@@ -84,6 +84,7 @@ def input_writer_node(state):
             f"Just modify the necessary parts to make the file complete and functional."
             "Please ensure that the generated file is complete, functional, and logically sound."
             "Additionally, apply your domain expertise to verify that all numerical values are consistent with the user's requirements, maintaining accuracy and coherence."
+            "When generating controlDict, do not include anything to preform post processing. Just include the necessary settings to run the simulation."
         )
         if len(writed_files) > 0:
             code_user_prompt += f"The following are files content already generated: {str(writed_files)}\n\n\nYou should ensure that the new file is consistent with the previous files. Such as boundary conditions, mesh settings, etc."
@@ -145,7 +146,10 @@ def input_writer_node(state):
         "You are an expert in OpenFOAM. Generate an Allrun script based on the provided details."
         f"Available commands with descriptions: {commands_help}\n\n"
         f"Reference Allrun scripts from similar cases: {state['allrun_reference']}\n\n"
-        "If custom mesh commands are provided, make sure to include them in the appropriate order in the Allrun script."
+        "If custom mesh commands are provided, make sure to include them in the appropriate order in the Allrun script. "
+        "CRITICAL: Do not include any other mesh commands other than the custom mesh commands."
+        "CRITICAL: Do not include any post processing commands in the Allrun script."
+        "CRITICAL: Do not include any gmshToFoam commands in the Allrun script."
     )
     
     allrun_user_prompt = (
@@ -156,6 +160,9 @@ def input_writer_node(state):
         "All run scripts for these similar cases are for reference only and may not be correct, as you might be a different case solver or have a different directory structure. " 
         "You need to rely on your OpenFOAM and physics knowledge to discern this, and pay more attention to user requirements, " 
         "as your ultimate goal is to fulfill the user's requirements and generate an allrun script that meets those requirements."
+        "CRITICAL: Do not include any post processing commands in the Allrun script."
+        "CRITICAL: Do not include any other mesh commands other than the custom mesh commands."
+        "CRITICAL: Do not include any gmshToFoam commands in the Allrun script."
         "Generate the Allrun script strictly based on the above information. Do not include explanations, comments, or additional text. Put the code in ``` tags."
     )
     

@@ -40,6 +40,7 @@ def local_runner_node(state):
     else:
         print("Allrun executed successfully without errors.")
     
+    state['loop_count'] += 1
     # Return updated state
     return {
         **state,

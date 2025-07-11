@@ -33,11 +33,12 @@ class GraphState(TypedDict):
     # Mesh-related state fields
     mesh_info: Optional[dict]
     mesh_commands: Optional[List[str]]
-    mesh_file_destination: Optional[str]
     custom_mesh_used: Optional[bool]
+    mesh_type: Optional[str]
+    custom_mesh_path: Optional[str]
 
 
-def llm_requires_custom_mesh(state: GraphState) -> bool:
+def llm_requires_custom_mesh(state: GraphState) -> int:
     """
     Use LLM to determine if user requires custom mesh based on their requirement.
     
@@ -45,7 +46,7 @@ def llm_requires_custom_mesh(state: GraphState) -> bool:
         state: Current graph state containing user requirement and LLM service
         
     Returns:
-        bool: True if custom mesh is required, False otherwise
+        int: 1 if custom mesh is required, 2 if gmsh mesh is required, 0 otherwise
     """
     user_requirement = state["user_requirement"]
     
@@ -56,6 +57,7 @@ def llm_requires_custom_mesh(state: GraphState) -> bool:
         "or any mention of importing/using external mesh files. "
         "If the user explicitly mentions or implies they want to use a custom mesh file, return 'custom_mesh'. "
         "If they want to use standard OpenFOAM mesh generation (blockMesh, snappyHexMesh with STL, etc.), return 'standard_mesh'. "
+        "Look for keywords like gmsh and determine if they want to create mesh using gmsh. If they want to create mesh using gmsh, return 'gmsh_mesh'. "
         "Be conservative - if unsure, assume standard mesh unless clearly specified otherwise."
     )
     
@@ -63,11 +65,16 @@ def llm_requires_custom_mesh(state: GraphState) -> bool:
         f"User requirement: {user_requirement}\n\n"
         "Determine if the user wants to use a custom mesh file. "
         "Return exactly 'custom_mesh' if they want to use a custom mesh file, "
-        "or 'standard_mesh' if they want standard OpenFOAM mesh generation."
+        "'standard_mesh' if they want standard OpenFOAM mesh generation or 'gmsh_mesh' if they want to create mesh using gmsh."
     )
     
     response = state["llm_service"].invoke(user_prompt, system_prompt)
-    return "custom_mesh" in response.lower()
+    if "custom_mesh" in response.lower():
+        return 1
+    elif "gmsh_mesh" in response.lower():
+        return 2
+    else:
+        return 0
 
 
 def llm_requires_hpc(state: GraphState) -> bool:
@@ -140,11 +147,15 @@ def route_after_architect(state: GraphState):
     """
     Route after architect node based on whether user wants custom mesh.
     """
-    if llm_requires_custom_mesh(state):
-        print("LLM determined: Custom mesh requested. Routing to meshing node.")
+    mesh_type = state.get("mesh_type", "standard_mesh")
+    if mesh_type == "custom_mesh":
+        print("Router: Custom mesh requested. Routing to meshing node.")
+        return "meshing"
+    elif mesh_type == "gmsh_mesh":
+        print("Router: GMSH mesh requested. Routing to meshing node.")
         return "meshing"
     else:
-        print("LLM determined: Standard mesh generation. Routing to input_writer node.")
+        print("Router: Standard mesh generation. Routing to input_writer node.")
         return "input_writer"
 
 
@@ -178,7 +189,7 @@ def route_after_reviewer(state: GraphState):
         else:
             return END
     
-    state["loop_count"] = loop_count + 1
-    print(f"Loop {loop_count + 1}: Continuing to fix errors.")
+    # state["loop_count"] = loop_count + 1
+    print(f"Loop {loop_count}: Continuing to fix errors.")
     
-    return "input_writer"
+    return route_after_input_writer(state)

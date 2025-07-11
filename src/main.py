@@ -50,7 +50,7 @@ def create_foam_agent_graph() -> StateGraph:
     
     return workflow
 
-def initialize_state(user_requirement: str, config: Config) -> GraphState:
+def initialize_state(user_requirement: str, config: Config, custom_mesh_path: Optional[str] = None) -> GraphState:
     """Initialize the graph state with required data."""
     # Load case statistics
     case_stats = json.load(open(f"{config.database_path}/raw/openfoam_case_stats.json", "r"))
@@ -85,13 +85,14 @@ def initialize_state(user_requirement: str, config: Config) -> GraphState:
         # Initialize mesh-related fields
         mesh_info=None,
         mesh_commands=None,
-        mesh_file_destination=None,
-        custom_mesh_used=None
+        custom_mesh_used=None,
+        mesh_type=None,
+        custom_mesh_path=custom_mesh_path
     )
     
     return state
 
-def main(user_requirement: str, config: Config):
+def main(user_requirement: str, config: Config, custom_mesh_path: Optional[str] = None):
     """Main function to run the OpenFOAM workflow."""
     
     # Create and compile the graph
@@ -99,7 +100,7 @@ def main(user_requirement: str, config: Config):
     app = workflow.compile()
     
     # Initialize the state
-    initial_state = initialize_state(user_requirement, config)
+    initial_state = initialize_state(user_requirement, config, custom_mesh_path)
     
     print("Starting Foam-Agent...")
     
@@ -135,6 +136,12 @@ if __name__ == "__main__":
         default="",
         help="Output directory for the workflow.",
     )
+    parser.add_argument(
+        "--custom_mesh_path",
+        type=str,
+        default=None,
+        help="Path to custom mesh file (e.g., .msh, .stl, .obj). If not provided, no custom mesh will be used.",
+    )
     
     args = parser.parse_args()
     print(args)
@@ -147,4 +154,4 @@ if __name__ == "__main__":
     with open(args.prompt_path, 'r') as f:
         user_requirement = f.read()
     
-    main(user_requirement, config)
+    main(user_requirement, config, args.custom_mesh_path)
