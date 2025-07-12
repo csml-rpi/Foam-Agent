@@ -21,6 +21,10 @@ import shutil
 from config import Config
 from langchain_ollama import ChatOllama
 
+# 加载环境变量
+from dotenv import load_dotenv
+load_dotenv()
+
 # Global dictionary to store loaded FAISS databases
 FAISS_DB_CACHE = {}
 DATABASE_DIR = f"{Path(__file__).resolve().parent.parent}/database/faiss"
