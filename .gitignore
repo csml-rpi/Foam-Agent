@@ -178,3 +178,8 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+learn_main.py
+Foam-Agent工作流程.md
+Foam-Agent程序运行逻辑图-打印版.md
+Foam-Agent程序运行逻辑图-打印版.pdf

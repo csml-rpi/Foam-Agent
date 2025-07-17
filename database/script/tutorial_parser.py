@@ -251,6 +251,7 @@ def save_cases_to_file(cases, output_dir):
     # 初始化案例统计字典 - 使用集合(set)实现自动去重
     # 集合的特性：不允许重复元素，自动去除重复值
     case_stats = {
+        'case_name': set(),      # 存储所有案例的名称，自动去重
         'case_domain': set(),    # 存储所有案例的领域，自动去重
         'case_category': set(),  # 存储所有案例的类别，自动去重  
         'case_solver': set()     # 存储所有案例的求解器，自动去重
@@ -268,6 +269,9 @@ def save_cases_to_file(cases, output_dir):
         
         # 使用集合的add()方法添加元素，自动去重
         # 如果元素已存在，add()不会重复添加
+        if case_name:
+            case_stats['case_name'].add(case_name)
+            print(f"    🏷️  添加案例名称: {case_name} (当前案例名称总数: {len(case_stats['case_name'])})")
         if case_domain:
             case_stats['case_domain'].add(case_domain)
             print(f"    🏷️  添加领域: {case_domain} (当前领域总数: {len(case_stats['case_domain'])})")
@@ -382,12 +386,14 @@ def save_cases_to_file(cases, output_dir):
     
     # 将集合转换为列表，保持去重后的唯一值
     # 这样既享受了集合的去重功能，又满足了JSON序列化的要求
+    case_stats['case_name'] = list(case_stats['case_name'])
     case_stats['case_category'] = list(case_stats['case_category'])
     case_stats['case_domain'] = list(case_stats['case_domain'])
     case_stats['case_solver'] = list(case_stats['case_solver'])
     
     print(f"💾 保存案例统计文件: {case_stats_filepath}")
     print(f"📊 最终统计信息 (已去重):")
+    print(f"    🏷️  案例名称数量: {len(case_stats['case_name'])} - {case_stats['case_name']}")
     print(f"    🏷️  领域数量: {len(case_stats['case_domain'])} - {case_stats['case_domain']}")
     print(f"    🏷️  类别数量: {len(case_stats['case_category'])} - {case_stats['case_category']}")
     print(f"    🏷️  求解器数量: {len(case_stats['case_solver'])} - {case_stats['case_solver']}")

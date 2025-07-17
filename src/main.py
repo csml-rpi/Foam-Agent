@@ -107,7 +107,37 @@ def initialize_state(user_requirement: str, config: Config) -> GraphState:
     """
     # 从数据库加载OpenFOAM案例统计信息
     # 这些统计信息用于帮助LLM理解可用的案例类型和配置选项
-    case_stats = json.load(open(f"{config.database_path}/raw/openfoam_case_stats.json", "r"))
+    case_stats_file_path = f"{config.database_path}/raw/openfoam_case_stats.json"
+    print(f"📊 正在加载案例统计信息...")
+    print(f"    📁 文件路径: {case_stats_file_path}")
+    
+    try:
+        with open(case_stats_file_path, "r", encoding="utf-8") as f:
+            case_stats = json.load(f)
+        
+        print(f"✅ 成功加载案例统计信息:")
+        print(f"    🏷️  案例领域 (case_domain): {len(case_stats['case_domain'])} 个")
+        print(f"        📋 可选值: {case_stats['case_domain']}")
+        print(f"    🏷️  案例类别 (case_category): {len(case_stats['case_category'])} 个")
+        print(f"        📋 可选值: {case_stats['case_category']}")
+        print(f"    🏷️  案例名称 (case_name): {len(case_stats['case_name'])} 个")
+        print(f"        📋 可选值: {case_stats['case_name']}")
+        print(f"    🏷️  案例求解器 (case_solver): {len(case_stats['case_solver'])} 个")
+        print(f"        📋 可选值: {case_stats['case_solver']}")
+        
+        print(f"    💡 这些统计信息来自OpenFOAM教程案例的自动分析")
+        print(f"    💡 用于限制LLM输出格式，确保生成的案例信息符合现有案例库")
+        
+    except FileNotFoundError:
+        print(f"❌ 错误: 找不到案例统计文件 {case_stats_file_path}")
+        print(f"    💡 请先运行数据库初始化脚本生成统计信息")
+        raise
+    except json.JSONDecodeError as e:
+        print(f"❌ 错误: 案例统计文件格式错误: {e}")
+        raise
+    except Exception as e:
+        print(f"❌ 错误: 加载案例统计信息失败: {e}")
+        raise
     
     # 创建初始状态对象，包含所有必要的字段
     state = GraphState(

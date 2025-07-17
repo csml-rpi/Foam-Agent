@@ -39,6 +39,11 @@ cd Foam-Agent
 conda env create -f environment.yml
 ```
 
+Run the benchmark with logging:
+```bash
+python foambench_main.py --openfoam_path /opt/openfoam10/ --prompt_path ./user_requirement.txt --output ./output 2>&1 | tee foambench.log
+```
+
 We will release our dataset as soon as the relevant license review is completed. This project will be continuously updated to integrate more advanced large language models for improved performance and to support additional functionalities. We encourage everyone to follow this GitHub repository and our team's progress. We firmly believe in the inevitable arrival of AGI and remain committed to advancing automation in the CFD domain. We welcome collaboration and communication from researchers and practitioners in the field.
 
 ## Citation

@@ -1,4 +1,19 @@
 # utils.py
+"""
+OpenFOAM 智能代理工具模块
+
+本模块提供了OpenFOAM案例处理、LLM服务、文件操作、FAISS向量数据库检索等核心功能。
+主要包含以下组件：
+1. LLMService: 支持多种LLM提供商的服务类
+2. FAISS数据库缓存: 预加载的OpenFOAM知识库
+3. 文件操作工具: 保存、读取、删除文件等
+4. OpenFOAM案例处理: 运行脚本、检查错误、解析结构等
+5. 向量检索: 基于FAISS的相似案例检索
+
+作者: OpenFOAM Agent Team
+版本: 1.0
+"""
+
 import re
 import subprocess
 import os
@@ -25,10 +40,14 @@ from langchain_ollama import ChatOllama
 from dotenv import load_dotenv
 load_dotenv()
 
-# Global dictionary to store loaded FAISS databases
+# 全局FAISS数据库缓存字典，避免重复加载
 FAISS_DB_CACHE = {}
 DATABASE_DIR = f"{Path(__file__).resolve().parent.parent}/database/faiss"
 
+print(f"[DEBUG] 正在加载FAISS数据库，路径: {DATABASE_DIR}")
+
+# 预加载所有FAISS数据库到内存中，提高检索效率
+# 注意：这里使用了allow_dangerous_deserialization=True，需要确保数据库文件的安全性
 FAISS_DB_CACHE = {
     "openfoam_allrun_scripts": FAISS.load_local(f"{DATABASE_DIR}/openfoam_allrun_scripts", OpenAIEmbeddings(model="text-embedding-3-small"), allow_dangerous_deserialization=True),
     "openfoam_tutorials_structure": FAISS.load_local(f"{DATABASE_DIR}/openfoam_tutorials_structure", OpenAIEmbeddings(model="text-embedding-3-small"), allow_dangerous_deserialization=True),
@@ -36,25 +55,55 @@ FAISS_DB_CACHE = {
     "openfoam_command_help": FAISS.load_local(f"{DATABASE_DIR}/openfoam_command_help", OpenAIEmbeddings(model="text-embedding-3-small"), allow_dangerous_deserialization=True)
 }
 
+print(f"[DEBUG] FAISS数据库加载完成，共加载 {len(FAISS_DB_CACHE)} 个数据库")
+
 class FoamfilePydantic(BaseModel):
+    """OpenFOAM文件的数据模型，用于结构化输出"""
     file_name: str = Field(description="Name of the OpenFOAM input file")
     folder_name: str = Field(description="Folder where the foamfile should be stored")
     content: str = Field(description="Content of the OpenFOAM file, written in OpenFOAM dictionary format")
 
 class FoamPydantic(BaseModel):
+    """OpenFOAM文件列表的数据模型"""
     list_foamfile: List[FoamfilePydantic] = Field(description="List of OpenFOAM configuration files")
 
 class ResponseWithThinkPydantic(BaseModel):
+    """包含思考过程的响应数据模型，主要用于DeepSeek模型"""
     think: str = Field(description="Thought process of the LLM")
     response: str = Field(description="Response of the LLM")
     
 class LLMService:
+    """
+    LLM服务类，支持多种LLM提供商
+    
+    支持的提供商：
+    - OpenAI (GPT系列)
+    - Anthropic (Claude系列)
+    - AWS Bedrock
+    - Ollama (本地部署)
+    
+    功能特性：
+    - 自动重试机制（针对限流错误）
+    - 详细的token使用统计
+    - 结构化输出支持
+    - 多种模型配置
+    """
+    
     def __init__(self, config: object):
+        """
+        初始化LLM服务
+        
+        Args:
+            config: 配置对象，包含模型版本、温度、提供商等信息
+        """
+        # 从配置对象中获取参数，提供默认值
         self.model_version = getattr(config, "model_version", "gpt-4o")
         self.temperature = getattr(config, "temperature", 0)
         self.model_provider = getattr(config, "model_provider", "openai")
         
-        # Initialize statistics
+        print(f"[DEBUG] 初始化LLM服务 - 提供商: {self.model_provider}, 模型: {self.model_version}, 温度: {self.temperature}")
+        
+        # 初始化统计信息
         self.total_calls = 0
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
@@ -62,8 +111,9 @@ class LLMService:
         self.failed_calls = 0
         self.retry_count = 0
         
-        # Initialize the LLM
+        # 根据提供商初始化相应的LLM
         if self.model_provider.lower() == "bedrock":
+            print("[DEBUG] 使用AWS Bedrock服务")
             bedrock_runtime = tracking_aws.new_default_client()
             self.llm = ChatBedrockConverse(
                 client=bedrock_runtime, 
@@ -72,37 +122,42 @@ class LLMService:
                 max_tokens=8192
             )
         elif self.model_provider.lower() == "anthropic":
+            print("[DEBUG] 使用Anthropic Claude服务")
             self.llm = ChatAnthropic(
                 model=self.model_version, 
                 temperature=self.temperature
             )
         elif self.model_provider.lower() == "openai":
+            print("[DEBUG] 使用OpenAI服务")
             self.llm = init_chat_model(
                 self.model_version, 
                 model_provider=self.model_provider, 
                 temperature=self.temperature
             )
         elif self.model_provider.lower() == "ollama":
+            print("[DEBUG] 使用Ollama本地服务")
             try:
+                # 检查Ollama服务是否运行
                 response = requests.get("http://localhost:11434/api/version", timeout=2)
-                # If request successful, service is running
+                print("[DEBUG] Ollama服务已运行")
             except requests.exceptions.RequestException:
-                print("Ollama is not running, starting it...")
+                print("[DEBUG] Ollama服务未运行，正在启动...")
+                # 启动Ollama服务
                 subprocess.Popen(["ollama", "serve"], 
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE)
-                # Wait for service to start
-                time.sleep(5)  # Give it 3 seconds to initialize
+                # 等待服务启动
+                time.sleep(5)  # 给服务5秒时间初始化
 
             self.llm = ChatOllama(
                 model=self.model_version, 
                 temperature=self.temperature,
-                num_predict=-1,
-                num_ctx=131072,
+                num_predict=-1,  # 无限制预测
+                num_ctx=131072,  # 上下文窗口大小
                 base_url="http://localhost:11434"
             )
         else:
-            raise ValueError(f"{self.model_provider} is not a supported model_provider")
+            raise ValueError(f"{self.model_provider} 是不支持的模型提供商")
     
     def invoke(self, 
               user_prompt: str, 
@@ -110,52 +165,66 @@ class LLMService:
               pydantic_obj: Optional[Type[BaseModel]] = None,
               max_retries: int = 10) -> Any:
         """
-        Invoke the LLM with the given prompts and return the response.
+        调用LLM并返回响应
         
         Args:
-            user_prompt: The user's prompt
-            system_prompt: Optional system prompt
-            pydantic_obj: Optional Pydantic model for structured output
-            max_retries: Maximum number of retries for throttling errors
+            user_prompt: 用户提示词
+            system_prompt: 可选的系统提示词
+            pydantic_obj: 可选的Pydantic模型，用于结构化输出
+            max_retries: 最大重试次数（针对限流错误）
             
         Returns:
-            The LLM response with token usage statistics
+            LLM响应，包含token使用统计
+            
+        Raises:
+            Exception: 当达到最大重试次数或发生其他错误时
         """
         self.total_calls += 1
+        print(f"[DEBUG] 第 {self.total_calls} 次调用LLM")
+        print(f"[DEBUG] 用户提示词长度: {len(user_prompt)} 字符")
         
+        # 构建消息列表
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
+            print(f"[DEBUG] 系统提示词长度: {len(system_prompt)} 字符")
         messages.append({"role": "user", "content": user_prompt})
         
-        # Calculate prompt tokens
+        # 计算提示词token数量
         prompt_tokens = 0
         for message in messages:
             prompt_tokens += self.llm.get_num_tokens(message["content"])
+        
+        print(f"[DEBUG] 提示词token数量: {prompt_tokens}")
         
         retry_count = 0
         while True:
             try:
                 if pydantic_obj:
+                    print("[DEBUG] 使用结构化输出模式")
                     structured_llm = self.llm.with_structured_output(pydantic_obj)
                     response = structured_llm.invoke(messages)
                 else:
                     if self.model_version.startswith("deepseek"):
+                        print("[DEBUG] 使用DeepSeek模型，提取思考过程")
                         structured_llm = self.llm.with_structured_output(ResponseWithThinkPydantic)
                         response = structured_llm.invoke(messages)
 
-                        # Extract the resposne without the think
+                        # 提取响应内容，去除思考过程
                         response = response.response
                     else:
+                        print("[DEBUG] 使用标准输出模式")
                         response = self.llm.invoke(messages)
                         response = response.content
 
-                # Calculate completion tokens
+                # 计算完成token数量
                 response_content = str(response)
                 completion_tokens = self.llm.get_num_tokens(response_content)
                 total_tokens = prompt_tokens + completion_tokens
                 
-                # Update statistics
+                print(f"[DEBUG] 响应token数量: {completion_tokens}, 总token数量: {total_tokens}")
+                
+                # 更新统计信息
                 self.total_prompt_tokens += prompt_tokens
                 self.total_completion_tokens += completion_tokens
                 self.total_tokens += total_tokens
@@ -163,35 +232,40 @@ class LLMService:
                 return response
                 
             except ClientError as e:
+                # 处理AWS Bedrock的限流错误
                 if e.response['Error']['Code'] == 'Throttling' or e.response['Error']['Code'] == 'TooManyRequestsException':
                     retry_count += 1
                     self.retry_count += 1
                     
                     if retry_count > max_retries:
                         self.failed_calls += 1
+                        print(f"[ERROR] 达到最大重试次数 {max_retries}")
                         raise Exception(f"Maximum retries ({max_retries}) exceeded: {str(e)}")
                     
+                    # 指数退避策略，带随机抖动
                     base_delay = 1.0
                     max_delay = 60.0
                     delay = min(max_delay, base_delay * (2 ** (retry_count - 1)))
                     jitter = random.uniform(0, 0.1 * delay)
                     sleep_time = delay + jitter
                     
-                    print(f"ThrottlingException occurred: {str(e)}. Retrying in {sleep_time:.2f} seconds (attempt {retry_count}/{max_retries})")
+                    print(f"[WARNING] 发生限流错误: {str(e)}. {sleep_time:.2f}秒后进行第{retry_count}/{max_retries}次重试")
                     time.sleep(sleep_time)
                 else:
                     self.failed_calls += 1
+                    print(f"[ERROR] AWS Bedrock错误: {str(e)}")
                     raise e
             except Exception as e:
                 self.failed_calls += 1
+                print(f"[ERROR] LLM调用失败: {str(e)}")
                 raise e
     
     def get_statistics(self) -> dict:
         """
-        Get the current statistics of the LLM service.
+        获取LLM服务的当前统计信息
         
         Returns:
-            Dictionary containing various statistics
+            包含各种统计信息的字典
         """
         return {
             "total_calls": self.total_calls,
@@ -207,7 +281,7 @@ class LLMService:
     
     def print_statistics(self) -> None:
         """
-        Print the current statistics of the LLM service.
+        打印LLM服务的当前统计信息
         """
         stats = self.get_statistics()
         print("\n<LLM Service Statistics>")
@@ -223,69 +297,163 @@ class LLMService:
         print("</LLM Service Statistics>")
 
 def tokenize(text: str) -> str:
-    # Replace underscores with spaces
+    """
+    对文本进行分词处理，用于向量检索前的预处理
+    
+    Args:
+        text: 输入文本
+        
+    Returns:
+        处理后的文本（小写，下划线替换为空格，驼峰命名分割）
+    """
+    print(f"[DEBUG] 原始文本: {text[:100]}...")
+    # 将下划线替换为空格
     text = text.replace('_', ' ')
-    # Insert a space between a lowercase letter and an uppercase letter (global match)
+    # 在小写字母和大写字母之间插入空格（全局匹配）
     text = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', text)
-    return text.lower()
+    result = text.lower()
+    print(f"[DEBUG] 分词后文本: {result[:100]}...")
+    return result
 
 def save_file(path: str, content: str) -> None:
+    """
+    保存文件到指定路径
+    
+    Args:
+        path: 文件路径
+        content: 文件内容
+    """
+    print(f"[DEBUG] 保存文件到: {path}")
+    print(f"[DEBUG] 文件内容长度: {len(content)} 字符")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'w') as f:
         f.write(content)
     print(f"Saved file at {path}")
 
 def read_file(path: str) -> str:
+    """
+    读取文件内容
+    
+    Args:
+        path: 文件路径
+        
+    Returns:
+        文件内容，如果文件不存在则返回空字符串
+    """
+    print(f"[DEBUG] 读取文件: {path}")
     if os.path.exists(path):
         with open(path, 'r') as f:
-            return f.read()
+            content = f.read()
+        print(f"[DEBUG] 文件内容长度: {len(content)} 字符")
+        return content
+    print(f"[WARNING] 文件不存在: {path}")
     return ""
 
 def list_case_files(case_dir: str) -> str:
+    """
+    列出案例目录中的所有文件
+    
+    Args:
+        case_dir: 案例目录路径
+        
+    Returns:
+        文件名的逗号分隔字符串
+    """
+    print(f"[DEBUG] 列出案例文件: {case_dir}")
     files = [f for f in os.listdir(case_dir) if os.path.isfile(os.path.join(case_dir, f))]
-    return ", ".join(files)
+    result = ", ".join(files)
+    print(f"[DEBUG] 找到 {len(files)} 个文件: {result}")
+    return result
 
 def remove_files(directory: str, prefix: str) -> None:
+    """
+    删除指定目录中具有特定前缀的文件
+    
+    Args:
+        directory: 目录路径
+        prefix: 文件前缀
+    """
+    print(f"[DEBUG] 删除文件，目录: {directory}, 前缀: {prefix}")
+    removed_count = 0
     for file in os.listdir(directory):
         if file.startswith(prefix):
-            os.remove(os.path.join(directory, file))
-    print(f"Removed files with prefix '{prefix}' in {directory}")
+            file_path = os.path.join(directory, file)
+            os.remove(file_path)
+            removed_count += 1
+            print(f"[DEBUG] 删除文件: {file_path}")
+    print(f"Removed {removed_count} files with prefix '{prefix}' in {directory}")
 
 def remove_file(path: str) -> None:
+    """
+    删除指定文件
+    
+    Args:
+        path: 文件路径
+    """
+    print(f"[DEBUG] 删除文件: {path}")
     if os.path.exists(path):
         os.remove(path)
         print(f"Removed file {path}")
+    else:
+        print(f"[WARNING] 文件不存在: {path}")
 
 def remove_numeric_folders(case_dir: str) -> None:
     """
-    Remove all folders in case_dir that represent numeric values, including those with decimal points,
-    except for the "0" folder.
+    删除案例目录中表示数值的文件夹，包括带小数点的文件夹，但保留"0"文件夹
     
     Args:
-        case_dir (str): The directory path to process
+        case_dir: 案例目录路径
     """
+    print(f"[DEBUG] 删除数值文件夹，目录: {case_dir}")
+    removed_count = 0
     for item in os.listdir(case_dir):
         item_path = os.path.join(case_dir, item)
         if os.path.isdir(item_path) and item != "0":
             try:
-                # Try to convert to float to check if it's a numeric value
+                # 尝试转换为浮点数来检查是否为数值
                 float(item)
-                # If conversion succeeds, it's a numeric folder
+                # 如果转换成功，说明是数值文件夹
                 try:
                     shutil.rmtree(item_path)
-                    print(f"Removed numeric folder: {item_path}")
+                    removed_count += 1
+                    print(f"[DEBUG] 删除数值文件夹: {item_path}")
                 except Exception as e:
-                    print(f"Error removing folder {item_path}: {str(e)}")
+                    print(f"[ERROR] 删除文件夹 {item_path} 时出错: {str(e)}")
             except ValueError:
-                # Not a numeric value, so we keep this folder
+                # 不是数值，保留这个文件夹
+                print(f"[DEBUG] 保留非数值文件夹: {item_path}")
                 pass
+    print(f"[DEBUG] 共删除 {removed_count} 个数值文件夹")
 
 def run_command(script_path: str, out_file: str, err_file: str, working_dir: str, config : Config) -> None:
-    print(f"Executing script {script_path} in {working_dir}")
+    """
+    在指定工作目录中执行OpenFOAM脚本
+    
+    Args:
+        script_path: 脚本路径
+        out_file: 标准输出文件路径
+        err_file: 标准错误文件路径
+        working_dir: 工作目录
+        config: 配置对象，包含超时时间等参数
+    """
+    print(f"[DEBUG] 执行脚本: {script_path}")
+    print(f"[DEBUG] 工作目录: {working_dir}")
+    print(f"[DEBUG] 输出文件: {out_file}")
+    print(f"[DEBUG] 错误文件: {err_file}")
+    
+    # 设置脚本执行权限
     os.chmod(script_path, 0o777)
+    
+    # 获取OpenFOAM环境变量
     openfoam_dir = os.getenv("WM_PROJECT_DIR")
+    print(f"[DEBUG] OpenFOAM目录: {openfoam_dir}")
+    
+    # 构建命令：先加载OpenFOAM环境，然后执行脚本
     command = f"source {openfoam_dir}/etc/bashrc && bash {os.path.abspath(script_path)}"
     timeout_seconds = config.max_time_limit
+    
+    print(f"[DEBUG] 执行命令: {command}")
+    print(f"[DEBUG] 超时时间: {timeout_seconds} 秒")
 
     with open(out_file, 'w') as out, open(err_file, 'w') as err:
         process = subprocess.Popen(
@@ -296,14 +464,12 @@ def run_command(script_path: str, out_file: str, err_file: str, working_dir: str
             stdin=subprocess.DEVNULL,
             text=True
         )
-        # stdout, stderr = process.communicate()
-        # out.write(stdout)
-        # err.write(stderr)
 
         try:
             stdout, stderr = process.communicate(timeout=timeout_seconds)
             out.write(stdout)
             err.write(stderr)
+            print(f"[DEBUG] 脚本执行完成，返回码: {process.returncode}")
         except subprocess.TimeoutExpired:
             process.kill()
             stdout, stderr = process.communicate()
@@ -313,20 +479,29 @@ def run_command(script_path: str, out_file: str, err_file: str, working_dir: str
             )
             out.write(timeout_message + stdout)
             err.write(timeout_message + stderr)
-            print(f"Execution timed out: {script_path}")
-
-    
+            print(f"[WARNING] 脚本执行超时: {script_path}")
 
     print(f"Executed script {script_path}")
 
 def check_foam_errors(directory: str) -> list:
+    """
+    检查OpenFOAM日志文件中的错误
+    
+    Args:
+        directory: 包含日志文件的目录
+        
+    Returns:
+        错误日志列表，每个元素包含文件名和错误内容
+    """
+    print(f"[DEBUG] 检查OpenFOAM错误，目录: {directory}")
     error_logs = []
-    # DOTALL mode allows '.' to match newline characters
+    # DOTALL模式允许'.'匹配换行符
     pattern = re.compile(r"ERROR:(.*)", re.DOTALL)
     
     for file in os.listdir(directory):
         if file.startswith("log"):
             filepath = os.path.join(directory, file)
+            print(f"[DEBUG] 检查日志文件: {filepath}")
             with open(filepath, 'r') as f:
                 content = f.read()
             
@@ -334,87 +509,266 @@ def check_foam_errors(directory: str) -> list:
             if match:
                 error_content = match.group(0).strip()
                 error_logs.append({"file": file, "error_content": error_content})
+                print(f"[DEBUG] 发现错误: {file}")
             elif "error" in content.lower():
-                print(f"Warning: file {file} contains 'error' but does not match expected format.")
+                print(f"[WARNING] 文件 {file} 包含'error'但不匹配预期格式")
+    
+    print(f"[DEBUG] 发现 {len(error_logs)} 个错误")
     return error_logs
 
 def extract_commands_from_allrun_out(out_file: str) -> list:
+    """
+    从allrun脚本的输出文件中提取执行的命令
+    
+    Args:
+        out_file: 输出文件路径
+        
+    Returns:
+        命令列表
+    """
+    print(f"[DEBUG] 从输出文件提取命令: {out_file}")
     commands = []
     if not os.path.exists(out_file):
+        print(f"[WARNING] 输出文件不存在: {out_file}")
         return commands
+    
     with open(out_file, 'r') as f:
         for line in f:
             if line.startswith("Running "):
                 parts = line.split(" ")
                 if len(parts) > 1:
-                    commands.append(parts[1].strip())
+                    command = parts[1].strip()
+                    commands.append(command)
+                    print(f"[DEBUG] 提取到命令: {command}")
+    
+    print(f"[DEBUG] 共提取到 {len(commands)} 个命令")
     return commands
 
 def parse_case_name(text: str) -> str:
+    """
+    从文本中解析案例名称
+    
+    Args:
+        text: 包含案例名称的文本
+        
+    Returns:
+        案例名称，如果未找到则返回"default_case"
+    """
+    print(f"[DEBUG] 解析案例名称，文本: {text[:100]}...")
     match = re.search(r'case name:\s*(.+)', text, re.IGNORECASE)
-    return match.group(1).strip() if match else "default_case"
+    if match:
+        case_name = match.group(1).strip()
+        print(f"[DEBUG] 解析到案例名称: {case_name}")
+        return case_name
+    else:
+        print(f"[WARNING] 未找到案例名称，使用默认值")
+        return "default_case"
 
 def split_subtasks(text: str) -> list:
+    """
+    从文本中分割子任务
+    
+    Args:
+        text: 包含子任务信息的文本
+        
+    Returns:
+        子任务列表
+    """
+    print(f"[DEBUG] 分割子任务，文本长度: {len(text)}")
     header_match = re.search(r'splits into (\d+) subtasks:', text, re.IGNORECASE)
     if not header_match:
-        print("Warning: No subtasks header found in the response.")
+        print("[WARNING] 在响应中未找到子任务头部信息")
         return []
+    
     num_subtasks = int(header_match.group(1))
+    print(f"[DEBUG] 预期子任务数量: {num_subtasks}")
+    
     subtasks = re.findall(r'subtask\d+:\s*(.*)', text, re.IGNORECASE)
     if len(subtasks) != num_subtasks:
-        print(f"Warning: Expected {num_subtasks} subtasks but found {len(subtasks)}.")
+        print(f"[WARNING] 预期 {num_subtasks} 个子任务但找到 {len(subtasks)} 个")
+    
+    print(f"[DEBUG] 实际找到 {len(subtasks)} 个子任务")
+    for i, subtask in enumerate(subtasks):
+        print(f"[DEBUG] 子任务 {i+1}: {subtask[:50]}...")
+    
     return subtasks
 
 def parse_context(text: str) -> str:
-    match = re.search(r'FoamFile\s*\{.*?(?=```|$)', text, re.DOTALL | re.IGNORECASE)
-    if match:
-        return match.group(0).strip()
+    """
+    从文本中解析OpenFOAM文件内容，提取FoamFile字典格式的部分
     
-    print("Warning: Could not parse context; returning original text.")
+    该函数用于从LLM生成的文本中提取OpenFOAM文件的实际内容。
+    LLM可能会在回答中包含解释、注释或其他非OpenFOAM内容，此函数
+    通过正则表达式提取从"FoamFile"开始到代码块结束或文本结束的部分。
+    
+    Args:
+        text (str): 包含FoamFile信息的文本，可能包含LLM的解释内容
+        
+    Returns:
+        str: 解析后的OpenFOAM文件内容，如果解析失败则返回原文本
+        
+    Example:
+        >>> text = "这是一个OpenFOAM文件：\nFoamFile\n{\n    format ascii;\n    class dictionary;\n}\n```"
+        >>> parse_context(text)
+        "FoamFile\n{\n    format ascii;\n    class dictionary;\n}"
+    """
+    print(f"[DEBUG] 解析FoamFile上下文，文本长度: {len(text)}")
+    
+    # 使用正则表达式匹配FoamFile内容
+    # r'FoamFile\s*\{.*?(?=```|$)' 的含义：
+    # - FoamFile: 匹配字面量"FoamFile"
+    # - \s*: 匹配零个或多个空白字符
+    # - \{: 匹配左大括号
+    # - .*?: 非贪婪匹配任意字符（包括换行符，因为使用了DOTALL标志）
+    # - (?=```|$): 正向预查，匹配到```代码块结束符或文本结尾时停止
+    # - re.DOTALL: 让.也能匹配换行符
+    # - re.IGNORECASE: 忽略大小写，匹配FoamFile、foamfile等
+    match = re.search(r'FoamFile\s*\{.*?(?=```|$)', text, re.DOTALL | re.IGNORECASE)
+    
+    if match:
+        # 提取匹配到的内容并去除首尾空白字符
+        context = match.group(0).strip()
+        print(f"[DEBUG] 成功解析FoamFile上下文，长度: {len(context)}")
+        return context
+    
+    # 如果正则匹配失败，返回原文本作为fallback
+    print("[WARNING] 无法解析上下文，返回原文本")
     return text
 
-
 def parse_file_name(subtask: str) -> str:
+    """
+    从子任务中解析文件名
+    
+    Args:
+        subtask: 子任务文本
+        
+    Returns:
+        文件名，如果未找到则返回空字符串
+    """
+    print(f"[DEBUG] 解析文件名，子任务: {subtask[:100]}...")
     match = re.search(r'openfoam\s+(.*?)\s+foamfile', subtask, re.IGNORECASE)
-    return match.group(1).strip() if match else ""
+    if match:
+        file_name = match.group(1).strip()
+        print(f"[DEBUG] 解析到文件名: {file_name}")
+        return file_name
+    else:
+        print(f"[WARNING] 未找到文件名")
+        return ""
 
 def parse_folder_name(subtask: str) -> str:
+    """
+    从子任务中解析文件夹名
+    
+    Args:
+        subtask: 子任务文本
+        
+    Returns:
+        文件夹名，如果未找到则返回空字符串
+    """
+    print(f"[DEBUG] 解析文件夹名，子任务: {subtask[:100]}...")
     match = re.search(r'foamfile in\s+(.*?)\s+folder', subtask, re.IGNORECASE)
-    return match.group(1).strip() if match else ""
+    if match:
+        folder_name = match.group(1).strip()
+        print(f"[DEBUG] 解析到文件夹名: {folder_name}")
+        return folder_name
+    else:
+        print(f"[WARNING] 未找到文件夹名")
+        return ""
 
 def find_similar_file(description: str, tutorial: str) -> str:
+    """
+    在教程文本中查找相似的文件描述
+    
+    Args:
+        description: 文件描述
+        tutorial: 教程文本
+        
+    Returns:
+        找到的相似文件内容，如果未找到则返回"None"
+    """
+    print(f"[DEBUG] 查找相似文件，描述: {description[:50]}...")
     start_pos = tutorial.find(description)
     if start_pos == -1:
+        print(f"[WARNING] 未找到描述: {description}")
         return "None"
+    
     end_marker = "input_file_end."
     end_pos = tutorial.find(end_marker, start_pos)
     if end_pos == -1:
+        print(f"[WARNING] 未找到结束标记")
         return "None"
-    return tutorial[start_pos:end_pos + len(end_marker)]
+    
+    result = tutorial[start_pos:end_pos + len(end_marker)]
+    print(f"[DEBUG] 找到相似文件，长度: {len(result)}")
+    return result
 
 def read_commands(file_path: str) -> str:
+    """
+    读取命令文件内容
+    
+    Args:
+        file_path: 命令文件路径
+        
+    Returns:
+        非空行的逗号分隔字符串
+        
+    Raises:
+        FileNotFoundError: 当文件不存在时
+    """
+    print(f"[DEBUG] 读取命令文件: {file_path}")
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Commands file not found: {file_path}")
+    
     with open(file_path, 'r') as f:
-        # join non-empty lines with a comma
-        return ", ".join(line.strip() for line in f if line.strip())
+        # 连接非空行，用逗号分隔
+        lines = [line.strip() for line in f if line.strip()]
+        result = ", ".join(lines)
+        print(f"[DEBUG] 读取到 {len(lines)} 个命令: {result}")
+        return result
 
 def find_input_file(case_dir: str, command: str) -> str:
+    """
+    在案例目录中查找包含指定命令的输入文件
+    
+    Args:
+        case_dir: 案例目录
+        command: 命令名称
+        
+    Returns:
+        找到的文件路径，如果未找到则返回空字符串
+    """
+    print(f"[DEBUG] 查找输入文件，案例目录: {case_dir}, 命令: {command}")
     for root, _, files in os.walk(case_dir):
         for file in files:
             if command in file:
-                return os.path.join(root, file)
+                file_path = os.path.join(root, file)
+                print(f"[DEBUG] 找到输入文件: {file_path}")
+                return file_path
+    
+    print(f"[WARNING] 未找到包含命令 {command} 的输入文件")
     return ""
 
 def retrieve_faiss(database_name: str, query: str, topk: int = 1) -> dict:
     """
-    Retrieve a similar case from a FAISS database.
+    从FAISS数据库中检索相似案例
+    
+    Args:
+        database_name: 数据库名称
+        query: 查询文本
+        topk: 返回的相似文档数量
+        
+    Returns:
+        格式化的检索结果字典
+        
+    Raises:
+        ValueError: 当数据库不存在或未找到文档时
     """
+    print(f"[DEBUG] FAISS检索 - 数据库: {database_name}, 查询: {query[:50]}..., topk: {topk}")
     
     if database_name not in FAISS_DB_CACHE:
         raise ValueError(f"Database '{database_name}' is not loaded.")
     
-    # Tokenize the query
+    # 对查询进行分词处理
     query = tokenize(query)
     
     vectordb = FAISS_DB_CACHE[database_name]
@@ -422,9 +776,19 @@ def retrieve_faiss(database_name: str, query: str, topk: int = 1) -> dict:
     if not docs:
         raise ValueError(f"No documents found for query: {query}")
     
+    print(f"[DEBUG] 找到 {len(docs)} 个相似文档")
+    
     formatted_results = []
-    for doc in docs:
+    for i, doc in enumerate(docs):
         metadata = doc.metadata or {}
+        print(f"[DEBUG] 文档 {i+1} 元数据字段: {list(metadata.keys())}")
+        # print(f"[DEBUG] 文档 {i+1} 详细元数据:")
+        # for key, value in metadata.items():
+        #     if key == 'full_content':
+        #         print(f"    {key}: {str(value)[:100]}... (长度: {len(str(value))})")
+        #     else:
+        #         print(f"    {key}: {value}")
+        # print()
         
         if database_name == "openfoam_allrun_scripts":
             formatted_results.append({
@@ -468,33 +832,44 @@ def retrieve_faiss(database_name: str, query: str, topk: int = 1) -> dict:
         else:
             raise ValueError(f"Unknown database name: {database_name}")
     
-    
-
+    print(f"[DEBUG] 格式化完成，返回 {len(formatted_results)} 个结果")
     return formatted_results
-        
 
 def parse_directory_structure(data: str) -> dict:
     """
-    Parses the directory structure string and returns a dictionary where:
-      - Keys: directory names
-      - Values: count of files in that directory.
+    解析目录结构字符串，返回字典，其中：
+      - 键：目录名
+      - 值：该目录中的文件数量
+    
+    Args:
+        data: 包含目录结构信息的字符串
+        
+    Returns:
+        目录文件数量字典
     """
+    print(f"[DEBUG] 解析目录结构，数据长度: {len(data)}")
     directory_file_counts = {}
 
-    # Find all <dir>...</dir> blocks in the input string.
+    # 在输入字符串中查找所有 <dir>...</dir> 块
     dir_blocks = re.findall(r'<dir>(.*?)</dir>', data, re.DOTALL)
+    print(f"[DEBUG] 找到 {len(dir_blocks)} 个目录块")
 
-    for block in dir_blocks:
-        # Extract the directory name (everything after "directory name:" until the first period)
+    for i, block in enumerate(dir_blocks):
+        print(f"[DEBUG] 处理目录块 {i+1}")
+        # 提取目录名（"directory name:" 之后到第一个句号之前的所有内容）
         dir_name_match = re.search(r'directory name:\s*(.*?)\.', block)
-        # Extract the list of file names within square brackets
+        # 提取方括号中的文件名列表
         files_match = re.search(r'File names in this directory:\s*\[(.*?)\]', block)
         
         if dir_name_match and files_match:
             dir_name = dir_name_match.group(1).strip()
             files_str = files_match.group(1)
-            # Split the file names by comma, removing any surrounding whitespace
+            # 按逗号分割文件名，去除周围的空白字符
             file_list = [filename.strip() for filename in files_str.split(',')]
             directory_file_counts[dir_name] = len(file_list)
+            print(f"[DEBUG] 目录: {dir_name}, 文件数量: {len(file_list)}")
+        else:
+            print(f"[WARNING] 目录块 {i+1} 格式不正确")
 
+    print(f"[DEBUG] 解析完成，共 {len(directory_file_counts)} 个目录")
     return directory_file_counts
