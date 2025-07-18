@@ -73,6 +73,8 @@ def input_writer_node(state):
             dir_structure[folder_name] = []
         dir_structure[folder_name].append(file_name)
         
+        # 所以在input_writer_node里面，每一次有错误，它都要重新生成所有文件，有点不太智能，而且很耗费token
+        # 也许这里需要优化，如果只是修改了部分文件，那么只需要重新生成部分文件
         print(f"Generating file: {file_name} in folder: {folder_name}")
         
         if not file_name or not folder_name:

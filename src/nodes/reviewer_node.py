@@ -147,6 +147,7 @@ def reviewer_node(state):
     print(f"[reviewer_node] 重写提示词长度: {len(rewrite_user_prompt)} 字符")
     
     # 调用LLM服务重写相关文件，使用FoamPydantic进行结构化输出
+    # 这里生成的rewrite_response是FoamPydantic对象，里面包含list_foamfile，每个foamfile对象包含file_name, folder_name, content
     rewrite_response = state["llm_service"].invoke(rewrite_user_prompt, REWRITE_SYSTEM_PROMPT, pydantic_obj=FoamPydantic)
     
     print(f"[reviewer_node] 文件重写完成，需要修改的文件数量: {len(rewrite_response.list_foamfile)}")
@@ -154,7 +155,7 @@ def reviewer_node(state):
     # 保存修改的文件
     print(f"============================== Rewrite ==============================")
     for foamfile in rewrite_response.list_foamfile:
-        print(f"Modified the file: {foamfile.file_name} in folder: {foamfile.folder_name}")
+        print(f"Modified the file: {foamfile.file_name} in folder: {foamfile.folder_name}") # 这个就是需要修改的文件
         print(f"[reviewer_node] 文件路径: {foamfile.folder_name}/{foamfile.file_name}")
         print(f"[reviewer_node] 文件内容长度: {len(foamfile.content)} 字符")
         
@@ -190,8 +191,11 @@ def reviewer_node(state):
     
     # 返回更新后的状态
     # 注意：清空错误日志，因为已经尝试修复
+    # 增加循环计数
+    current_loop_count = state.get("loop_count", 0)
     return {
         **state,
         "history_text": history_text,
-        "error_logs": []  # 清空错误日志，因为已经尝试修复
+        "error_logs": [],  # 清空错误日志，因为已经尝试修复
+        "loop_count": current_loop_count + 1  # 增加循环计数
     }

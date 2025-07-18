@@ -345,8 +345,8 @@ def route_after_reviewer(state: GraphState):
             print("[DEBUG] 达到最大循环次数且不需要可视化，结束工作流")
             return END
     
-    # 增加循环计数并继续修复错误
-    state["loop_count"] = loop_count + 1
+    # 注意：在路由函数中直接修改state不会生效
+    # 循环计数的增加应该在reviewer_node中完成
     print(f"Loop {loop_count + 1}: Continuing to fix errors.")
     
     return "input_writer"

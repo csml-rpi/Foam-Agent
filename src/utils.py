@@ -486,30 +486,35 @@ def run_command(script_path: str, out_file: str, err_file: str, working_dir: str
 def check_foam_errors(directory: str) -> list:
     """
     检查OpenFOAM日志文件中的错误
-    
-    Args:
-        directory: 包含日志文件的目录
-        
-    Returns:
-        错误日志列表，每个元素包含文件名和错误内容
+
+    参数:
+        directory: 包含日志文件的目录路径
+
+    返回:
+        错误日志列表，每个元素是一个字典，包含文件名和错误内容
     """
     print(f"[DEBUG] 检查OpenFOAM错误，目录: {directory}")
     error_logs = []
-    # DOTALL模式允许'.'匹配换行符
+    # 定义正则表达式，匹配以"ERROR:"开头的内容，DOTALL模式下'.'也能匹配换行符
     pattern = re.compile(r"ERROR:(.*)", re.DOTALL)
     
+    # 遍历目录下所有文件
     for file in os.listdir(directory):
+        # 只处理以"log"开头的文件（通常是OpenFOAM的日志文件，如log.blockMesh、log.icoFoam等）
         if file.startswith("log"):
             filepath = os.path.join(directory, file)
             print(f"[DEBUG] 检查日志文件: {filepath}")
             with open(filepath, 'r') as f:
                 content = f.read()
             
+            # 用正则表达式查找第一个"ERROR:"及其后面的所有内容
             match = pattern.search(content)
             if match:
                 error_content = match.group(0).strip()
+                # 记录错误日志，包含文件名和错误内容
                 error_logs.append({"file": file, "error_content": error_content})
                 print(f"[DEBUG] 发现错误: {file}")
+            # 如果没有匹配到"ERROR:"，但内容中包含"error"（不区分大小写），也给出警告
             elif "error" in content.lower():
                 print(f"[WARNING] 文件 {file} 包含'error'但不匹配预期格式")
     
