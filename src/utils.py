@@ -486,10 +486,10 @@ def run_command(script_path: str, out_file: str, err_file: str, working_dir: str
 def check_foam_errors(directory: str) -> list:
     """
     检查OpenFOAM日志文件中的错误
-
+    
     参数:
         directory: 包含日志文件的目录路径
-
+        
     返回:
         错误日志列表，每个元素是一个字典，包含文件名和错误内容
     """

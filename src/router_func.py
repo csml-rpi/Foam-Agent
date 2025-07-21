@@ -200,7 +200,7 @@ def llm_requires_visualization(state: GraphState) -> bool:
         "paraview, post-processing, results analysis, or any mention of viewing/displaying results. "
         "If the user explicitly mentions or implies they want visualization, return 'visualization'. "
         "If they don't mention visualization or only want to run the simulation, return 'no_visualization'. "
-        "Be conservative - if unsure, assume visualization is wanted unless clearly specified otherwise." 
+        "Be conservative - if unsure, assume visualization is wanted unless clearly specified otherwise."
         # "Be strict - only return 'visualization' if the user explicitly requests it or uses clear visualization keywords."
     )
     
