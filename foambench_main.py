@@ -35,6 +35,12 @@ def parse_args():
         required=True,
         help="User requirement file path for the benchmark"
     )
+    parser.add_argument(
+        '--custom_mesh_path',
+        type=str,
+        default=None,
+        help="Path to custom mesh file (e.g., .msh, .stl, .obj). If not provided, no custom mesh will be used."
+    )
     return parser.parse_args()
 
 def run_command(command_str):
@@ -139,11 +145,15 @@ def main():
     if not os.path.exists(f"{script_dir}/database/faiss/openfoam_tutorials_details"):
         SCRIPTS.append(f"python database/script/faiss_tutorials_details.py --database_path=./database")
     
-    print(f"python src/main.py --prompt_path='{args.prompt_path}' --output_dir='{args.output}'")
+    # Build main workflow command with optional custom mesh path
+    main_cmd = f"python src/main.py --prompt_path='{args.prompt_path}' --output_dir='{args.output}'"
+    if args.custom_mesh_path:
+        main_cmd += f" --custom_mesh_path='{args.custom_mesh_path}'"
     
-    # 添加主要的基准测试工作流程脚本
+    print(f"Main workflow command: {main_cmd}")
+    # Main workflow
     SCRIPTS.extend([
-        f"python src/main.py --prompt_path='{args.prompt_path}' --output_dir='{args.output}'"
+        main_cmd
     ])
 
     # 按顺序执行所有脚本
@@ -153,6 +163,6 @@ def main():
     print("Workflow completed successfully.")
 
 if __name__ == "__main__":
-    # 使用示例：
-    # python foambench_main.py --openfoam_path $WM_PROJECT_DIR --output ./output --prompt_path "./user_requirement.txt"
+    ## python foambench_main.py --openfoam_path $WM_PROJECT_DIR --output ./output --prompt_path "./user_requirement.txt"
+    ## python foambench_main.py --openfoam_path $WM_PROJECT_DIR --output ./output --prompt_path "./user_requirement.txt" --custom_mesh_path "./my_mesh.msh"
     main()

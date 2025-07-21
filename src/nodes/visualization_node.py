@@ -15,8 +15,38 @@ OpenFOAM可视化节点
 """
 
 import os
+import subprocess
+import sys
 from typing import List, Optional
 from pydantic import BaseModel, Field
+from utils import save_file
+
+# Helper to get the .foam file name
+def get_foam_file(case_dir):
+    case_dir_name = os.path.basename(os.path.normpath(case_dir))
+    return f"{case_dir_name}.foam"
+
+VISUALIZATION_SYSTEM_PROMPT = (
+    "You are an expert in OpenFOAM post-processing and PyVista Python scripting. "
+    "Your task is to generate a PyVista Python script that visualizes the specified data from the OpenFOAM case. "
+    "The script should load the OpenFOAM case data by reading the .foam file (e.g., 'runs.foam') in the case directory using PyVista, display the geometry, and color the surface by the specified field (e.g., 'U' for velocity). "
+    "Ensure the script shows the geometry, sets up the colorbar, and saves the visualization as a PNG file. "
+    "Use coolwarm colormap."
+    "The script must save the visualization as a PNG file, and the output image must contain the geometry and the colorbar, not just the colorbar. "
+    "IMPORTANT: Return ONLY the Python code without any markdown formatting, code block markers, or explanatory text. "
+    "The script should start with the necessary imports, read the .foam file using PyVista, and end with the screenshot saving."
+)
+
+ERROR_FIX_SYSTEM_PROMPT = (
+    "You are an expert in PyVista Python scripting and OpenFOAM visualization. "
+    "Your task is to fix the provided PyVista Python script that encountered an error. "
+    "Ensure the script loads the OpenFOAM case data by reading the .foam file (e.g., 'runs.foam') in the case directory using PyVista, displays the geometry, and colors the surface by the specified field. "
+    "Make sure the script shows the geometry, sets up the colorbar, and saves the visualization as a PNG file. "
+    "Use coolwarm colormap."
+    "The script must save the visualization as a PNG file, and the output image must contain the geometry and the colorbar, not just the colorbar. "
+    "IMPORTANT: Return ONLY the Python code without any markdown formatting, code block markers, or explanatory text. "
+    "The script should start with the necessary imports, read the .foam file using PyVista, and end with the screenshot saving."
+)
 
 class PlotConfigPydantic(BaseModel):
     """Configuration for plotting parameters"""
@@ -41,135 +71,219 @@ class VisualizationAnalysisPydantic(BaseModel):
 
 def visualization_node(state):
     """
-    Visualization node: Creates plots and visualizations from the successfully generated OpenFOAM case.
-    This nodeuses the successfully generated code and user_requirement to create plots.
+    Visualization node: Creates PyVista visualizations from the successfully generated OpenFOAM case.
+    This node uses the successfully generated code and user_requirement to create PyVista visualizations.
     
     Updates state with:
       - plot_configs: List of plot configurations
       - plot_outputs: List of generated plot file paths
       - visualization_summary: Summary of generated visualizations
+      - pyvista_visualization: PyVista visualization results
     """
     config = state["config"]
     user_requirement = state["user_requirement"]
     case_dir = state["case_dir"]
     
-    print(f"============================== Visualization Node ==============================")
-    print(f"[visualization_node] 开始可视化处理...")
-    print(f"[visualization_node] 案例名称: {state.get('case_name', 'Unknown')}")
-    print(f"[visualization_node] 案例目录: {case_dir}")
-    print(f"[visualization_node] 用户需求长度: {len(user_requirement)} 字符")
+    print(f"============================== Visualization (PyVista) ==============================")
     
-    # 步骤1：分析用户需求以确定需要生成哪些图表
-    print("Step 1: Analyzing user requirements for visualization needs...")
-    print(f"[visualization_node] 步骤1：分析用户需求中的可视化要求...")
-    
-    # 可视化分析的系统提示词 - 用于从用户需求中提取可视化相关信息
-    visualization_system_prompt = (
-        "You are an expert in OpenFOAM visualization and computational fluid dynamics. "
-        "Your task is to analyze user requirements and extract key information needed for visualization. "
-        "Focus specifically on visualization-related information and ignore other simulation setup details. "
-        "Extract the following key elements:\n"
-        "- Primary field to visualize (e.g., velocity magnitude, pressure, temperature)\n"
-        "- Type of plot requested (e.g., contour, vector, streamline, time series)\n"
-        "- Time step information (if specified)\n"
-        "- Plane or slice information (if 2D visualization is requested)\n"
-        "- Additional fields that might be useful to visualize\n"
-        "- Priority of the visualization request\n\n"
-        "Your output must strictly follow the JSON schema provided and include no additional information. "
-        "If specific visualization details are not mentioned, make reasonable assumptions based on the simulation type."
-    )
-    
-    # 构建用户提示词，要求LLM分析用户需求中的可视化需求
-    visualization_user_prompt = (
-        f"User Requirement: {user_requirement}\n\n"
-        "Please analyze this user requirement and extract the visualization needs. "
-        "Focus on what the user wants to visualize, what fields are important, and what type of plots would be most useful. "
-        "Ignore simulation setup details like boundary conditions, mesh information, or solver settings unless they directly relate to visualization."
-    )
-    
-    print(f"[visualization_node] 调用LLM服务分析可视化需求...")
-    print(f"[visualization_node] 用户提示词长度: {len(visualization_user_prompt)} 字符")
-    
-    # 调用LLM服务分析用户需求中的可视化要求
-    visualization_analysis = state["llm_service"].invoke(
-        visualization_user_prompt, 
-        visualization_system_prompt, 
-        pydantic_obj=VisualizationAnalysisPydantic
-    )
-    
-    # 输出分析结果的关键信息
-    print(f"[visualization_node] LLM分析完成，提取的可视化信息:")
-    print(f"[visualization_node] 主要可视化字段: {visualization_analysis.primary_field}")
-    print(f"[visualization_node] 请求的图表类型: {visualization_analysis.plot_type}")
-    if visualization_analysis.time_step:
-        print(f"[visualization_node] 指定时间步: {visualization_analysis.time_step}")
-    if visualization_analysis.plane_info:
-        print(f"[visualization_node] 平面信息: {visualization_analysis.plane_info}")
-    if visualization_analysis.additional_fields:
-        print(f"[visualization_node] 附加字段: {visualization_analysis.additional_fields}")
-    print(f"[visualization_node] 可视化优先级: {visualization_analysis.visualization_priority}")
-    
-    # 步骤2：检查可用的OpenFOAM数据文件和时间步
-    print(f"[visualization_node] 步骤2：检查可用的OpenFOAM数据文件和时间步...")
-    print(f"[visualization_node] TODO: 扫描案例目录以获取可用的时间步和字段数据")
-    # TODO: Scan case directory for available time steps and field data
-    pass
-    
-    # 步骤3：基于可用数据和用户需求生成可视化计划
-    print(f"[visualization_node] 步骤3：基于可用数据和用户需求生成可视化计划...")
-    print(f"[visualization_node] TODO: 创建结构化计划，确定需要生成哪些图表")
-    # TODO: Create structured plan for what plots to generate
-    pass
-    
-    # 步骤4：使用OpenFOAM工具执行绘图命令
-    print(f"[visualization_node] 步骤4：使用OpenFOAM工具执行绘图命令...")
-    print(f"[visualization_node] TODO: 运行OpenFOAM后处理工具（postProcess, sample等）")
-    # TODO: Run OpenFOAM post-processing tools (postProcess, sample, etc.)
-    pass
-    
-    # 步骤5：使用matplotlib、pyvista或其他可视化库生成图表
-    print(f"[visualization_node] 步骤5：使用可视化库生成图表...")
-    print(f"[visualization_node] TODO: 从处理后的数据创建实际图表")
-    # TODO: Create actual plots from the processed data
-    pass
-    
-    # 步骤6：保存图表并生成摘要
-    print(f"[visualization_node] 步骤6：保存图表并生成摘要...")
-    print(f"[visualization_node] TODO: 将图表保存到输出目录并创建摘要报告")
-    # TODO: Save plots to output directory and create summary report
-    pass
-    
-    # 为骨架代码提供模拟返回值
-    print(f"[visualization_node] 生成模拟的可视化配置...")
-    
-    # 模拟的图表配置列表，我草，这里其实应该用pydantic来生成，而不是用字典
-    # 感觉它先hard code了
-    plot_configs = [
-        {
-            "plot_type": "contour",
-            "field_name": "p",
-            "time_step": "latest",
-            "output_format": "png",
-            "output_path": os.path.join(case_dir, "plots", "pressure_contour.png")
-        },
-        {
-            "plot_type": "vector",
-            "field_name": "U",
-            "time_step": "latest", 
-            "output_format": "png",
-            "output_path": os.path.join(case_dir, "plots", "velocity_vectors.png")
+    # Ensure case_dir is absolute
+    case_dir = os.path.abspath(case_dir)
+    if not os.path.exists(case_dir):
+        print(f"Case directory does not exist: {case_dir}")
+        return {
+            **state,
+            "plot_configs": [],
+            "plot_outputs": [],
+            "visualization_summary": {"error": f"Case directory does not exist: {case_dir}"},
+            "pyvista_visualization": {"success": False, "error": f"Case directory does not exist: {case_dir}"}
         }
-    ]
     
-    print(f"[visualization_node] 图表配置数量: {len(plot_configs)}")
-    for i, config in enumerate(plot_configs):
-        print(f"[visualization_node] 配置 {i+1}: 类型={config['plot_type']}, 字段={config['field_name']}, 输出={config['output_path']}")
+    # Touch the .foam file before generating the visualization script
+    foam_file = get_foam_file(case_dir)
+    foam_file_path = os.path.join(case_dir, foam_file)
+    with open(foam_file_path, 'a'):
+        os.utime(foam_file_path, None)
     
-    # 模拟的图表输出文件路径列表
-    plot_outputs = [
-        os.path.join(case_dir, "plots", "pressure_contour.png"),
-        os.path.join(case_dir, "plots", "velocity_vectors.png")
-    ]
+    # Initialize loop counter
+    current_loop = 0
+    error_logs = []
+    max_loop = state['config'].max_loop
+    
+    while current_loop < max_loop:
+        current_loop += 1
+        print(f"Attempt {current_loop} of {max_loop}")
+        
+        # Create visualization script
+        viz_prompt = (
+            f"<case_directory>{case_dir}</case_directory>\n"
+            f"<foam_file>{foam_file}</foam_file>\n"
+            f"<visualization_requirements>{state['user_requirement']}</visualization_requirements>\n"
+            f"<previous_errors>{error_logs}</previous_errors>\n"
+            f"Please create a PyVista Python script that visualizes the specified data by reading the .foam file ('{foam_file}') and saves it as a PNG file named visualization.png."
+        )
+        
+        viz_script = state["llm_service"].invoke(viz_prompt, VISUALIZATION_SYSTEM_PROMPT)
+        
+        # Save the visualization script
+        script_path = os.path.join(case_dir, "visualization.py")
+        save_file(script_path, viz_script)
+        
+        # Execute the script using Python
+        try:
+            result = subprocess.run(
+                [sys.executable, script_path],
+                cwd=case_dir,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            print(f"Finished command: Return Code {result.returncode}")
+            error_logs = []
+            
+            # Check if the output image was created
+            output_image = os.path.join(case_dir, "visualization.png")
+            if os.path.exists(output_image):
+                print(f"PyVista visualization created successfully: {output_image}")
+                
+                # Create plot configs and outputs in the expected format
+                plot_configs = [
+                    {
+                        "plot_type": "pyvista_2d",
+                        "field_name": "U",  # Default field, could be enhanced to detect from script
+                        "time_step": "latest",
+                        "output_format": "png",
+                        "output_path": output_image
+                    }
+                ]
+                
+                plot_outputs = [output_image]
+                
+                visualization_summary = {
+                    "total_plots_generated": len(plot_outputs),
+                    "plot_types": ["pyvista_2d"],
+                    "fields_visualized": ["U"],
+                    "output_directory": case_dir,
+                    "pyvista_success": True
+                }
+                
+                pyvista_result = {
+                    "success": True,
+                    "output_image": output_image,
+                    "script": viz_script
+                }
+                
+                print(f"Generated {len(plot_outputs)} plots")
+                print(f"PyVista visualization saved to: {output_image}")
+                print("============================== Visualization Complete ==============================")
+                
+                return {
+                    **state,
+                    "plot_configs": plot_configs,
+                    "plot_outputs": plot_outputs,
+                    "visualization_summary": visualization_summary,
+                    "pyvista_visualization": pyvista_result
+                }
+            else:
+                error_logs.append("Visualization script executed but no output image was created")
+                
+        except subprocess.CalledProcessError as e:
+            error_message = f"Error executing visualization script: {str(e)}"
+            if e.stdout:
+                error_message += f"\nSTDOUT:\n{e.stdout.decode() if isinstance(e.stdout, bytes) else e.stdout}"
+            if e.stderr:
+                error_message += f"\nSTDERR:\n{e.stderr.decode() if isinstance(e.stderr, bytes) else e.stderr}"
+            error_logs.append(error_message)
+        
+        # If we have errors and haven't reached max loops, try to fix them
+        if error_logs and current_loop < max_loop:
+            error_fix_prompt = (
+                f"<error_logs>{error_logs}</error_logs>\n"
+                f"<foam_file>{foam_file}</foam_file>\n"
+                f"<original_script>{viz_script}</original_script>\n"
+                f"<attempt_number>{current_loop}</attempt_number>\n"
+                f"Please fix the PyVista Python script based on the error messages. The script should read the .foam file ('{foam_file}') in the case directory."
+            )
+            
+            fixed_script = state["llm_service"].invoke(error_fix_prompt, ERROR_FIX_SYSTEM_PROMPT)
+            
+            # Save the fixed script
+            save_file(script_path, fixed_script)
+            
+            # Try executing the fixed script
+            try:
+                result = subprocess.run(
+                    [sys.executable, script_path],
+                    cwd=case_dir,
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                print(f"Finished command: Return Code {result.returncode}")
+                error_logs = []
+                
+                # Check if the output image was created
+                output_image = os.path.join(case_dir, "visualization.png")
+                if os.path.exists(output_image):
+                    print(f"PyVista visualization created successfully: {output_image}")
+                    
+                    # Create plot configs and outputs in the expected format
+                    plot_configs = [
+                        {
+                            "plot_type": "pyvista_3d",
+                            "field_name": "U",  # Default field, could be enhanced to detect from script
+                            "time_step": "latest",
+                            "output_format": "png",
+                            "output_path": output_image
+                        }
+                    ]
+                    
+                    plot_outputs = [output_image]
+                    
+                    visualization_summary = {
+                        "total_plots_generated": len(plot_outputs),
+                        "plot_types": ["pyvista_3d"],
+                        "fields_visualized": ["U"],
+                        "output_directory": case_dir,
+                        "pyvista_success": True
+                    }
+                    
+                    pyvista_result = {
+                        "success": True,
+                        "output_image": output_image,
+                        "script": fixed_script
+                    }
+                    
+                    print(f"Generated {len(plot_outputs)} plots")
+                    print(f"PyVista visualization saved to: {output_image}")
+                    print("============================== Visualization Complete ==============================")
+                    
+                    return {
+                        **state,
+                        "plot_configs": plot_configs,
+                        "plot_outputs": plot_outputs,
+                        "visualization_summary": visualization_summary,
+                        "pyvista_visualization": pyvista_result
+                    }
+                else:
+                    error_logs.append("Fixed visualization script executed but no output image was created")
+                    
+            except subprocess.CalledProcessError as e:
+                error_message = f"Error executing fixed visualization script: {str(e)}"
+                if e.stdout:
+                    error_message += f"\nSTDOUT:\n{e.stdout.decode() if isinstance(e.stdout, bytes) else e.stdout}"
+                if e.stderr:
+                    error_message += f"\nSTDERR:\n{e.stderr.decode() if isinstance(e.stderr, bytes) else e.stderr}"
+                error_logs.append(error_message)
+    
+    # If we've exhausted all attempts
+    if current_loop >= max_loop:
+        print(f"Failed to create visualization after {max_loop} attempts")
+        error_message = f"Maximum number of attempts ({max_loop}) reached without success"
+        error_logs.append(error_message)
+    
+    # Return failure state in the expected format
+    plot_configs = []
+    plot_outputs = []
     
     print(f"[visualization_node] 图表输出文件数量: {len(plot_outputs)}")
     for i, output in enumerate(plot_outputs):
@@ -177,28 +291,26 @@ def visualization_node(state):
     
     # 可视化摘要信息
     visualization_summary = {
-        "total_plots_generated": len(plot_outputs),
-        "plot_types": ["contour", "vector"],
-        "fields_visualized": ["p", "U"],
-        "output_directory": os.path.join(case_dir, "plots")
+        "total_plots_generated": 0,
+        "plot_types": [],
+        "fields_visualized": [],
+        "output_directory": case_dir,
+        "pyvista_success": False,
+        "error": error_message if 'error_message' in locals() else "Unknown error"
     }
     
-    print(f"[visualization_node] 可视化摘要:")
-    print(f"[visualization_node] - 生成的图表总数: {visualization_summary['total_plots_generated']}")
-    print(f"[visualization_node] - 图表类型: {visualization_summary['plot_types']}")
-    print(f"[visualization_node] - 可视化字段: {visualization_summary['fields_visualized']}")
-    print(f"[visualization_node] - 输出目录: {visualization_summary['output_directory']}")
+    pyvista_result = {
+        "success": False,
+        "error": error_message if 'error_message' in locals() else "Unknown error",
+        "error_logs": error_logs
+    }
     
-    print(f"Generated {len(plot_outputs)} plots")
-    print(f"Plots saved to: {os.path.join(case_dir, 'plots')}")
-    print("============================== Visualization Complete ==============================")
+    print("============================== Visualization Failed ==============================")
     
-    # 返回更新后的状态
-    print(f"[visualization_node] 返回更新后的状态...")
     return {
         **state,
-        "visualization_analysis": visualization_analysis,
         "plot_configs": plot_configs,
         "plot_outputs": plot_outputs,
-        "visualization_summary": visualization_summary
+        "visualization_summary": visualization_summary,
+        "pyvista_visualization": pyvista_result
     }

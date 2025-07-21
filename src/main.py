@@ -7,11 +7,10 @@ from dataclasses import dataclass, field
 from typing import List, Optional, TypedDict, Literal
 from langgraph.graph import StateGraph, START, END  # LangGraph工作流图相关组件
 from langgraph.types import Command
-import argparse  # 命令行参数解析
-from pathlib import Path  # 路径处理
-from utils import LLMService  # LLM服务封装
+import argparse
+from pathlib import Path
+from utils import LLMService, GraphState
 
-# 导入配置和各个工作流节点
 from config import Config
 from nodes.architect_node import architect_node      # 架构师节点：解析用户需求并规划工作
 from nodes.meshing_node import meshing_node          # 网格节点：处理自定义网格文件
@@ -23,11 +22,10 @@ from nodes.hpc_runner_node import hpc_runner_node    # HPC运行节点：在高�
 
 # 导入路由函数和工作流状态定义
 from router_func import (
-    GraphState,                    # 工作流状态数据结构
-    route_after_architect,         # 架构师节点后的路由逻辑
-    route_after_input_writer,      # 输入文件编写节点后的路由逻辑
-    route_after_runner,            # 运行节点后的路由逻辑
-    route_after_reviewer           # 审查节点后的路由逻辑
+    route_after_architect, 
+    route_after_input_writer, 
+    route_after_runner, 
+    route_after_reviewer
 )
 import json
 
@@ -88,128 +86,58 @@ def create_foam_agent_graph() -> StateGraph:
     
     return workflow
 
-def initialize_state(user_requirement: str, config: Config) -> GraphState:
-    """
-    初始化工作流状态
-    
-    该函数创建并初始化工作流的初始状态，包括：
-    - 用户需求文本
-    - 系统配置参数
-    - 案例统计信息（从数据库加载）
-    - 各种中间状态字段的初始值
-    
-    Args:
-        user_requirement (str): 用户的CFD仿真需求描述
-        config (Config): 系统配置对象
-        
-    Returns:
-        GraphState: 初始化完成的工作流状态对象
-    """
-    # 从数据库加载OpenFOAM案例统计信息
-    # 这些统计信息用于帮助LLM理解可用的案例类型和配置选项
-    case_stats_file_path = f"{config.database_path}/raw/openfoam_case_stats.json"
-    print(f"📊 正在加载案例统计信息...")
-    print(f"    📁 文件路径: {case_stats_file_path}")
-    
-    try:
-        with open(case_stats_file_path, "r", encoding="utf-8") as f:
-            case_stats = json.load(f)
-        
-        print(f"✅ 成功加载案例统计信息:")
-        print(f"    🏷️  案例领域 (case_domain): {len(case_stats['case_domain'])} 个")
-        print(f"        📋 可选值: {case_stats['case_domain']}")
-        print(f"    🏷️  案例类别 (case_category): {len(case_stats['case_category'])} 个")
-        print(f"        📋 可选值: {case_stats['case_category']}")
-        print(f"    🏷️  案例名称 (case_name): {len(case_stats['case_name'])} 个")
-        print(f"        📋 可选值: {case_stats['case_name']}")
-        print(f"    🏷️  案例求解器 (case_solver): {len(case_stats['case_solver'])} 个")
-        print(f"        📋 可选值: {case_stats['case_solver']}")
-        
-        print(f"    💡 这些统计信息来自OpenFOAM教程案例的自动分析")
-        print(f"    💡 用于限制LLM输出格式，确保生成的案例信息符合现有案例库")
-        
-    except FileNotFoundError:
-        print(f"❌ 错误: 找不到案例统计文件 {case_stats_file_path}")
-        print(f"    💡 请先运行数据库初始化脚本生成统计信息")
-        raise
-    except json.JSONDecodeError as e:
-        print(f"❌ 错误: 案例统计文件格式错误: {e}")
-        raise
-    except Exception as e:
-        print(f"❌ 错误: 加载案例统计信息失败: {e}")
-        raise
-    
-    # 创建初始状态对象，包含所有必要的字段
+def initialize_state(user_requirement: str, config: Config, custom_mesh_path: Optional[str] = None) -> GraphState:
+    case_stats = json.load(open(f"{config.database_path}/raw/openfoam_case_stats.json", "r"))
+    mesh_type = "custom_mesh" if custom_mesh_path else "standard_mesh"
     state = GraphState(
-        # 核心输入参数
-        user_requirement=user_requirement,  # 用户需求文本
-        config=config,                      # 系统配置
-        
-        # 案例基本信息（将在工作流中逐步填充）
-        case_dir="",                        # 案例目录路径
-        tutorial="",                        # 参考教程名称
-        case_name="",                       # 案例名称
-        subtasks=[],                        # 子任务列表
-        current_subtask_index=0,            # 当前子任务索引
-        
-        # 错误处理相关
-        error_command=None,                 # 出错的命令
-        error_content=None,                 # 错误内容
-        loop_count=0,                       # 循环次数（用于防止无限循环）
-        
-        # LLM服务实例
-        llm_service=LLMService(config),     # 大语言模型服务
-        
-        # 参考信息（从FAISS数据库检索）
-        case_stats=case_stats,              # 案例统计信息
-        tutorial_reference=None,            # 教程参考信息
-        case_path_reference=None,           # 案例路径参考
-        dir_structure_reference=None,       # 目录结构参考
-        case_info=None,                     # 案例详细信息
-        allrun_reference=None,              # allrun脚本参考
-        
-        # 工作流中间状态
-        dir_structure=None,                 # 目录结构
-        commands=None,                      # 执行的命令列表
-        foamfiles=None,                     # OpenFOAM文件内容
-        error_logs=None,                    # 错误日志
-        history_text=None,                  # 历史文本
-        
-        # 案例分类信息
-        case_domain=None,                   # 案例领域（如incompressible, compressible等）
-        case_category=None,                 # 案例类别
-        case_solver=None,                   # 求解器类型
-        
-        # 网格相关字段
-        mesh_info=None,                     # 网格信息
-        mesh_commands=None,                 # 网格处理命令
-        mesh_file_destination=None,         # 网格文件目标位置
-        custom_mesh_used=None               # 是否使用自定义网格
+        user_requirement=user_requirement,
+        config=config,
+        case_dir="",
+        tutorial="",
+        case_name="",
+        subtasks=[],
+        current_subtask_index=0,
+        error_command=None,
+        error_content=None,
+        loop_count=0,
+        llm_service=LLMService(config),
+        case_stats=case_stats,
+        tutorial_reference=None,
+        case_path_reference=None,
+        dir_structure_reference=None,
+        case_info=None,
+        allrun_reference=None,
+        dir_structure=None,
+        commands=None,
+        foamfiles=None,
+        error_logs=None,
+        history_text=None,
+        case_domain=None,
+        case_category=None,
+        case_solver=None,
+        mesh_info=None,
+        mesh_commands=None,
+        custom_mesh_used=None,
+        mesh_type=mesh_type,
+        custom_mesh_path=custom_mesh_path,
+        review_analysis=None,
+        input_writer_mode="initial"
     )
-    
+    if custom_mesh_path:
+        print(f"Custom mesh path: {custom_mesh_path}")
+    else:
+        print("No custom mesh path provided.")
     return state
 
-def main(user_requirement: str, config: Config):
-    """
-    主函数：运行OpenFOAM工作流
-    
-    这是整个系统的核心入口函数，负责：
-    1. 创建工作流图并编译
-    2. 初始化工作流状态
-    3. 执行工作流
-    4. 处理结果和统计信息
-    
-    Args:
-        user_requirement (str): 用户的CFD仿真需求描述
-        config (Config): 系统配置对象
-    """
+def main(user_requirement: str, config: Config, custom_mesh_path: Optional[str] = None):
+    """Main function to run the OpenFOAM workflow."""
     
     # 步骤1：创建并编译工作流图
     workflow = create_foam_agent_graph()
     app = workflow.compile()  # 编译工作流图，生成可执行的应用
     
-    # 步骤2：初始化工作流状态
-    initial_state = initialize_state(user_requirement, config)
+    # Initialize the state
+    initial_state = initialize_state(user_requirement, config, custom_mesh_path)
     
     print("Starting Foam-Agent...")  # 开始执行提示
     
@@ -244,21 +172,25 @@ if __name__ == "__main__":
     """
     # 创建命令行参数解析器
     parser = argparse.ArgumentParser(
-        description="Run the OpenFOAM workflow"  # 参数解析器描述
-    )
-    
-    # 定义命令行参数
-    parser.add_argument(
-        "--prompt_path",  # 用户需求文件路径参数
-        type=str,
-        default=f"{Path(__file__).parent.parent}/user_requirement.txt",  # 默认路径
-        help="User requirement file path for the workflow.",  # 帮助信息，
+        description="Run the OpenFOAM workflow"
     )
     parser.add_argument(
-        "--output_dir",  # 输出目录参数
+        "--prompt_path",
         type=str,
-        default="",  # 默认为空，使用配置中的默认目录
-        help="Output directory for the workflow.",  # 帮助信息
+        default=f"{Path(__file__).parent.parent}/user_requirement.txt",
+        help="User requirement file path for the workflow.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="",
+        help="Output directory for the workflow.",
+    )
+    parser.add_argument(
+        "--custom_mesh_path",
+        type=str,
+        default=None,
+        help="Path to custom mesh file (e.g., .msh, .stl, .obj). If not provided, no custom mesh will be used.",
     )
     
     # 解析命令行参数
@@ -276,5 +208,4 @@ if __name__ == "__main__":
     with open(args.prompt_path, 'r') as f:
         user_requirement = f.read()
     
-    # 启动主工作流
-    main(user_requirement, config)
+    main(user_requirement, config, args.custom_mesh_path)

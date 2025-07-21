@@ -1,72 +1,11 @@
 from typing import TypedDict, List, Optional
 from config import Config
-from utils import LLMService
+from utils import LLMService, GraphState
 from langgraph.graph import StateGraph, START, END
-
-# 定义图状态的数据结构，用于在LangGraph工作流中传递数据
-class GraphState(TypedDict):
-    # 用户输入的需求描述
-    user_requirement: str
-    # 配置信息
-    config: Config
-    # 案例目录路径
-    case_dir: str
-    # 教程内容
-    tutorial: str
-    # 案例名称
-    case_name: str
-    # 子任务列表
-    subtasks: List[dict]
-    # 当前子任务索引
-    current_subtask_index: int
-    # 错误命令（可选）
-    error_command: Optional[str]
-    # 错误内容（可选）
-    error_content: Optional[str]
-    # 循环计数，用于防止无限循环
-    loop_count: int
-    # 以下字段在执行过程中会被添加
-    # LLM服务实例
-    llm_service: Optional[LLMService]
-    # 案例统计信息
-    case_stats: Optional[dict]
-    # 教程参考信息
-    tutorial_reference: Optional[str]
-    # 案例路径参考
-    case_path_reference: Optional[str]
-    # 目录结构参考
-    dir_structure_reference: Optional[str]
-    # 案例信息
-    case_info: Optional[str]
-    # allrun脚本参考
-    allrun_reference: Optional[str]
-    # 目录结构
-    dir_structure: Optional[dict]
-    # 命令列表
-    commands: Optional[List[str]]
-    # OpenFOAM文件信息
-    foamfiles: Optional[dict]
-    # 错误日志列表
-    error_logs: Optional[List[str]]
-    # 历史文本
-    history_text: Optional[List[str]]
-    # 案例领域（如流体力学、热传导等）
-    case_domain: Optional[str]
-    # 案例类别
-    case_category: Optional[str]
-    # 求解器类型
-    case_solver: Optional[str]
-    # 网格相关状态字段
-    mesh_info: Optional[dict]
-    # 网格生成命令
-    mesh_commands: Optional[List[str]]
-    # 网格文件目标路径
-    mesh_file_destination: Optional[str]
-    # 是否使用自定义网格
-    custom_mesh_used: Optional[bool]
+from langgraph.types import Command
 
 
-def llm_requires_custom_mesh(state: GraphState) -> bool:
+def llm_requires_custom_mesh(state: GraphState) -> int:
     """
     使用LLM判断用户是否需要自定义网格
     
@@ -81,7 +20,7 @@ def llm_requires_custom_mesh(state: GraphState) -> bool:
         state: 包含用户需求和LLM服务的当前图状态
         
     Returns:
-        bool: 如果需要自定义网格返回True，否则返回False
+        int: 1 if custom mesh is required, 2 if gmsh mesh is required, 0 otherwise
     """
     user_requirement = state["user_requirement"]
     print(f"[DEBUG] 分析用户需求是否需要自定义网格: {user_requirement[:100]}...")
@@ -94,15 +33,15 @@ def llm_requires_custom_mesh(state: GraphState) -> bool:
         "or any mention of importing/using external mesh files. "
         "If the user explicitly mentions or implies they want to use a custom mesh file, return 'custom_mesh'. "
         "If they want to use standard OpenFOAM mesh generation (blockMesh, snappyHexMesh with STL, etc.), return 'standard_mesh'. "
-        "Be conservative - if unsure, assume standard mesh unless clearly specified otherwise."
+        "Look for keywords like gmsh and determine if they want to create mesh using gmsh. If they want to create mesh using gmsh, return 'gmsh_mesh'. "
+        "Be conservative - if unsure, assume 'standard_mesh' unless clearly specified otherwise."
+        "Only return 'custom_mesh' or 'standard_mesh' or 'gmsh_mesh'. Don't return anything else."
     )
     
     # 用户提示词：具体的问题描述
     user_prompt = (
         f"User requirement: {user_requirement}\n\n"
-        "Determine if the user wants to use a custom mesh file. "
-        "Return exactly 'custom_mesh' if they want to use a custom mesh file, "
-        "or 'standard_mesh' if they want standard OpenFOAM mesh generation."
+        "Determine if the user wants to use 'custom_mesh' or 'standard_mesh' or 'gmsh_mesh'. "
     )
     
     # 检查LLM服务是否可用
@@ -112,11 +51,12 @@ def llm_requires_custom_mesh(state: GraphState) -> bool:
     
     # 调用LLM服务进行分析
     response = state["llm_service"].invoke(user_prompt, system_prompt)
-    print(f"[DEBUG] LLM响应: {response}")
-    
-    result = "custom_mesh" in response.lower()
-    print(f"[DEBUG] 是否需要自定义网格: {result}")
-    return result
+    if "custom_mesh" in response.lower():
+        return 1
+    elif "gmsh_mesh" in response.lower():
+        return 2
+    else:
+        return 0
 
 
 def llm_requires_hpc(state: GraphState) -> bool:
@@ -148,14 +88,13 @@ def llm_requires_hpc(state: GraphState) -> bool:
         "If the user explicitly mentions or implies they want to run on HPC/cluster, return 'hpc_run'. "
         "If they want to run locally or don't specify, return 'local_run'. "
         "Be conservative - if unsure, assume local run unless clearly specified otherwise."
+        "Only return 'hpc_run' or 'local_run'. Don't return anything else."
     )
     
     # 用户提示词：具体的问题描述
     user_prompt = (
         f"User requirement: {user_requirement}\n\n"
-        "Determine if the user wants to run the simulation on HPC/cluster. "
-        "Return exactly 'hpc_run' if they want to use HPC/cluster, "
-        "or 'local_run' if they want to run locally."
+        "return 'hpc_run' or 'local_run'"
     )
     
     # 检查LLM服务是否可用
@@ -196,20 +135,17 @@ def llm_requires_visualization(state: GraphState) -> bool:
     system_prompt = (
         "You are an expert in OpenFOAM workflow analysis. "
         "Analyze the user requirement to determine if they want visualization of results. "
-        "Look for keywords like: plot, visualize, graph, chart, contour, streamlines, "
-        "paraview, post-processing, results analysis, or any mention of viewing/displaying results. "
-        "If the user explicitly mentions or implies they want visualization, return 'visualization'. "
+        "Look for keywords like: plot, visualize, graph, chart, contour, streamlines, paraview, post-processing."
+        "Only if the user explicitly mentions they want visualization, return 'yes_visualization'. "
         "If they don't mention visualization or only want to run the simulation, return 'no_visualization'. "
         "Be conservative - if unsure, assume visualization is wanted unless clearly specified otherwise."
-        # "Be strict - only return 'visualization' if the user explicitly requests it or uses clear visualization keywords."
+        "Only return 'yes_visualization' or 'no_visualization'. Don't return anything else."
     )
     
     # 用户提示词：具体的问题描述
     user_prompt = (
         f"User requirement: {user_requirement}\n\n"
-        "Determine if the user wants visualization of simulation results. "
-        "Return exactly 'visualization' if they want to visualize results, "
-        "or 'no_visualization' if they don't need visualization."
+        "return 'yes_visualization' or 'no_visualization'"
     )
     
     # 检查LLM服务是否可用
@@ -219,36 +155,23 @@ def llm_requires_visualization(state: GraphState) -> bool:
     
     # 调用LLM服务进行分析
     response = state["llm_service"].invoke(user_prompt, system_prompt)
-    print(f"[DEBUG] LLM响应: {response}")
-    
-    result = "visualization" in response.lower()
-    print(f"[DEBUG] 是否需要可视化: {result}")
-    return result
+    return "yes_visualization" in response.lower()
 
 
 def route_after_architect(state: GraphState):
     """
-    架构节点后的路由决策
-    
-    功能：根据用户是否需要自定义网格来决定下一步的执行路径
-    执行逻辑：
-    1. 调用LLM判断是否需要自定义网格
-    2. 如果需要自定义网格，路由到网格生成节点
-    3. 否则路由到输入文件编写节点
-    
-    Args:
-        state: 当前图状态
-        
-    Returns:
-        str: 下一个节点的名称
+    Route after architect node based on whether user wants custom mesh.
+    For current version, if user wants custom mesh, user should be able to provide a path to the mesh file.
     """
-    print("[DEBUG] 执行架构节点后的路由决策")
-    
-    if llm_requires_custom_mesh(state):
-        print("LLM determined: Custom mesh requested. Routing to meshing node.")
+    mesh_type = state.get("mesh_type", "standard_mesh")
+    if mesh_type == "custom_mesh":
+        print("Router: Custom mesh requested. Routing to meshing node.")
+        return "meshing"
+    elif mesh_type == "gmsh_mesh":
+        print("Router: GMSH mesh requested. Routing to meshing node.")
         return "meshing"
     else:
-        print("LLM determined: Standard mesh generation. Routing to input_writer node.")
+        print("Router: Standard mesh generation. Routing to input_writer node.")
         return "input_writer"
 
 
@@ -336,17 +259,12 @@ def route_after_reviewer(state: GraphState):
     
     if loop_count >= max_loop:
         print(f"Maximum loop count ({max_loop}) reached. Ending workflow.")
-        
-        # 即使达到最大循环次数，如果用户需要可视化，仍然进行可视化
         if llm_requires_visualization(state):
             print("[DEBUG] 达到最大循环次数但需要可视化，路由到可视化节点")
             return "visualization"
         else:
             print("[DEBUG] 达到最大循环次数且不需要可视化，结束工作流")
             return END
-    
-    # 注意：在路由函数中直接修改state不会生效
-    # 循环计数的增加应该在reviewer_node中完成
-    print(f"Loop {loop_count + 1}: Continuing to fix errors.")
-    
+    print(f"Loop {loop_count}: Continuing to fix errors.")
+
     return "input_writer"

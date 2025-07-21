@@ -163,10 +163,7 @@ def architect_node(state):
     
     # 保存参考案例信息到文件
     case_path = os.path.join(case_dir, "similar_case.txt")
-    print(f"保存参考案例信息到: {case_path}")
-
-    # exit()  # 注释掉这行，让程序继续执行
-
+    
     # TODO update all information to faiss_detailed
     tutorial_reference = faiss_detailed
     case_path_reference = case_path
@@ -227,7 +224,6 @@ def architect_node(state):
     print(f"  - subtasks数量: {len(subtasks)}")
     
     return {
-        **state,
         "case_name": case_name,
         "case_domain": case_domain,
         "case_category": case_category,
@@ -238,5 +234,5 @@ def architect_node(state):
         "dir_structure_reference": dir_structure_reference,
         "case_info": case_info,
         "allrun_reference": allrun_reference,
-        "subtasks": [{"file_name": subtask.file_name, "folder_name": subtask.folder_name} for subtask in subtasks]
+        "subtasks": [{"file_name": subtask.file_name, "folder_name": subtask.folder_name} for subtask in subtasks],
     }

@@ -53,6 +53,8 @@ def local_runner_node(state):
         print("Allrun executed successfully without errors.")
     
     # 4. 返回包含错误日志的state
+    state['loop_count'] += 1
+    # Return updated state
     return {
         **state,
         "error_logs": error_logs

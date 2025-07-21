@@ -17,8 +17,8 @@ OpenFOAM 智能代理工具模块
 import re
 import subprocess
 import os
-from typing import Optional, Any, Type
-from pydantic import BaseModel
+from typing import Optional, Any, Type, TypedDict, List
+from pydantic import BaseModel, Field
 from langchain.chat_models import init_chat_model
 from langchain_community.vectorstores import FAISS
 from langchain_openai.embeddings import OpenAIEmbeddings
@@ -27,8 +27,6 @@ from langchain_anthropic import ChatAnthropic
 from pathlib import Path
 import tracking_aws
 import requests
-from pydantic import BaseModel, Field
-from typing import List
 import time
 import random
 from botocore.exceptions import ClientError
@@ -295,6 +293,43 @@ class LLMService:
         print(f"Average completion tokens per call: {stats['average_completion_tokens']:.2f}")
         print(f"Average tokens per call: {stats['average_tokens']:.2f}\n")
         print("</LLM Service Statistics>")
+
+class GraphState(TypedDict):
+    user_requirement: str
+    config: Config
+    case_dir: str
+    tutorial: str
+    case_name: str
+    subtasks: List[dict]
+    current_subtask_index: int
+    error_command: Optional[str]
+    error_content: Optional[str]
+    loop_count: int
+    # Additional state fields that will be added during execution
+    llm_service: Optional['LLMService']
+    case_stats: Optional[dict]
+    tutorial_reference: Optional[str]
+    case_path_reference: Optional[str]
+    dir_structure_reference: Optional[str]
+    case_info: Optional[str]
+    allrun_reference: Optional[str]
+    dir_structure: Optional[dict]
+    commands: Optional[List[str]]
+    foamfiles: Optional[dict]
+    error_logs: Optional[List[str]]
+    history_text: Optional[List[str]]
+    case_domain: Optional[str]
+    case_category: Optional[str]
+    case_solver: Optional[str]
+    # Mesh-related state fields
+    mesh_info: Optional[dict]
+    mesh_commands: Optional[List[str]]
+    custom_mesh_used: Optional[bool]
+    mesh_type: Optional[str]
+    custom_mesh_path: Optional[str]
+    # Review and rewrite related fields
+    review_analysis: Optional[str]
+    input_writer_mode: Optional[str]
 
 def tokenize(text: str) -> str:
     """
