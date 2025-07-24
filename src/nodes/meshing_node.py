@@ -907,9 +907,13 @@ def meshing_node(state):
       - mesh_commands: Commands needed for mesh processing
       - mesh_file_destination: Where the mesh file should be placed
     """
+    # 1. 读取state中的配置信息、用户需求和算例目录
     config = state["config"]
     user_requirement = state["user_requirement"]
     case_dir = state["case_dir"]
+    print(f"[meshing_node] config: {config}")
+    print(f"[meshing_node] user_requirement: {user_requirement}")
+    print(f"[meshing_node] case_dir: {case_dir}")
     
     # Get mesh type from state (determined by router)
     mesh_type = state.get("mesh_type", "standard_mesh")

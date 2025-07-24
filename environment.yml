@@ -101,3 +101,4 @@ dependencies:
       - zstandard==0.23.0
       - boto3==1.36.26
       - langchain_aws==0.2.13
+      - langchain-ollama==0.1.8

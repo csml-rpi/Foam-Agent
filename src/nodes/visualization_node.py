@@ -1,4 +1,19 @@
 # visualization_node.py
+"""
+OpenFOAM可视化节点
+
+本模块实现了OpenFOAM案例的可视化功能，包括：
+1. 分析用户需求中的可视化要求
+2. 检查可用的OpenFOAM数据文件和时间步
+3. 生成可视化计划
+4. 执行OpenFOAM后处理工具
+5. 生成图表和可视化结果
+6. 保存可视化结果并生成摘要
+
+作者: OpenFOAM Agent Team
+版本: 1.0
+"""
+
 import os
 import subprocess
 import sys
@@ -270,6 +285,11 @@ def visualization_node(state):
     plot_configs = []
     plot_outputs = []
     
+    print(f"[visualization_node] 图表输出文件数量: {len(plot_outputs)}")
+    for i, output in enumerate(plot_outputs):
+        print(f"[visualization_node] 输出文件 {i+1}: {output}")
+    
+    # 可视化摘要信息
     visualization_summary = {
         "total_plots_generated": 0,
         "plot_types": [],

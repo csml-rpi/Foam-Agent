@@ -1,0 +1,18 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug foambench_main.py",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/foambench_main.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--openfoam_path", "/opt/openfoam10/",
+                "--prompt_path", "./user_requirement.txt",
+                "--output", "./output"
+            ],
+            "envFile": "${workspaceFolder}/.env"
+        }
+    ]
+}
