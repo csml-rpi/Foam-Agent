@@ -152,6 +152,9 @@ def architect_node(state):
     elif mesh_type == 2:
         mesh_type_value = "gmsh_mesh"
         print("Architect determined: GMSH mesh requested.")
+    elif mesh_type == 3:
+        mesh_type_value = "dict_mesh"
+        print("Architect determined: Dict mesh requested.")
     else:
         mesh_type_value = "standard_mesh"
         print("Architect determined: Standard mesh generation.")

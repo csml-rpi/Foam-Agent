@@ -24,9 +24,10 @@ def llm_requires_custom_mesh(state: GraphState) -> int:
         "or any mention of importing/using external mesh files. "
         "If the user explicitly mentions or implies they want to use a custom mesh file, return 'custom_mesh'. "
         "If they want to use standard OpenFOAM mesh generation (blockMesh, snappyHexMesh with STL, etc.), return 'standard_mesh'. "
+        "If the user says that they have provided blockMeshDict and snappyHexMeshDict, return 'dict_mesh'. "
         "Look for keywords like gmsh and determine if they want to create mesh using gmsh. If they want to create mesh using gmsh, return 'gmsh_mesh'. "
         "Be conservative - if unsure, assume 'standard_mesh' unless clearly specified otherwise."
-        "Only return 'custom_mesh' or 'standard_mesh' or 'gmsh_mesh'. Don't return anything else."
+        "Only return 'custom_mesh' or 'standard_mesh', 'gmsh_mesh' or 'dict_mesh'. Don't return anything else."
     )
     
     user_prompt = (
@@ -41,6 +42,8 @@ def llm_requires_custom_mesh(state: GraphState) -> int:
         return 1
     elif "gmsh_mesh" in response.lower():
         return 2
+    elif "dict_mesh" in response.lower():
+        return 3
     else:
         return 0
 

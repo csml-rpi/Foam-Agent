@@ -30,6 +30,18 @@ def parse_args():
         default=None,
         help="Path to custom mesh file (e.g., .msh, .stl, .obj). If not provided, no custom mesh will be used."
     )
+    parser.add_argument(
+        '--blockmesh_dict_path',
+        type=str,
+        default=None,
+        help="Path to blockMeshDict file. If not provided, no blockMeshDict will be used."
+    )
+    parser.add_argument(
+        '--snappyhexmesh_dict_path',
+        type=str,
+        default=None,
+        help="Path to snappyHexMeshDict file. If not provided, no snappyHexMeshDict will be used."
+    )
     return parser.parse_args()
 
 def run_command(command_str):
@@ -101,6 +113,10 @@ def main():
     main_cmd = f"python src/main.py --prompt_path='{args.prompt_path}' --output_dir='{args.output}'"
     if args.custom_mesh_path:
         main_cmd += f" --custom_mesh_path='{args.custom_mesh_path}'"
+    if args.blockmesh_dict_path:
+        main_cmd += f" --blockmesh_dict_path='{args.blockmesh_dict_path}'"
+    if args.snappyhexmesh_dict_path:
+        main_cmd += f" --snappyhexmesh_dict_path='{args.snappyhexmesh_dict_path}'"
     
     print(f"Main workflow command: {main_cmd}")
     # Main workflow

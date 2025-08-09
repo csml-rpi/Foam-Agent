@@ -49,7 +49,7 @@ def create_foam_agent_graph() -> StateGraph:
     
     return workflow
 
-def initialize_state(user_requirement: str, config: Config, custom_mesh_path: Optional[str] = None) -> GraphState:
+def initialize_state(user_requirement: str, config: Config, custom_mesh_path: Optional[str] = None, blockmesh_dict_path: Optional[str] = None, snappyhexmesh_dict_path: Optional[str] = None) -> GraphState:
     case_stats = json.load(open(f"{config.database_path}/raw/openfoam_case_stats.json", "r"))
     # mesh_type = "custom_mesh" if custom_mesh_path else "standard_mesh"
     state = GraphState(
@@ -87,7 +87,9 @@ def initialize_state(user_requirement: str, config: Config, custom_mesh_path: Op
         input_writer_mode="initial",
         job_id=None,
         cluster_info=None,
-        slurm_script_path=None
+        slurm_script_path=None,
+        blockmesh_upload_path=blockmesh_dict_path,
+        snappyhexmesh_upload_path=snappyhexmesh_dict_path
     )
     if custom_mesh_path:
         print(f"Custom mesh path: {custom_mesh_path}")
@@ -95,7 +97,7 @@ def initialize_state(user_requirement: str, config: Config, custom_mesh_path: Op
         print("No custom mesh path provided.")
     return state
 
-def main(user_requirement: str, config: Config, custom_mesh_path: Optional[str] = None):
+def main(user_requirement: str, config: Config, custom_mesh_path: Optional[str] = None, blockmesh_dict_path: Optional[str] = None, snappyhexmesh_dict_path: Optional[str] = None):
     """Main function to run the OpenFOAM workflow."""
     
     # Create and compile the graph
@@ -103,7 +105,7 @@ def main(user_requirement: str, config: Config, custom_mesh_path: Optional[str] 
     app = workflow.compile()
     
     # Initialize the state
-    initial_state = initialize_state(user_requirement, config, custom_mesh_path)
+    initial_state = initialize_state(user_requirement, config, custom_mesh_path, blockmesh_dict_path, snappyhexmesh_dict_path)
     
     print("Starting Foam-Agent...")
     
@@ -145,6 +147,18 @@ if __name__ == "__main__":
         default=None,
         help="Path to custom mesh file (e.g., .msh, .stl, .obj). If not provided, no custom mesh will be used.",
     )
+    parser.add_argument(
+        "--blockmesh_dict_path",
+        type=str,
+        default=None,
+        help="Path to blockMeshDict file. If not provided, no blockMeshDict will be used.",
+    )
+    parser.add_argument(
+        "--snappyhexmesh_dict_path",
+        type=str,
+        default=None,
+        help="Path to snappyHexMeshDict file. If not provided, no snappyHexMeshDict will be used.",
+    )
     
     args = parser.parse_args()
     print(args)
@@ -157,4 +171,4 @@ if __name__ == "__main__":
     with open(args.prompt_path, 'r') as f:
         user_requirement = f.read()
     
-    main(user_requirement, config, args.custom_mesh_path)
+    main(user_requirement, config, args.custom_mesh_path, args.blockmesh_dict_path, args.snappyhexmesh_dict_path)

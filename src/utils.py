@@ -256,6 +256,9 @@ class GraphState(TypedDict):
     job_id: Optional[str]
     cluster_info: Optional[dict]
     slurm_script_path: Optional[str]
+    # Uploaded meshing dictionaries
+    blockmesh_upload_path: Optional[str]
+    snappyhexmesh_upload_path: Optional[str]
 
 def tokenize(text: str) -> str:
     # Replace underscores with spaces

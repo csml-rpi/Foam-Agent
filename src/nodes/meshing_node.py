@@ -395,6 +395,151 @@ def handle_custom_mesh(state, case_dir):
             "error_logs": error_logs
         }
 
+def handle_uploaded_mesh_dicts(state, case_dir):
+    """
+    Handle user-uploaded blockMeshDict and snappyHexMeshDict.
+    - Copy provided dict files into system directory
+    - Create minimal controlDict via LLM (like custom mesh path flow)
+    - Run blockMesh if blockMeshDict provided
+    - Run snappyHexMesh (with -overwrite) if snappyHexMeshDict provided
+    - Verify constant/polyMesh exists; run checkMesh
+    Returns a dict with mesh_info, mesh_commands, mesh_file_destination, error_logs
+    """
+    print("============================== Uploaded Mesh Dicts Processing ==============================")
+    error_logs = []
+    case_dir = os.path.abspath(case_dir)
+    system_dir = os.path.join(case_dir, "system")
+    constant_dir = os.path.join(case_dir, "constant")
+    os.makedirs(system_dir, exist_ok=True)
+    os.makedirs(constant_dir, exist_ok=True)
+
+    # Normalize provided paths: treat None, empty, or string 'none' (case-insensitive) as absent
+    def _normalize_path(p):
+        if p is None:
+            return None
+        if isinstance(p, str):
+            s = p.strip()
+            if s == "" or s.lower() == "none":
+                return None
+            return s
+        return None
+
+    blockmesh_src = _normalize_path(state.get("blockmesh_upload_path"))
+    snappy_src = _normalize_path(state.get("snappyhexmesh_upload_path"))
+
+    if not blockmesh_src and not snappy_src:
+        print("No uploaded mesh dictionaries provided.")
+        return {
+            "mesh_info": None,
+            "mesh_commands": [],
+            "mesh_file_destination": None,
+            "error_logs": ["No blockMeshDict or snappyHexMeshDict upload path provided"]
+        }
+
+    # Copy uploaded files only if their path is provided
+    try:
+        if blockmesh_src:
+            if not os.path.exists(blockmesh_src):
+                raise FileNotFoundError(f"blockMeshDict source not found: {blockmesh_src}")
+            shutil.copy2(blockmesh_src, os.path.join(system_dir, "blockMeshDict"))
+            print(f"Copied blockMeshDict from {blockmesh_src}")
+        if snappy_src:
+            if not os.path.exists(snappy_src):
+                raise FileNotFoundError(f"snappyHexMeshDict source not found: {snappy_src}")
+            shutil.copy2(snappy_src, os.path.join(system_dir, "snappyHexMeshDict"))
+            print(f"Copied snappyHexMeshDict from {snappy_src}")
+    except Exception as e:
+        msg = f"Failed to copy uploaded mesh dictionaries: {e}"
+        print(msg)
+        return {
+            "mesh_info": None,
+            "mesh_commands": [],
+            "mesh_file_destination": None,
+            "error_logs": [msg]
+        }
+
+    # Ensure controlDict exists (minimal) via LLM
+    try:
+        controldict_prompt = (
+            f"<user_requirements>{state['user_requirement']}</user_requirements>\n"
+            "Please create a minimal controlDict suitable to run meshing steps (blockMesh/snappyHexMesh). "
+            "Return ONLY the controlDict file content without any additional text."
+        )
+        controldict_content = state["llm_service"].invoke(controldict_prompt, CONTROLDICT_SYSTEM_PROMPT).strip()
+        if controldict_content:
+            save_file(os.path.join(system_dir, "controlDict"), controldict_content)
+            print("Created controlDict for uploaded mesh dictionaries")
+    except Exception as e:
+        print(f"Warning: controlDict generation failed: {e}")
+
+    mesh_commands = []
+
+    # Run blockMesh only if blockMeshDict path is provided
+    try:
+        if blockmesh_src:
+            print("Running blockMesh...")
+            result = subprocess.run(["blockMesh"], cwd=case_dir, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            print(result.stdout)
+            mesh_commands.append("blockMesh")
+    except subprocess.CalledProcessError as e:
+        err = f"blockMesh failed: {e.stderr or e.stdout or str(e)}"
+        print(err)
+        error_logs.append(err)
+
+    # Run snappyHexMesh only if snappyHexMeshDict path is provided
+    try:
+        if snappy_src:
+            print("Running snappyHexMesh -overwrite...")
+            result = subprocess.run(["snappyHexMesh", "-overwrite"], cwd=case_dir, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            print(result.stdout)
+            mesh_commands.append("snappyHexMesh -overwrite")
+    except subprocess.CalledProcessError as e:
+        err = f"snappyHexMesh failed: {e.stderr or e.stdout or str(e)}"
+        print(err)
+        error_logs.append(err)
+
+    # Verify polyMesh created
+    polyMesh_dir = os.path.join(constant_dir, "polyMesh")
+    if not os.path.exists(polyMesh_dir):
+        msg = "Mesh generation failed: constant/polyMesh not found"
+        print(msg)
+        error_logs.append(msg)
+        return {
+            "mesh_info": None,
+            "mesh_commands": mesh_commands,
+            "mesh_file_destination": None,
+            "error_logs": error_logs
+        }
+
+    # Run checkMesh
+    try:
+        print("Running checkMesh...")
+        result = subprocess.run(["checkMesh"], cwd=case_dir, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        print(result.stdout)
+        # mesh_commands.append("checkMesh")
+    except subprocess.CalledProcessError as e:
+        err = f"checkMesh reported issues: {e.stderr or e.stdout or str(e)}"
+        print(err)
+        error_logs.append(err)
+
+    # Create .foam file
+    foam_file = os.path.join(case_dir, f"{os.path.basename(case_dir)}.foam")
+    with open(foam_file, 'w'):
+        pass
+
+    return {
+        "mesh_info": {
+            "mesh_file_path": os.path.join(constant_dir, "polyMesh"),
+            "mesh_file_type": "polyMesh",
+            "mesh_description": "Mesh generated from uploaded blockMesh/snappyHexMesh dictionaries",
+            "requires_blockmesh_removal": False
+        },
+        "mesh_commands": mesh_commands,
+        "mesh_file_destination": polyMesh_dir,
+        "custom_mesh_used": True,
+        "error_logs": error_logs
+    }
+
 def run_checkmesh_and_correct(state, case_dir, python_file, max_loop, current_loop, corrected_code, error_logs):
     """
     Run checkMesh command and handle mesh quality issues.
@@ -921,6 +1066,9 @@ def meshing_node(state):
     elif mesh_type == "gmsh_mesh":
         print("Router determined: GMSH mesh requested.")
         return handle_gmsh_mesh(state, case_dir)
+    elif mesh_type == "dict_mesh" :
+        print("Detected uploaded mesh dictionaries in state. Processing uploaded blockMesh/snappyHexMesh.")
+        return handle_uploaded_mesh_dicts(state, case_dir)
     else:
         print("Router determined: Standard mesh generation.")
         return handle_standard_mesh(state, case_dir)

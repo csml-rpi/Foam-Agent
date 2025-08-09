@@ -233,8 +233,12 @@ def _initial_write_mode(state):
     )
 
     if state.get("mesh_mode") == "custom":
-        allrun_system_prompt += "CRITICAL: Do not include any other mesh commands other than the custom mesh commands.\n"
-        allrun_system_prompt += "CRITICAL: Do not include any gmshToFoam commands in the Allrun script."
+        allrun_system_prompt += "CRITICAL: Do not include any other mesh commands other than the custom mesh commands. The mesh is already created.\n"
+        allrun_system_prompt += "CRITICAL: Do not include any gmshToFoam commands in the Allrun script. The mesh is already created."
+
+    if state.get("mesh_type") == "dict_mesh":
+        allrun_system_prompt += "CRITICAL: Do not include any mesh commands like blockMesh, snappyHexMesh, etc. The mesh is already created.\n"
+        allrun_system_prompt += "CRITICAL: Do not include any commands that run gmsh to create the mesh. The mesh is already created."
     
     allrun_user_prompt = (
         f"User requirement: {state['user_requirement']}\n"
