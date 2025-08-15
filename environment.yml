@@ -1,4 +1,4 @@
-name: openfoamAgent
+name: openfoamAgent-v2
 channels:
   - conda-forge
   - defaults
@@ -67,7 +67,7 @@ dependencies:
       - langchain-experimental==0.3.4
       - langchain-openai==0.2.14
       - langchain-text-splitters==0.3.6
-      - langchain-ollama==0.1.1
+      - langchain-ollama==0.2.3
       - langgraph==0.2.71
       - langgraph-checkpoint==2.0.12
       - langgraph-sdk==0.1.51
@@ -102,3 +102,5 @@ dependencies:
       - zstandard==0.23.0
       - boto3==1.36.26
       - langchain_aws==0.2.13
+      - pyvista==0.45.0
+      - transformers==4.52.0
