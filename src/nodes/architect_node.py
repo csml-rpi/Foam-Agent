@@ -76,10 +76,18 @@ def architect_node(state):
     
     faiss_structure = retrieve_faiss("openfoam_tutorials_structure", case_info, topk=config.searchdocs)
     faiss_structure = faiss_structure[0]['full_content']
+    faiss_structure = re.sub(r"\n{3}", '\n', faiss_structure)
     
     # Retrieve by case info + directory structure
     faiss_detailed = retrieve_faiss("openfoam_tutorials_details", faiss_structure, topk=config.searchdocs)
     faiss_detailed = faiss_detailed[0]['full_content']
+
+    # cutoff similar case length for file dependency
+    config.file_dependency = (faiss_detailed.count('\n') < config.file_dependency_threshold)
+    if (config.file_dependency):
+        print("File-dependency will be used by input writer.")
+    else:
+        print("No file-dependency in input writer.")
     
     dir_structure = re.search(r"<directory_structure>(.*?)</directory_structure>", faiss_detailed, re.DOTALL).group(1).strip()
     print(f"Retrieved similar case structure: {dir_structure}")
@@ -89,7 +97,7 @@ def architect_node(state):
     print(dir_counts_str)
     
     # Retrieve a reference Allrun script from the FAISS "Allrun" database.
-    index_content = f"<index>\ncase name: {case_name}\ncase solver: {case_solver}</index>\n<directory_structure>{dir_structure}</directory_structure>"
+    index_content = f"<index>\ncase name: {case_name}\ncase solver: {case_solver}\n</index>\n<directory_structure>\n{dir_structure}\n</directory_structure>"
     faiss_allrun = retrieve_faiss("openfoam_allrun_scripts", index_content, topk=config.searchdocs)
     allrun_reference = "Similar cases are ordered, with smaller numbers indicating greater similarity. For example, similar_case_1 is more similar than similar_case_2, and similar_case_2 is more similar than similar_case_3.\n"
     for idx, item in enumerate(faiss_allrun):

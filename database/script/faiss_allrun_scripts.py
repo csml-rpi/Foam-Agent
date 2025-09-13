@@ -71,7 +71,7 @@ def main():
         case_solver = extract_field("case solver", index_content)
         
         # allrun script content is not sensitive to case domain and category
-        index_content = f"<index>\ncase name: {case_name}\ncase solver: {case_solver}</index>"
+        index_content = f"<index>\ncase name: {case_name}\ncase solver: {case_solver}\n</index>\n"
 
         # Extract allrun script content from full_content
         script_match = re.search(r"<allrun_script>([\s\S]*?)</allrun_script>", full_content)
