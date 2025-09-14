@@ -84,10 +84,11 @@ def architect_node(state):
 
     # If the similar case is too long, skip file-dependency to reduce the LLM context length.
     # Default `file_dependency_threshold=3000` in `src/config.py`
-    config.file_dependency = (faiss_detailed.count('\n') < config.file_dependency_threshold)
-    if (config.file_dependency):
+    file_dependency_flag = state["file_dependency_flag"]
+    if (faiss_detailed.count('\n') < config.file_dependency_threshold):
         print("File-dependency will be used by input writer.")
     else:
+        file_dependency_flag = False
         print("No file-dependency in input writer.")
     
     dir_structure = re.search(r"<directory_structure>(.*?)</directory_structure>", faiss_detailed, re.DOTALL).group(1).strip()
@@ -181,4 +182,5 @@ def architect_node(state):
         "allrun_reference": allrun_reference,
         "subtasks": [{"file_name": subtask.file_name, "folder_name": subtask.folder_name} for subtask in subtasks],
         "mesh_type": mesh_type_value,
+        "file_dependency_flag": file_dependency_flag
     }

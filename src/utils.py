@@ -227,6 +227,7 @@ class GraphState(TypedDict):
     error_command: Optional[str]
     error_content: Optional[str]
     loop_count: int
+    file_dependency_flag: bool
     # Additional state fields that will be added during execution
     llm_service: Optional['LLMService']
     case_stats: Optional[dict]

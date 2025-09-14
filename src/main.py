@@ -63,6 +63,7 @@ def initialize_state(user_requirement: str, config: Config, custom_mesh_path: Op
         error_command=None,
         error_content=None,
         loop_count=0,
+        file_dependency_flag=True,
         llm_service=LLMService(config),
         case_stats=case_stats,
         tutorial_reference=None,
