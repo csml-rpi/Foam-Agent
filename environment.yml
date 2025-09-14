@@ -1,4 +1,4 @@
-name: openfoamAgent-v2
+name: FoamAgent
 channels:
   - conda-forge
   - defaults
