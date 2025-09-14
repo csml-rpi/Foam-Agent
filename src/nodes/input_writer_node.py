@@ -164,6 +164,7 @@ def _initial_write_mode(state):
             "When generating controlDict, do not include anything to preform post processing. Just include the necessary settings to run the simulation."
         )
         
+        # see `architect_node.py` for the decision on file-dependency
         if config.file_dependency:
             if len(writed_files) > 0:
                 code_user_prompt += f"The following are files content already generated: {str(writed_files)}\n\n\nYou should ensure that the new file is consistent with the previous files. Such as boundary conditions, mesh settings, etc."

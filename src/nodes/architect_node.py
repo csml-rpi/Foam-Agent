@@ -76,13 +76,14 @@ def architect_node(state):
     
     faiss_structure = retrieve_faiss("openfoam_tutorials_structure", case_info, topk=config.searchdocs)
     faiss_structure = faiss_structure[0]['full_content']
-    faiss_structure = re.sub(r"\n{3}", '\n', faiss_structure)
+    faiss_structure = re.sub(r"\n{3}", '\n', faiss_structure) # remove extra newlines
     
     # Retrieve by case info + directory structure
     faiss_detailed = retrieve_faiss("openfoam_tutorials_details", faiss_structure, topk=config.searchdocs)
     faiss_detailed = faiss_detailed[0]['full_content']
 
-    # cutoff similar case length for file dependency
+    # If the similar case is too long, skip file-dependency to reduce the LLM context length.
+    # Default `file_dependency_threshold=3000` in `src/config.py`
     config.file_dependency = (faiss_detailed.count('\n') < config.file_dependency_threshold)
     if (config.file_dependency):
         print("File-dependency will be used by input writer.")
