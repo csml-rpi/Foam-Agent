@@ -59,7 +59,18 @@ python foambench_main.py --openfoam_path $WM_PROJECT_DIR --output ./output --pro
 ```bash
 git clone https://github.com/csml-rpi/Foam-Agent.git
 cd Foam-Agent
+```
+If you prefer an old stable version, do
+```bash
 git checkout v1.0.0
+```
+Otherwise, FoamAgent will be at the latest version.
+
+#### Foam-Agent Docker
+You can skip the rest of [1](#1-clone-the-repository-and-install-dependencies) and [2](#2-install-and-configure-openfoam-v10) by using a Docker, which has the entire Foam-Agent framework already set up. The instructions are at [docker/README.md](docker/README.md). Afterwards, go to [3](#3-database-preprocessing-first-time-setup).
+
+Otherwise, continue with
+```
 conda env create -n openfoamAgent -f environment.yml
 conda activate openfoamAgent
 ```
