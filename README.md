@@ -60,9 +60,9 @@ python foambench_main.py --openfoam_path $WM_PROJECT_DIR --output ./output --pro
 git clone https://github.com/csml-rpi/Foam-Agent.git
 cd Foam-Agent
 ```
-If you prefer an old stable version, do
+If you prefer a stable version, please check the tags, and do
 ```bash
-git checkout v1.0.0
+git checkout v1.1.0
 ```
 Otherwise, FoamAgent will be at the latest version.
 
