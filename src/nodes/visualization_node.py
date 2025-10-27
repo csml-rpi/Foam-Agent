@@ -98,7 +98,7 @@ def visualization_node(state):
         print(f"Attempt {current_loop} of {max_loop}")
         
         # Create visualization script
-        viz_script = generate_pyvista_script(state["llm_service"], case_dir, foam_file, state['user_requirement'], error_logs)
+        viz_script = generate_pyvista_script(case_dir, foam_file, state['user_requirement'], error_logs)
         success, output_image, errs = run_pyvista_script(case_dir, viz_script)
         if success and output_image:
             error_logs = []
@@ -147,7 +147,7 @@ def visualization_node(state):
         
         # If we have errors and haven't reached max loops, try to fix them
         if error_logs and current_loop < max_loop:
-            fixed_script = fix_pyvista_script(state["llm_service"], foam_file, viz_script, error_logs)
+            fixed_script = fix_pyvista_script(foam_file, viz_script, error_logs)
             success, output_image, errs = run_pyvista_script(case_dir, fixed_script, filename="visualization.py")
             if success and output_image:
                 print(f"Finished command: Return Code 0")

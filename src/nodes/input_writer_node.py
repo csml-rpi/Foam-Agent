@@ -18,18 +18,6 @@ INITIAL_WRITE_SYSTEM_PROMPT = (
     f"- Ensure case solver settings are consistent with the user's requirements. Available solvers are: {{case_solver}}.\n"
     "Provide only the code—no explanations, comments, or additional text."
 )
-
-REWRITE_SYSTEM_PROMPT = None  # Deprecated: logic moved to service
-
-def compute_priority(subtask):
-    if subtask["folder_name"] == "system":
-        return 0
-    elif subtask["folder_name"] == "constant":
-        return 1
-    elif subtask["folder_name"] == "0":
-        return 2
-    else:
-        return 3
         
 
 def parse_allrun(text: str) -> str:
@@ -68,7 +56,6 @@ def _rewrite_mode(state):
         print("No review analysis available for rewrite mode.")
         return state
     out = rewrite_files(
-        llm=state["llm_service"],
         case_dir=state["case_dir"],
         foamfiles=state.get("foamfiles"),
         error_logs=state.get("error_logs", []),
@@ -86,7 +73,6 @@ def _initial_write_mode(state):
     
     config = state["config"]
     write_out = initial_write(
-        llm=state["llm_service"],
         case_dir=state["case_dir"],
         subtasks=state["subtasks"],
         user_requirement=state["user_requirement"],
@@ -102,9 +88,9 @@ def _initial_write_mode(state):
     mesh_type = state.get("mesh_type")
     mesh_commands = state.get("mesh_commands") or []
     allrun_out = build_allrun(
-        llm=state["llm_service"],
         case_dir=state["case_dir"],
-        config=config,
+        database_path=config.database_path,
+        searchdocs=config.searchdocs,
         dir_structure=dir_structure,
         case_info=state["case_info"],
         allrun_reference=state["allrun_reference"],

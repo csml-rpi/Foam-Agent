@@ -1,5 +1,6 @@
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Any
 from models import ReviewIn, ReviewOut
+from services import global_llm_service
 
 
 REVIEWER_SYSTEM_PROMPT = (
@@ -10,15 +11,15 @@ REVIEWER_SYSTEM_PROMPT = (
     "Do not reinterpret or modify the keyword (e.g., do not treat '|' as 'or'); instead, assume it is meant to be taken literally. "
     "Propose ideas on how to resolve the errors, but do not modify any files directly. "
     "Please do not propose solutions that require modifying any parameters declared in the user requirement, try other approaches instead. Do not ask the user any questions."
+    "The user will supply all relevant foam files along with the error logs, and within the logs, you will find both the error content and the corresponding error command indicated by the log file name."
 )
 
 
 def review_error_logs(
     tutorial_reference: str,
-    foamfiles,
-    error_logs,
+    foamfiles: Any,
+    error_logs: List[str],
     user_requirement: str,
-    llm,
     history_text: Optional[List[str]] = None,
 ) -> Tuple[str, List[str]]:
     """Stateless reviewer: returns (review_analysis, updated_history)."""
@@ -40,7 +41,7 @@ def review_error_logs(
             "Please review the error logs and provide guidance on how to resolve the reported errors. Make sure your suggestions adhere to user requirements and do not contradict it."
         )
 
-    review_response = llm.invoke(reviewer_user_prompt, REVIEWER_SYSTEM_PROMPT)
+    review_response = global_llm_service.invoke(reviewer_user_prompt, REVIEWER_SYSTEM_PROMPT)
     review_content = review_response
 
     updated_history = list(history_text) if history_text else []
@@ -54,13 +55,12 @@ def review_error_logs(
     return review_content, updated_history
 
 
-def review_and_suggest_fix(inp: ReviewIn, llm, tutorial_reference: str, foamfiles, user_requirement: str) -> ReviewOut:
+def review_and_suggest_fix(inp: ReviewIn, tutorial_reference: str, foamfiles: Any, user_requirement: str) -> ReviewOut:
     review_content, _ = review_error_logs(
         tutorial_reference=tutorial_reference,
         foamfiles=foamfiles,
         error_logs=inp.logs,
         user_requirement=user_requirement,
-        llm=llm,
         history_text=None,
     )
     return ReviewOut(suggestions=review_content)

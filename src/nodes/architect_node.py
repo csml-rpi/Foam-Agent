@@ -39,7 +39,7 @@ def architect_node(state):
     user_requirement = state["user_requirement"]
 
     # Step 1: Translate user requirement (service)
-    info = parse_requirement_to_case_info(user_requirement, state["case_stats"], state["llm_service"])
+    info = parse_requirement_to_case_info(user_requirement, state["case_stats"])
     case_name = info["case_name"]
     case_domain = info["case_domain"]
     case_category = info["case_category"]
@@ -51,7 +51,12 @@ def architect_node(state):
     print(f"Parsed case solver: {case_solver}")
     
     # Step 2: Determine case directory (service)
-    case_dir = resolve_case_dir(config, case_name)
+    case_dir = resolve_case_dir(
+        case_name=case_name,
+        case_dir=getattr(config, "case_dir", ""),
+        run_times=getattr(config, "run_times", 1),
+        run_directory=str(getattr(config, "run_directory", "")) or str(config.run_directory)
+    )
     
     if os.path.exists(case_dir):
         print(f"Warning: Case directory {case_dir} already exists. Overwriting.")
@@ -63,7 +68,12 @@ def architect_node(state):
 
     # Step 3: Retrieve references (service)
     faiss_detailed, dir_structure, dir_counts_str, allrun_reference, file_dependency_flag = retrieve_references(
-        case_name, case_solver, case_domain, case_category, config, state["llm_service"]
+        case_name=case_name,
+        case_solver=case_solver,
+        case_domain=case_domain,
+        case_category=case_category,
+        searchdocs=getattr(config, "searchdocs", 2),
+        file_dependency_threshold=getattr(config, "file_dependency_threshold", 3000)
     )
     print(f"Retrieved similar case structure: {dir_structure}")
     print(dir_counts_str)
@@ -79,7 +89,7 @@ def architect_node(state):
         
 
     # Step 4: Break down into subtasks (service)
-    subtasks = decompose_to_subtasks(user_requirement, dir_structure, dir_counts_str, state["llm_service"])
+    subtasks = decompose_to_subtasks(user_requirement, dir_structure, dir_counts_str)
 
     if len(subtasks) == 0:
         print("Failed to generate subtasks.")

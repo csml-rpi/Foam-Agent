@@ -1,4 +1,4 @@
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
 
 
@@ -99,12 +99,19 @@ class ReviewOut(BaseModel):
 
 class ApplyFixIn(BaseModel):
     case_id: str
-    modifications: List[Dict]
+    foamfiles: Optional[Any] = None  # FoamPydantic object
+    error_logs: List[str] = []
+    review_analysis: str = ""
+    user_requirement: str = ""
+    dir_structure: Optional[Dict] = None
 
 
 class ApplyFixOut(BaseModel):
     status: str
     written: List[str]
+    updated_dir_structure: Optional[Dict] = None
+    updated_foamfiles: Optional[Any] = None  # FoamPydantic object
+    cleared_error_logs: List[str] = []
 
 
 class VisualizationIn(BaseModel):

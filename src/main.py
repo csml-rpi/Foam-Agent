@@ -152,6 +152,9 @@ if __name__ == "__main__":
     
     # Initialize configuration.
     config = Config()
+
+    print(f"config: {config}")
+
     if args.output_dir != "":
         config.case_dir = args.output_dir
     
