@@ -5,7 +5,7 @@ import subprocess
 from typing import Dict, List, Tuple, Any
 from pydantic import BaseModel, Field
 from utils import save_file
-from services import global_llm_service
+from . import global_llm_service
 
 
 def copy_custom_mesh(custom_mesh_path: str, user_requirement: str, case_dir: str) -> Dict[str, Any]:

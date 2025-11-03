@@ -3,7 +3,6 @@ from typing import List, Any
 from models import RunIn, RunOut
 from utils import remove_files, remove_file, remove_numeric_folders, run_command, check_foam_errors
 
-
 def run_allrun_and_collect_errors(
     case_dir: str,
     timeout: int = 3600,

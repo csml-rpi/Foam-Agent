@@ -1,8 +1,8 @@
 import os
 import re
-from typing import Dict, List, Any
-from utils import save_file, parse_context, retrieve_faiss, FoamPydantic, FoamfilePydantic
-from services import global_llm_service
+from typing import Dict, List, Any, Optional
+from utils import save_file, parse_context, retrieve_faiss, FoamPydantic, FoamfilePydantic, scan_case_directory, read_case_foamfiles
+from . import global_llm_service
 
 
 def compute_priority(subtask):
@@ -100,6 +100,7 @@ def initial_write(
     )
 
     for subtask in subtasks:
+        print(f"subtask: {subtask}")
         file_name = subtask["file_name"]
         folder_name = subtask["folder_name"]
         
@@ -147,7 +148,7 @@ def initial_write(
     # Generate Allrun script if database_path is provided
     if database_path:
         allrun_result = build_allrun(case_dir, database_path, searchdocs, dir_structure, case_info, allrun_reference, mesh_type, mesh_commands or [], user_requirement)
-        written_files.append(FoamfilePydantic(file_name="Allrun", folder_name="./", content=allrun_result["allrun_script"]))
+        written_files.append(FoamfilePydantic(file_name="Allrun", folder_name=case_dir, content=allrun_result["allrun_script"]))
     
     foamfiles = FoamPydantic(list_foamfile=written_files)
     return {"dir_structure": dir_structure, "foamfiles": foamfiles}
@@ -313,11 +314,11 @@ def build_allrun(
 
 def rewrite_files(
     case_dir: str,
-    foamfiles: Any,
     error_logs: List[str],
     review_analysis: str,
     user_requirement: str,
-    dir_structure: Dict[str, List[str]]
+    foamfiles: Optional[Any] = None,
+    dir_structure: Optional[Dict[str, List[str]]] = None
 ) -> Dict[str, Any]:
     """
     Rewrite OpenFOAM files based on error analysis and reviewer suggestions.
@@ -326,13 +327,18 @@ def rewrite_files(
     problematic files, then uses LLM to generate corrected versions of
     the files that need modification.
     
+    The function automatically reads foamfiles and directory structure from
+    case_dir if they are not provided.
+    
     Args:
         case_dir (str): Directory path where the case files are located
-        foamfiles (Any): FoamPydantic object containing current file contents
         error_logs (List[str]): List of error messages from simulation runs
-        review_analysis (str): Analysis and suggestions from the reviewer
+        review_analysis (str): Analysis and suggestions from the reviewer (required)
         user_requirement (str): Original user requirements for context
-        dir_structure (Dict[str, List[str]]): Current directory structure
+        foamfiles (Optional[Any]): FoamPydantic object containing current file contents.
+                                   If None, will be read from case_dir.
+        dir_structure (Optional[Dict[str, List[str]]]): Current directory structure.
+                                                        If None, will be scanned from case_dir.
     
     Returns:
         Dict[str, Any]: Contains:
@@ -341,24 +347,40 @@ def rewrite_files(
             - error_logs (List[str]): Cleared error logs (empty on success)
     
     Raises:
-        ValueError: If foamfiles format is invalid
-        RuntimeError: If LLM service fails to generate corrections
         FileNotFoundError: If case directory does not exist
+        ValueError: If review_analysis is empty or foamfiles format is invalid
+        RuntimeError: If LLM service fails to generate corrections
     
     Example:
         >>> result = rewrite_files(
         ...     case_dir="/path/to/case",
-        ...     foamfiles=current_foamfiles,
         ...     error_logs=["Error: undefined reference"],
         ...     review_analysis="Add missing boundary condition",
-        ...     user_requirement="Simple flow simulation",
-        ...     dir_structure={"system": ["controlDict"]}
+        ...     user_requirement="Simple flow simulation"
+        ...     # foamfiles and dir_structure will be read automatically
         ... )
         >>> print(f"Updated {len(result['foamfiles'].list_foamfile)} files")
     """
+    # Validate case directory exists
+    if not os.path.exists(case_dir):
+        raise FileNotFoundError(f"Case directory does not exist: {case_dir}")
+    
+    # Validate review_analysis is provided
+    if not review_analysis or review_analysis.strip() == "":
+        raise ValueError("review_analysis is required and cannot be empty")
+    
+    # Read directory structure if not provided
+    if dir_structure is None:
+        print(f"Scanning directory structure from: {case_dir}")
+        dir_structure = scan_case_directory(case_dir)
+    
+    # Read foamfiles if not provided
+    if foamfiles is None:
+        print(f"Reading OpenFOAM files from: {case_dir}")
+        foamfiles = read_case_foamfiles(case_dir, dir_structure)
+    
     from utils import FoamPydantic, FoamfilePydantic  # local import to avoid cycles
     import re
-    import os
 
     rewrite_system_prompt = (
         "You are an expert in OpenFOAM simulation and numerical modeling. "
@@ -409,4 +431,3 @@ def rewrite_files(
         "foamfiles": updated_foamfiles,
         "error_logs": [],
     }
-

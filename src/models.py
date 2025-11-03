@@ -88,15 +88,6 @@ class LogsOut(BaseModel):
     logs: Dict[str, str]
 
 
-class ReviewIn(BaseModel):
-    case_id: str
-    logs: Dict
-
-
-class ReviewOut(BaseModel):
-    suggestions: Dict
-
-
 class ApplyFixIn(BaseModel):
     case_id: str
     foamfiles: Optional[Any] = None  # FoamPydantic object

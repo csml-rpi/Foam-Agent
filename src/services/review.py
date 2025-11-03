@@ -1,6 +1,5 @@
 from typing import List, Optional, Tuple, Any
-from models import ReviewIn, ReviewOut
-from services import global_llm_service
+from . import global_llm_service
 
 
 REVIEWER_SYSTEM_PROMPT = (
@@ -53,16 +52,4 @@ def review_error_logs(
     ]
     updated_history.extend(current_attempt)
     return review_content, updated_history
-
-
-def review_and_suggest_fix(inp: ReviewIn, tutorial_reference: str, foamfiles: Any, user_requirement: str) -> ReviewOut:
-    review_content, _ = review_error_logs(
-        tutorial_reference=tutorial_reference,
-        foamfiles=foamfiles,
-        error_logs=inp.logs,
-        user_requirement=user_requirement,
-        history_text=None,
-    )
-    return ReviewOut(suggestions=review_content)
-
 

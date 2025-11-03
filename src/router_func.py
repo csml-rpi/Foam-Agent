@@ -108,9 +108,9 @@ def llm_requires_visualization(state: GraphState) -> bool:
     return "yes_visualization" in response.lower()
 
 
-def route_after_architect(state: GraphState):
+def route_after_planner(state: GraphState):
     """
-    Route after architect node based on whether user wants custom mesh.
+    Route after planner node based on whether user wants custom mesh.
     For current version, if user wants custom mesh, user should be able to provide a path to the mesh file.
     """
     mesh_type = state.get("mesh_type", "standard_mesh")

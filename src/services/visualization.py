@@ -4,7 +4,7 @@ import subprocess
 import glob
 from typing import Dict, List, Tuple
 from utils import save_file
-from services import global_llm_service
+from . import global_llm_service
 
 
 def ensure_foam_file(case_dir: str) -> str:

@@ -3,10 +3,7 @@ from typing import List
 import os
 from pydantic import BaseModel, Field
 import re
-from utils import (
-    save_file, remove_files, remove_file,
-    run_command, check_foam_errors, retrieve_faiss, remove_numeric_folders
-)
+
 from services.run_local import run_allrun_and_collect_errors
 
 
@@ -17,12 +14,12 @@ def local_runner_node(state):
     """
     config = state["config"]
     case_dir = state["case_dir"]
-    allrun_file_path = os.path.join(case_dir, "Allrun")
+    max_time_limit = state["config"].max_time_limit
     
     print(f"============================== Runner ==============================")
     
     # Execute using service and collect errors
-    error_logs = run_allrun_and_collect_errors(case_dir, config)
+    error_logs = run_allrun_and_collect_errors(case_dir, max_time_limit)
 
     if len(error_logs) > 0:
         print("Errors detected in the Allrun execution.")

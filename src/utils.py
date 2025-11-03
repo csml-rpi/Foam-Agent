@@ -2,7 +2,7 @@
 import re
 import subprocess
 import os
-from typing import Optional, Any, Type, TypedDict, List
+from typing import Optional, Any, Type, TypedDict, List, Dict
 from pydantic import BaseModel, Field
 from langchain.chat_models import init_chat_model
 from langchain_community.vectorstores import FAISS
@@ -316,12 +316,109 @@ def remove_numeric_folders(case_dir: str) -> None:
                 # Not a numeric value, so we keep this folder
                 pass
 
-def run_command(script_path: str, out_file: str, err_file: str, working_dir: str, config : Config) -> None:
+
+def scan_case_directory(case_dir: str) -> Dict[str, List[str]]:
+    """
+    Scan an OpenFOAM case directory and return the directory structure.
+    
+    This function traverses the case directory one level deep and collects
+    the files in each subdirectory (typically 'system', 'constant', '0', etc.).
+    
+    Args:
+        case_dir (str): Path to the OpenFOAM case directory
+    
+    Returns:
+        Dict[str, List[str]]: Dictionary mapping folder names to lists of file names
+            Example: {"system": ["controlDict", "fvSchemes"], "constant": ["transportProperties"]}
+    
+    Raises:
+        FileNotFoundError: If case_dir does not exist
+        PermissionError: If directory cannot be accessed
+    
+    Example:
+        >>> structure = scan_case_directory("/path/to/case")
+        >>> print(structure["system"])  # ["controlDict", "fvSchemes", "fvSolution"]
+    """
+    if not os.path.exists(case_dir):
+        raise FileNotFoundError(f"Case directory does not exist: {case_dir}")
+    
+    dir_structure = {}
+    base_depth = case_dir.rstrip(os.sep).count(os.sep)
+    
+    # Walk through the directory tree
+    for root, dirs, files in os.walk(case_dir):
+        # Only process directories one level below case_dir
+        current_depth = root.rstrip(os.sep).count(os.sep)
+        if current_depth == base_depth + 1:
+            folder_name = os.path.relpath(root, case_dir)
+            # Filter out hidden files and only include regular files
+            regular_files = [f for f in files if not f.startswith('.') and os.path.isfile(os.path.join(root, f))]
+            if regular_files:
+                dir_structure[folder_name] = regular_files
+    
+    return dir_structure
+
+
+def read_case_foamfiles(case_dir: str, dir_structure: Optional[Dict[str, List[str]]] = None) -> 'FoamPydantic':
+    """
+    Read OpenFOAM files from a case directory and convert to FoamPydantic format.
+    
+    This function reads all OpenFOAM configuration files from the case directory
+    (typically from 'system', 'constant', '0' folders) and creates a FoamPydantic
+    object containing the file contents.
+    
+    Args:
+        case_dir (str): Path to the OpenFOAM case directory
+        dir_structure (Optional[Dict[str, List[str]]]): Pre-scanned directory structure.
+            If None, will scan the directory automatically.
+    
+    Returns:
+        FoamPydantic: Object containing list of FoamfilePydantic objects with file metadata
+    
+    Raises:
+        FileNotFoundError: If case_dir does not exist
+        UnicodeDecodeError: If files contain invalid encoding (will skip those files)
+    
+    Example:
+        >>> foamfiles = read_case_foamfiles("/path/to/case")
+        >>> print(len(foamfiles.list_foamfile))  # Number of files read
+        >>> print(foamfiles.list_foamfile[0].file_name)  # "controlDict"
+    """
+    if not os.path.exists(case_dir):
+        raise FileNotFoundError(f"Case directory does not exist: {case_dir}")
+    
+    # Scan directory structure if not provided
+    if dir_structure is None:
+        dir_structure = scan_case_directory(case_dir)
+    
+    foamfile_list = []
+    
+    # Read files from each folder
+    for folder_name, file_names in dir_structure.items():
+        for file_name in file_names:
+            file_path = os.path.join(case_dir, folder_name, file_name)
+            
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                foamfile_list.append(FoamfilePydantic(
+                    file_name=file_name,
+                    folder_name=folder_name,
+                    content=content
+                ))
+            except UnicodeDecodeError:
+                print(f"Warning: Skipping file due to encoding error: {file_path}")
+            except Exception as e:
+                print(f"Warning: Error reading file {file_path}: {e}")
+    
+    return FoamPydantic(list_foamfile=foamfile_list)
+
+def run_command(script_path: str, out_file: str, err_file: str, working_dir: str, max_time_limit: int) -> None:
     print(f"Executing script {script_path} in {working_dir}")
     os.chmod(script_path, 0o777)
     openfoam_dir = os.getenv("WM_PROJECT_DIR")
     command = f"source {openfoam_dir}/etc/bashrc && bash {os.path.abspath(script_path)}"
-    timeout_seconds = config.max_time_limit
 
     with open(out_file, 'w') as out, open(err_file, 'w') as err:
         process = subprocess.Popen(
@@ -337,7 +434,7 @@ def run_command(script_path: str, out_file: str, err_file: str, working_dir: str
         # err.write(stderr)
 
         try:
-            stdout, stderr = process.communicate(timeout=timeout_seconds)
+            stdout, stderr = process.communicate(timeout=max_time_limit)
             out.write(stdout)
             err.write(stderr)
         except subprocess.TimeoutExpired:

@@ -5,7 +5,7 @@ import subprocess
 import re
 from models import HPCScriptIn, HPCScriptOut, RunIn, RunOut, JobStatusIn, JobStatusOut
 from utils import check_foam_errors, save_file
-from services import global_llm_service
+from . import global_llm_service
 
 
 def create_slurm_script(case_dir: str, cluster_info: dict) -> str:
