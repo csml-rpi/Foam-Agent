@@ -98,6 +98,65 @@ class LLMService:
         else:
             raise ValueError(f"{self.model_provider} is not a supported model_provider")
     
+    def _is_throttling_error(self, error: Exception) -> bool:
+        """
+        Check if an exception is a throttling-related error.
+        
+        Args:
+            error: The exception to check
+            
+        Returns:
+            True if it's a throttling error, False otherwise
+        """
+        # Check ClientError with specific error codes
+        if isinstance(error, ClientError):
+            error_code = error.response.get('Error', {}).get('Code', '')
+            return error_code in ('Throttling', 'TooManyRequestsException')
+        
+        # Check for ThrottlingException and throttling-related error messages
+        error_type = type(error).__name__
+        error_str = str(error)
+        
+        throttling_indicators = (
+            error_type == 'ThrottlingException',
+            'ThrottlingException' in error_str,
+            'Too many tokens' in error_str,
+            'reached max retries' in error_str
+        )
+        
+        return any(throttling_indicators)
+    
+    def _handle_throttling_retry(self, error: Exception, retry_count: int, max_retries: int) -> int:
+        """
+        Handle throttling error by implementing exponential backoff retry logic.
+        
+        Args:
+            error: The throttling exception
+            retry_count: Current retry attempt number
+            max_retries: Maximum number of retries allowed
+            
+        Raises:
+            Exception: If max retries exceeded
+        """
+        retry_count += 1
+        self.retry_count += 1
+        
+        if retry_count > max_retries:
+            self.failed_calls += 1
+            raise Exception(f"Maximum retries ({max_retries}) exceeded: {str(error)}")
+        
+        # Exponential backoff with jitter
+        base_delay = 1.0
+        max_delay = 60.0
+        delay = min(max_delay, base_delay * (2 ** (retry_count - 1)))
+        jitter = random.uniform(0, 0.1 * delay)
+        sleep_time = delay + jitter
+        
+        print(f"ThrottlingException occurred: {str(error)}. Retrying in {sleep_time:.2f} seconds (attempt {retry_count}/{max_retries})")
+        time.sleep(sleep_time)
+        
+        return retry_count
+    
     def invoke(self, 
               user_prompt: str, 
               system_prompt: Optional[str] = None, 
@@ -156,29 +215,17 @@ class LLMService:
                 
                 return response
                 
-            except ClientError as e:
-                if e.response['Error']['Code'] == 'Throttling' or e.response['Error']['Code'] == 'TooManyRequestsException':
-                    retry_count += 1
-                    self.retry_count += 1
-                    
-                    if retry_count > max_retries:
-                        self.failed_calls += 1
-                        raise Exception(f"Maximum retries ({max_retries}) exceeded: {str(e)}")
-                    
-                    base_delay = 1.0
-                    max_delay = 60.0
-                    delay = min(max_delay, base_delay * (2 ** (retry_count - 1)))
-                    jitter = random.uniform(0, 0.1 * delay)
-                    sleep_time = delay + jitter
-                    
-                    print(f"ThrottlingException occurred: {str(e)}. Retrying in {sleep_time:.2f} seconds (attempt {retry_count}/{max_retries})")
-                    time.sleep(sleep_time)
+            except Exception as e:
+                if self._is_throttling_error(e):
+                    retry_count = self._handle_throttling_retry(e, retry_count, max_retries)
+                    continue  # Retry the request
                 else:
+                    # Non-throttling error: log and raise
+                    print(f"Error occurred in LLM service: {str(e)}")
+                    if isinstance(e, ClientError):
+                        print(e.response)
                     self.failed_calls += 1
                     raise e
-            except Exception as e:
-                self.failed_calls += 1
-                raise e
     
     def get_statistics(self) -> dict:
         """
