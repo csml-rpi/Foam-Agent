@@ -71,8 +71,8 @@ You can skip the rest of [1](#1-clone-the-repository-and-install-dependencies) a
 
 Otherwise, continue with
 ```
-conda env create -n openfoamAgent -f environment.yml
-conda activate openfoamAgent
+conda env create -n FoamAgent -f environment.yml
+conda activate FoamAgent
 ```
 
 ### 2. Install and configure OpenFOAM v10
@@ -153,7 +153,7 @@ do a Reynolds-Averaged Simulation (RAS) pitzdaily simulation. Use PIMPLE algorit
 
 - **OpenFOAM environment not found**: Ensure you have sourced the OpenFOAM bashrc and restarted your terminal.
 - **Database not initialized**: Make sure you have run `foambench_main.py` or all scripts in `database/script/`.
-- **Missing dependencies**: After activating the environment, run `pip install -r requirements.txt` if needed.
+- **Missing dependencies**: If dependencies are missing, recreate the environment: `conda env update -n FoamAgent -f environment.yml --prune` or `conda env remove -n FoamAgent && conda env create -n FoamAgent -f environment.yml`.
 - **API key errors**: Ensure `OPENAI_API_KEY` is set in your environment.
 
 ## Citation

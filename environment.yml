@@ -1,106 +1,573 @@
 name: FoamAgent
 channels:
+  - pytorch
+  - nvidia
   - conda-forge
   - defaults
 dependencies:
   - _libgcc_mutex=0.1
   - _openmp_mutex=4.5
+  - aiosignal=1.3.2
+  - alsa-lib=1.2.13
+  - aom=3.9.1
+  - attr=2.5.1
+  - attrs=25.1.0
+  - blosc=1.21.6
+  - brotli-bin=1.1.0
+  - brotli-python=1.1.0
+  - brotli=1.1.0
   - bzip2=1.0.8
+  - c-ares=1.34.4
   - ca-certificates=2025.1.31
+  - cairo=1.18.4
+  - certifi=2025.1.31
+  - charset-normalizer=3.4.1
+  - contourpy=1.3.1
+  - cpython=3.12.9
+  - cuda-cudart=12.4.127
+  - cuda-cupti=12.4.127
+  - cuda-libraries=12.4.1
+  - cuda-nvrtc=12.4.127
+  - cuda-nvtx=12.4.127
+  - cuda-opencl=12.8.90
+  - cuda-runtime=12.4.1
+  - cuda-version=12.8
+  - cudnn=9.3.0.75
+  - cycler=0.12.1
+  - cyrus-sasl=2.1.27
+  - dav1d=1.2.1
+  - dbus=1.13.6
+  - double-conversion=3.3.1
   - expat=2.6.4
+  - ffmpeg=7.1.1
+  - filelock=3.18.0
+  - font-ttf-dejavu-sans-mono=2.37
+  - font-ttf-inconsolata=3.000
+  - font-ttf-source-code-pro=2.038
+  - font-ttf-ubuntu=0.83
+  - fontconfig=2.15.0
+  - fonts-conda-ecosystem=1
+  - fonts-conda-forge=1
+  - fonttools=4.56.0
+  - freetype=2.12.1
+  - fribidi=1.0.10
+  - frozenlist=1.5.0
+  - fsspec=2025.3.0
+  - gdk-pixbuf=2.42.12
+  - gettext-tools=0.23.1
+  - gettext=0.23.1
+  - giflib=5.2.2
+  - gl2ps=1.4.2
+  - glew=2.1.0
+  - gmp=6.3.0
+  - gmpy2=2.1.5
+  - graphite2=1.3.13
+  - h2=4.2.0
+  - harfbuzz=10.4.0
+  - hdf4=4.2.15
+  - hdf5=1.14.3
+  - hpack=4.1.0
+  - hyperframe=6.1.0
+  - icu=75.1
+  - idna=3.10
+  - jack=1.9.22
+  - jinja2=3.1.6
+  - jsoncpp=1.9.6
+  - keyutils=1.6.1
+  - kiwisolver=1.4.8
+  - krb5=1.21.3
+  - lame=3.100
+  - lcms2=2.17
   - ld_impl_linux-64=2.43
+  - lerc=4.0.0
+  - level-zero=1.21.2
+  - libabseil=20250127.0
+  - libaec=1.1.3
+  - libasprintf-devel=0.23.1
+  - libasprintf=0.23.1
+  - libass=0.17.3
+  - libavif16=1.2.0
+  - libblas=3.9.0
+  - libbrotlicommon=1.1.0
+  - libbrotlidec=1.1.0
+  - libbrotlienc=1.1.0
+  - libcap=2.75
+  - libcblas=3.9.0
+  - libclang-cpp19.1=19.1.7
+  - libclang13=19.1.7
+  - libcublas=12.4.5.8
+  - libcufft=11.2.1.3
+  - libcufile=1.13.1.3
+  - libcups=2.3.3
+  - libcurand=10.3.9.90
+  - libcurl=8.12.1
+  - libcusolver=11.6.1.9
+  - libcusparse=12.3.1.170
+  - libdb=6.2.32
+  - libde265=1.0.15
+  - libdeflate=1.23
+  - libdrm=2.4.124
+  - libedit=3.1.20250104
+  - libegl=1.7.0
+  - libev=4.33
   - libexpat=2.6.4
   - libffi=3.4.6
-  - libgcc=14.2.0
+  - libflac=1.4.3
   - libgcc-ng=14.2.0
+  - libgcc=14.2.0
+  - libgcrypt-lib=1.11.0
+  - libgettextpo-devel=0.23.1
+  - libgettextpo=0.23.1
+  - libgfortran5=14.2.0
+  - libgfortran=14.2.0
+  - libgl=1.7.0
+  - libglib=2.82.2
+  - libglu=9.0.3
+  - libglvnd=1.7.0
+  - libglx=1.7.0
   - libgomp=14.2.0
-  - liblzma=5.6.4
+  - libgpg-error=1.51
+  - libheif=1.19.7
+  - libhwloc=2.11.2
+  - libiconv=1.18
+  - libjpeg-turbo=3.0.0
+  - liblapack=3.9.0
+  - libllvm19=19.1.7
   - liblzma-devel=5.6.4
+  - liblzma=5.6.4
+  - libmagma=2.8.0
+  - libmagma_sparse=2.8.0
+  - libnetcdf=4.9.2
+  - libnghttp2=1.64.0
+  - libnpp=12.2.5.30
   - libnsl=2.0.1
-  - libsqlite=3.46.0
-  - libuuid=1.41.5
-  - libzlib=1.2.13
+  - libntlm=1.8
+  - libnvfatbin=12.8.90
+  - libnvjitlink=12.4.127
+  - libnvjpeg=12.3.1.117
+  - libogg=1.3.5
+  - libopenblas=0.3.29
+  - libopenvino-auto-batch-plugin=2025.0.0
+  - libopenvino-auto-plugin=2025.0.0
+  - libopenvino-hetero-plugin=2025.0.0
+  - libopenvino-intel-cpu-plugin=2025.0.0
+  - libopenvino-intel-gpu-plugin=2025.0.0
+  - libopenvino-intel-npu-plugin=2025.0.0
+  - libopenvino-ir-frontend=2025.0.0
+  - libopenvino-onnx-frontend=2025.0.0
+  - libopenvino-paddle-frontend=2025.0.0
+  - libopenvino-pytorch-frontend=2025.0.0
+  - libopenvino-tensorflow-frontend=2025.0.0
+  - libopenvino-tensorflow-lite-frontend=2025.0.0
+  - libopenvino=2025.0.0
+  - libopus=1.3.1
+  - libpciaccess=0.18
+  - libpng=1.6.47
+  - libpq=17.4
+  - libprotobuf=5.29.3
+  - librsvg=2.58.4
+  - libsndfile=1.2.2
+  - libsqlite=3.49.1
+  - libssh2=1.11.1
+  - libstdcxx-ng=14.2.0
+  - libstdcxx=14.2.0
+  - libsystemd0=257.4
+  - libtheora=1.1.1
+  - libtiff=4.7.0
+  - libtorch=2.5.1
+  - libudev1=257.4
+  - libunwind=1.6.2
+  - liburing=2.9
+  - libusb=1.0.27
+  - libuuid=2.38.1
+  - libuv=1.50.0
+  - libva=2.22.0
+  - libvorbis=1.3.7
+  - libvpx=1.14.1
+  - libwebp-base=1.5.0
+  - libxcb=1.17.0
+  - libxcrypt=4.4.36
+  - libxkbcommon=1.8.0
+  - libxml2=2.13.6
+  - libzip=1.11.2
+  - libzlib=1.3.1
+  - llvm-openmp=19.1.7
+  - loguru=0.7.2
+  - lz4-c=1.10.0
+  - markupsafe=3.0.2
+  - matplotlib-base=3.10.1
+  - mkl=2024.2.2
+  - mpc=1.3.1
+  - mpfr=4.2.1
+  - mpg123=1.32.9
+  - mpmath=1.3.0
+  - msgpack-python=1.1.0
+  - multidict=6.1.0
+  - munkres=1.1.4
+  - mysql-common=9.0.1
+  - mysql-libs=9.0.1
+  - nccl=2.26.2.1
   - ncurses=6.5
+  - networkx=3.4.2
+  - nlohmann_json=3.11.3
+  - ocl-icd=2.3.2
+  - opencl-headers=2024.10.24
+  - openh264=2.6.0
+  - openjpeg=2.5.3
+  - openldap=2.6.9
   - openssl=3.4.1
+  - packaging=24.2
+  - pango=1.56.1
+  - pcre2=10.44
+  - pillow=11.1.0
   - pip=25.0.1
+  - pixman=0.44.2
+  - platformdirs=4.3.6
+  - pooch=1.8.2
+  - proj=9.5.1
+  - propcache=0.2.1
+  - pthread-stubs=0.4
+  - pugixml=1.15
+  - pulseaudio-client=17.0
+  - pybind11-global=2.13.6
+  - pybind11=2.13.6
+  - pycparser=2.22
+  - pyparsing=3.2.1
+  - pysocks=1.7.1
+  - python-dateutil=2.9.0.post0
   - python=3.12.9
+  - python_abi=3.12
+  - pytorch-cuda=12.4
+  - pytorch-mutex=1.0
+  - pytorch=2.5.1
+  - pyvista=0.44.2
+  - qhull=2020.2
+  - qt6-main=6.8.2
+  - rav1e=0.6.6
   - readline=8.2
+  - requests=2.32.3
+  - scooby=0.10.0
+  - sdl2=2.32.50
+  - sdl3=3.2.8
   - setuptools=75.8.0
-  - sqlite=3.46.0
-  - tk=8.6.14
-  - tzdata=2025a
+  - six=1.17.0
+  - sleef=3.8
+  - snappy=1.2.1
+  - sqlite=3.49.1
+  - svt-av1=3.0.0
+  - tbb=2021.13.0
+  - tk=8.6.13
+  - torchvision=0.20.1
+  - unicodedata2=16.0.0
+  - urllib3=2.3.0
+  - utfcpp=4.0.6
+  - vtk-base=9.3.1
+  - vtk-io-ffmpeg=9.3.1
+  - wayland-protocols=1.41
+  - wayland=1.23.1
   - wheel=0.45.1
-  - xz=5.6.4
+  - wslink=2.3.2
+  - x264=1!164.3095
+  - x265=3.5
+  - xcb-util-cursor=0.1.5
+  - xcb-util-image=0.4.0
+  - xcb-util-keysyms=0.4.1
+  - xcb-util-renderutil=0.3.10
+  - xcb-util-wm=0.4.2
+  - xcb-util=0.4.1
+  - xkeyboard-config=2.43
+  - xorg-libice=1.1.2
+  - xorg-libsm=1.2.5
+  - xorg-libx11=1.8.11
+  - xorg-libxau=1.0.12
+  - xorg-libxcomposite=0.4.6
+  - xorg-libxcursor=1.2.3
+  - xorg-libxdamage=1.1.6
+  - xorg-libxdmcp=1.1.5
+  - xorg-libxext=1.3.6
+  - xorg-libxfixes=6.0.1
+  - xorg-libxi=1.8.2
+  - xorg-libxrandr=1.5.4
+  - xorg-libxrender=0.9.12
+  - xorg-libxscrnsaver=1.2.4
+  - xorg-libxt=1.3.1
+  - xorg-libxtst=1.2.5
+  - xorg-libxxf86vm=1.1.6
   - xz-gpl-tools=5.6.4
   - xz-tools=5.6.4
-  - zlib=1.2.13
+  - xz=5.6.4
+  - yarl=1.18.3
+  - zlib=1.3.1
+  - zstd=1.5.7
   - pip:
+      - accelerate==1.2.1
       - aiohappyeyeballs==2.4.6
       - aiohttp==3.11.12
-      - aiosignal==1.3.2
+      - airportsdata==20250224
       - annotated-types==0.7.0
       - anthropic==0.45.2
       - anyio==4.8.0
-      - attrs==25.1.0
-      - certifi==2025.1.31
-      - charset-normalizer==3.4.1
+      - argon2-cffi-bindings==21.2.0
+      - argon2-cffi==23.1.0
+      - arrow==1.3.0
+      - astor==0.8.1
+      - asttokens==3.0.0
+      - async-lru==2.0.4
+      - authlib==1.6.5
+      - babel==2.17.0
+      - beartype==0.22.4
+      - beautifulsoup4==4.13.3
+      - bitsandbytes==0.45.3
+      - blake3==1.0.4
+      - bleach==6.2.0
+      - boto3==1.37.1
+      - botocore==1.37.1
+      - cachetools==6.2.1
+      - cffi==2.0.0
       - click==8.1.8
+      - cloudpickle==3.1.1
+      - comm==0.2.2
+      - compressed-tensors==0.9.1
+      - cryptography==46.0.3
+      - cupy-cuda12x==13.4.1
+      - cyclopts==4.0.0
       - dataclasses-json==0.6.7
+      - debugpy==1.8.13
+      - decorator==5.2.1
       - defusedxml==0.7.1
+      - deprecated==1.2.18
+      - depyf==0.18.0
+      - dill==0.4.0
+      - diskcache==5.6.3
       - distro==1.9.0
+      - dnspython==2.7.0
+      - docstring-parser==0.17.0
+      - docutils==0.22.2
+      - einops==0.8.1
+      - email-validator==2.2.0
+      - exceptiongroup==1.3.0
+      - executing==2.2.0
       - faiss-cpu==1.10.0
-      - frozenlist==1.5.0
+      - fastapi-cli==0.0.7
+      - fastapi==0.115.12
+      - fastjsonschema==2.21.1
+      - fastmcp==2.13.0.1
+      - fastrlock==0.8.3
+      - fqdn==1.5.1
+      - gguf==0.10.0
       - gitingest==0.1.2
+      - googleapis-common-protos==1.70.0
       - greenlet==3.1.1
+      - grpcio==1.71.0
       - h11==0.14.0
+      - hf-xet==1.0.3
       - httpcore==1.0.7
-      - httpx==0.28.1
+      - httptools==0.6.4
       - httpx-sse==0.4.0
-      - idna==3.10
+      - httpx==0.28.1
+      - huggingface-hub==0.30.2
+      - imageio==2.37.0
+      - importlib-metadata==8.0.0
+      - iniconfig==2.1.0
+      - interegular==0.3.3
+      - ipycanvas==0.13.3
+      - ipyevents==2.0.2
+      - ipykernel==6.29.5
+      - ipython-genutils==0.2.0
+      - ipython-pygments-lexers==1.1.1
+      - ipython==9.0.2
+      - ipyvtklink==0.2.3
+      - ipywidgets==7.8.5
+      - isodate==0.7.2
+      - isoduration==20.11.0
+      - jaraco-classes==3.4.0
+      - jaraco-context==6.0.1
+      - jaraco-functools==4.3.0
+      - jedi==0.19.2
+      - jeepney==0.9.0
       - jiter==0.8.2
+      - jmespath==1.0.1
+      - joblib==1.4.2
+      - json5==0.10.0
       - jsonpatch==1.33
       - jsonpointer==3.0.0
-      - langchain==0.3.18
+      - jsonschema-path==0.3.4
+      - jsonschema-specifications==2024.10.1
+      - jsonschema==4.23.0
+      - jupyter-client==8.6.3
+      - jupyter-core==5.7.2
+      - jupyter-events==0.12.0
+      - jupyter-lsp==2.2.5
+      - jupyter-server-terminals==0.5.3
+      - jupyter-server==2.15.0
+      - jupyterlab-pygments==0.3.0
+      - jupyterlab-server==2.27.3
+      - jupyterlab-widgets==1.1.11
+      - jupyterlab==4.3.5
+      - keyring==25.6.0
       - langchain-anthropic==0.2.4
+      - langchain-aws==0.2.13
       - langchain-community==0.3.17
-      - langchain-core==0.3.34
+      - langchain-core==0.3.54
       - langchain-experimental==0.3.4
+      - langchain-ollama==0.3.2
       - langchain-openai==0.2.14
       - langchain-text-splitters==0.3.6
-      - langchain-ollama==0.2.3
-      - langgraph==0.2.71
+      - langchain==0.3.18
       - langgraph-checkpoint==2.0.12
       - langgraph-sdk==0.1.51
+      - langgraph==0.2.71
       - langserve==0.3.1
       - langsmith==0.3.8
+      - lark==1.2.2
+      - lazy-object-proxy==1.12.0
+      - llguidance==0.7.16
+      - llvmlite==0.43.0
+      - lm-format-enforcer==0.10.11
+      - markdown-it-py==3.0.0
       - marshmallow==3.26.1
-      - msgpack==1.1.0
-      - multidict==6.1.0
+      - matplotlib-inline==0.1.7
+      - mcp==1.19.0
+      - mdurl==0.1.2
+      - mistral-common==1.5.4
+      - mistune==3.1.2
+      - more-itertools==10.8.0
+      - msgspec==0.19.0
       - mypy-extensions==1.0.0
-      - numpy==2.2.2
+      - nbclient==0.10.2
+      - nbconvert==7.16.6
+      - nbformat==5.10.4
+      - nest-asyncio==1.6.0
+      - ninja==1.11.1.4
+      - notebook-shim==0.2.4
+      - notebook==7.3.2
+      - numba==0.60.0
+      - numpy==1.26.4
+      - nvidia-cublas-cu12==12.4.5.8
+      - nvidia-cuda-cupti-cu12==12.4.127
+      - nvidia-cuda-nvrtc-cu12==12.4.127
+      - nvidia-cuda-runtime-cu12==12.4.127
+      - nvidia-cudnn-cu12==9.1.0.70
+      - nvidia-cufft-cu12==11.2.1.3
+      - nvidia-curand-cu12==10.3.5.147
+      - nvidia-cusolver-cu12==11.6.1.9
+      - nvidia-cusparse-cu12==12.3.1.170
+      - nvidia-cusparselt-cu12==0.6.2
+      - nvidia-nccl-cu12==2.21.5
+      - nvidia-nvjitlink-cu12==12.4.127
+      - nvidia-nvtx-cu12==12.4.127
+      - ollama==0.4.8
       - openai==1.61.1
+      - openapi-core==0.19.5
+      - openapi-pydantic==0.5.1
+      - openapi-schema-validator==0.6.3
+      - openapi-spec-validator==0.7.2
+      - opencv-python-headless==4.11.0.86
+      - opentelemetry-api==1.26.0
+      - opentelemetry-exporter-otlp-proto-common==1.26.0
+      - opentelemetry-exporter-otlp-proto-grpc==1.26.0
+      - opentelemetry-exporter-otlp-proto-http==1.26.0
+      - opentelemetry-exporter-otlp==1.26.0
+      - opentelemetry-proto==1.26.0
+      - opentelemetry-sdk==1.26.0
+      - opentelemetry-semantic-conventions-ai==0.4.3
+      - opentelemetry-semantic-conventions==0.47b0
       - orjson==3.10.15
-      - packaging==24.2
-      - propcache==0.2.1
-      - pydantic==2.10.6
-      - pydantic-core==2.27.2
+      - outlines-core==0.1.26
+      - outlines==0.1.11
+      - overrides==7.7.0
+      - pandas==2.3.1
+      - pandocfilters==1.5.1
+      - parse==1.20.2
+      - parso==0.8.4
+      - partial-json-parser==0.2.1.1.post5
+      - pathable==0.4.4
+      - pathvalidate==3.3.1
+      - pexpect==4.9.0
+      - pluggy==1.5.0
+      - prometheus-client==0.21.1
+      - prometheus-fastapi-instrumentator==7.1.0
+      - prompt-toolkit==3.0.50
+      - protobuf==4.25.6
+      - psutil==7.0.0
+      - ptyprocess==0.7.0
+      - pure-eval==0.2.3
+      - py-cpuinfo==9.0.0
+      - py-key-value-aio==0.2.8
+      - py-key-value-shared==0.2.8
+      - pycountry==24.6.1
+      - pydantic-core==2.41.4
       - pydantic-settings==2.7.1
-      - python-dotenv==1.0.1
+      - pydantic==2.12.3
+      - pygments==2.19.1
+      - pyperclip==1.11.0
+      - pytest==8.3.5
+      - python-dotenv==1.2.1
+      - python-json-logger==3.3.0
+      - python-multipart==0.0.20
+      - pytz==2025.2
+      - pyvistaqt==0.11.2
       - pyyaml==6.0.2
+      - pyzmq==26.2.1
+      - qtpy==2.4.3
+      - ray==2.40.0
+      - referencing==0.36.2
       - regex==2024.11.6
-      - requests==2.32.3
       - requests-toolbelt==1.0.0
+      - rfc3339-validator==0.1.4
+      - rfc3986-validator==0.1.1
+      - rich-rst==1.3.2
+      - rich-toolkit==0.14.1
+      - rich==14.0.0
+      - rpds-py==0.23.1
+      - s3transfer==0.11.2
+      - safetensors==0.5.3
+      - scikit-learn==1.6.1
+      - scipy==1.15.2
+      - secretstorage==3.4.0
+      - send2trash==1.8.3
+      - sentencepiece==0.2.0
+      - shellingham==1.5.4
       - sniffio==1.3.1
+      - soupsieve==2.6
       - sqlalchemy==2.0.38
+      - sse-starlette==3.0.2
+      - stack-data==0.6.3
+      - starlette==0.46.2
+      - sympy==1.13.1
       - tenacity==9.0.0
+      - terminado==0.18.1
+      - threadpoolctl==3.5.0
       - tiktoken==0.8.0
+      - tinycss2==1.4.0
+      - tokenizers==0.21.1
+      - torchaudio==2.5.1
+      - tornado==6.4.2
       - tqdm==4.67.1
-      - typing-extensions==4.12.2
+      - traitlets==5.14.3
+      - transformers==4.51.3
+      - triton==3.1.0
+      - typer==0.15.2
+      - types-python-dateutil==2.9.0.20241206
+      - typing-extensions==4.15.0
       - typing-inspect==0.9.0
-      - urllib3==2.3.0
-      - yarl==1.18.3
+      - typing-inspection==0.4.2
+      - tzdata==2025.2
+      - uri-template==1.3.0
+      - uvicorn==0.34.1
+      - uvloop==0.21.0
+      - vllm==0.7.3
+      - vtk==9.3.1
+      - watchfiles==1.0.5
+      - wcwidth==0.2.13
+      - webcolors==24.11.1
+      - webencodings==0.5.1
+      - websocket-client==1.8.0
+      - websockets==15.0.1
+      - werkzeug==3.1.1
+      - widgetsnbextension==3.6.10
+      - wrapt==1.17.2
+      - xformers==0.0.28.post3
+      - xgrammar==0.1.11
+      - zipp==3.21.0
       - zstandard==0.23.0
-      - boto3==1.36.26
-      - langchain_aws==0.2.13
-      - pyvista==0.45.0
-      - transformers==4.52.0

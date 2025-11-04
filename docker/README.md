@@ -1,35 +1,79 @@
 ## Foam-Agent Docker
-A Foam-Agent image is available at [https://hub.docker.com/r/zhangt20/foamagent](https://hub.docker.com/r/zhangt20/foamagent). This image includes Foam-Agent, OpenFOAM-v10, and the openfoamAgent conda environment. 
+
+This Docker setup provides a complete Foam-Agent environment with OpenFOAM-v10 and the FoamAgent conda environment. **You must build the image from the Dockerfile** - no pre-built images are provided.
+
+### Features
+- **Fully automated setup**: Conda environment is automatically initialized and activated
+- **Direct git clone**: Foam-Agent is cloned directly from GitHub during build
+- **Easy updates**: Simply run `git pull` inside the container to get the latest code
+- **Auto-configured**: OpenFOAM and conda environments are automatically sourced
 
 ### Building the Docker image
-If you prefer do build the Docker image yourself, do the following steps.
 
-1. In your terminal, navigate to one level above `Foam-Agent/`, and then do
+**Required**: Build the image from the Dockerfile:
+
+1. Navigate to the directory containing the Dockerfile:
 ```bash
-cp Foam-Agent/docker/Dockerfile .
+cd Foam-Agent/docker
 ```
 
-You file structure should now be
-```
-./
-├── Dockerfile
-└── Foam-Agent
-```
-
-2. Download the MiniConda installation script
+2. Build the image (everything is automated - no need to download Miniconda or copy files):
 ```bash
-wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ./Miniconda3-latest-Linux-x86_64.sh
+docker build --tag foamagent:latest .
 ```
 
-3. Build the image
-```
-docker build --tag foamagent:1.0.1 .
+**Note**: The building process should take around 15 minutes, and the final image size should be between 7-8 GB. The Dockerfile will automatically:
+- Download and install Miniconda
+- Clone the latest Foam-Agent code from GitHub
+- Create and configure the conda environment
+- Set up all necessary environment variables
+
+### Running the Container
+
+#### Basic Usage
+```bash
+docker run -it --name foamagent foamagent:latest
 ```
 
-Afterwards, follow the instruction at [https://hub.docker.com/r/zhangt20/foamagent](https://hub.docker.com/r/zhangt20/foamagent) to create a container.
+When the container starts, you'll automatically get:
+- ✅ OpenFOAM environment sourced
+- ✅ Conda initialized
+- ✅ FoamAgent conda environment activated
+- ✅ Working directory set to `/home/openfoam/Foam-Agent`
+- ✅ Welcome message with usage instructions
 
-The building process should take around 15 minutes, and the image size should be between 7-8 GB.
+#### Set OpenAI API Key
+You can either:
+1. Set it when running the container:
+```bash
+docker run -it -e OPENAI_API_KEY=your-key-here --name foamagent foamagent:latest
+```
+
+2. Or set it inside the container:
+```bash
+export OPENAI_API_KEY=your-key-here
+```
+
+#### Run Foam-Agent
+Once inside the container (everything is already set up):
+```bash
+python foambench_main.py --openfoam_path $WM_PROJECT_DIR --output ./output --prompt_path ./user_requirement.txt
+```
+
+#### Update to Latest Foam-Agent Code
+To get the latest code from GitHub:
+```bash
+cd /home/openfoam/Foam-Agent
+git pull
+```
+
+### Restarting the Container
+```bash
+docker start -i foamagent
+```
+
+Everything will be automatically configured again - no manual setup needed!
 
 ## Note
-In [Dockerfile](Dockerfile) line 72-80, there is an option to exclude root access. However, the image size will increase to around 10-15 GB.
+In [Dockerfile](Dockerfile) line 131-139, there is an option to exclude root access. However, the image size will increase to around 10-15 GB.
 
