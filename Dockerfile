@@ -67,6 +67,15 @@ RUN apt-get update \
 ENV CONDA_DIR="/opt/conda"
 ENV PATH=$CONDA_DIR/bin:$PATH
 ENV FoamAgent_PATH="/home/openfoam/Foam-Agent"
+ENV PYTHONPATH="$FoamAgent_PATH/src:$PYTHONPATH"
+# ENV FOAM_AGENT_MODE="api"
+ENV FOAM_AGENT_MODE="mcp"
+ENV FOAM_AGENT_PORT="7860"
+ENV MCP_TRANSPORT="http"
+ENV MCP_PORT="7860"
+ENV MCP_HOST="0.0.0.0"
+
+EXPOSE 7860
 
 # Copy Conda runtime and Foam-Agent from builder
 COPY --from=builder $CONDA_DIR $CONDA_DIR
@@ -133,12 +142,25 @@ echo ""
 echo "Note: Make sure OPENAI_API_KEY is set before running!"
 echo "=========================================="
 
-# Execute the command passed to the container
-if [ "$1" = "/bin/bash" ] || [ "$1" = "bash" ] || [ -z "$1" ]; then
-    exec /bin/bash -i
-else
+# # Execute the command passed to the container
+# if [ "$1" = "/bin/bash" ] || [ "$1" = "bash" ] || [ -z "$1" ]; then
+#     exec /bin/bash -i
+# else
+#     exec "$@"
+# fi
+
+if [[ "$#" -gt 0 ]]; then
     exec "$@"
 fi
+
+MODE="${FOAM_AGENT_MODE:-api}"
+PORT="${FOAM_AGENT_PORT:-7860}"
+
+if [[ "$MODE" == "mcp" ]]; then
+    exec python -m src.mcp.start_mcp
+fi
+
+exec uvicorn app:app --host 0.0.0.0 --port "$PORT"
 EOFSCRIPT
 RUN chmod +x /usr/local/bin/foamagent-entrypoint.sh
 
@@ -157,4 +179,6 @@ WORKDIR /home/openfoam/
 
 # Use the custom entrypoint script
 ENTRYPOINT ["/usr/local/bin/foamagent-entrypoint.sh"]
-CMD ["/bin/bash"]
+
+# CMD ["/bin/bash"]
+CMD ["__auto__"]
