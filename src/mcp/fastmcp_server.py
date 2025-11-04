@@ -56,14 +56,16 @@ By managing the full pipeline—from meshing and case setup to execution and pos
 
 class PlanRequest(BaseModel):
     """Request to plan simulation structure."""
-    case_id: str = Field(description="Case identifier")
     user_requirement: str = Field(description="User requirements for the simulation")
 
 
 class PlanResponse(BaseModel):
     """Response from simulation planning."""
     subtasks: List[Dict[str, str]] = Field(description="List of subtasks with file and folder information")
-    case_info: Dict[str, str] = Field(description="Case metadata")
+    case_name: str = Field(description="Generated case name")
+    case_solver: str = Field(description="OpenFOAM solver to use")
+    case_domain: str = Field(description="Simulation domain (e.g., 'fluid', 'solid')")
+    case_category: str = Field(description="Case category (e.g., 'tutorial', 'advanced')")
 
 
 @mcp.tool(name="plan")
@@ -77,7 +79,7 @@ async def plan(
     for OpenFOAM file generation.
     """
     try:
-        await ctx.info(f"Planning simulation structure for case: {request.case_id}")
+        await ctx.info("Planning simulation structure from user requirements")
         
         # Load case statistics, available domains, categories, and solvers
         case_stats_path = os.path.join(global_config.database_path, "raw", "openfoam_case_stats.json")
@@ -97,16 +99,13 @@ async def plan(
         
         # Convert subtasks to PlanResponse format
         subtasks = [{"file": s["file_name"], "folder": s["folder_name"]} for s in plan_data["subtasks"]]
-        case_info = {
-            "case_name": plan_data["case_name"],
-            "solver": plan_data["case_solver"],
-            "domain": plan_data["case_domain"],
-            "category": plan_data["case_category"],
-        }
         
         return PlanResponse(
             subtasks=subtasks,
-            case_info=case_info
+            case_name=plan_data["case_name"],
+            case_solver=plan_data["case_solver"],
+            case_domain=plan_data["case_domain"],
+            case_category=plan_data["case_category"]
         )
         
     except Exception as e:
@@ -120,10 +119,12 @@ async def plan(
 
 class GenerateFilesRequest(BaseModel):
     """Request to generate OpenFOAM files."""
-    case_id: str = Field(description="Case identifier")
+    case_name: str = Field(description="Case name (from plan response)")
     subtasks: List[Dict[str, str]] = Field(description="List of subtasks to generate files for")
     user_requirement: str = Field(description="User requirements")
     case_solver: str = Field(description="OpenFOAM solver to use")
+    case_domain: str = Field(description="Simulation domain")
+    case_category: str = Field(description="Case category")
 
 
 class GenerateFilesResponse(BaseModel):
@@ -144,11 +145,11 @@ async def input_writer(
     system, constant, and initial condition files.
     """
     try:
-        await ctx.info(f"Generating OpenFOAM files for case: {request.case_id}")
+        await ctx.info(f"Generating OpenFOAM files for case: {request.case_name}")
         
         # Resolve case directory
         case_dir = resolve_case_dir(
-            case_name=request.case_id,
+            case_name=request.case_name,
             case_dir="",
             run_times=global_config.run_times
         )
@@ -160,12 +161,12 @@ async def input_writer(
         with open(case_stats_path, 'r') as f:
             case_stats = json.load(f)
         
-        # Get case info from the first subtask or use defaults
+        # Build case info from request
         case_info = {
-            "case_name": request.case_id,
+            "case_name": request.case_name,
             "case_solver": request.case_solver,
-            "case_domain": "fluid",  # Default
-            "case_category": "tutorial"  # Default
+            "case_domain": request.case_domain,
+            "case_category": request.case_category
         }
 
         ctx.info(f"Case info: {case_info}")
@@ -248,7 +249,7 @@ class RunSimulationRequest(BaseModel):
 
 class RunSimulationResponse(BaseModel):
     """Response from simulation run."""
-    status: str = Field(description="Run status: 'completed' or 'failed'")
+    status: str = Field(description="Run status: 'success' or 'failed'")
     errors: List[str] = Field(description="List of errors found")
     log_files: Dict[str, str] = Field(description="Paths to log files")
 
@@ -298,7 +299,7 @@ async def run(
         if os.path.exists(err_path):
             log_files['Allrun.err'] = err_path
         
-        status = "completed" if not errors else "failed"
+        status = "success" if not errors else "failed"
         
         await ctx.info(f"Simulation {status} with {len(errors)} error(s)")
         
@@ -327,8 +328,6 @@ class ReviewRequest(BaseModel):
 class ReviewResponse(BaseModel):
     """Response from simulation review."""
     analysis: str = Field(description="Analysis of simulation errors")
-    suggestions: List[str] = Field(description="List of suggested fixes")
-    issues_found: List[str] = Field(description="List of issues identified")
 
 
 @mcp.tool(name="review")
@@ -391,9 +390,7 @@ async def review(
         
         # Format response (suggestions and issues are empty as review_error_logs only returns analysis)
         return ReviewResponse(
-            analysis=review_content,
-            suggestions=[],
-            issues_found=[]
+            analysis=review_content
         )
         
     except Exception as e:
@@ -410,10 +407,7 @@ class ApplyFixesRequest(BaseModel):
     case_dir: str = Field(description="Path to the OpenFOAM case directory")
     error_logs: List[str] = Field(description="List of error log messages from simulation")
     review_analysis: str = Field(description="Review analysis with fix suggestions from the review tool. Must be provided.")
-    user_requirement: str = Field(
-        default="",
-        description="Original user requirements or simulation description for context"
-    )
+    user_requirement: str = Field(description="Original user requirements or simulation description for context")
 
 
 class ApplyFixesResponse(BaseModel):
@@ -522,7 +516,7 @@ class VisualizationRequest(BaseModel):
 class VisualizationResponse(BaseModel):
     """Response from visualization generation."""
     artifacts: List[str] = Field(description="List of generated visualization files")
-    script_path: Optional[str] = Field(description="Path to visualization script")
+    script: str = Field(description="Visualization script")
 
 
 @mcp.tool(name="visualization")
@@ -567,7 +561,7 @@ async def visualization(
         
         return VisualizationResponse(
             artifacts=artifacts,
-            script_path=script
+            script=script
         )
         
     except Exception as e:

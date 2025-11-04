@@ -15,7 +15,7 @@ class Config:
     max_time_limit: int = 3600 # Max time limit after which the openfoam run will be terminated, in seconds
     file_dependency_threshold: int = 3000 # threshold length on the similar case; see `nodes/architect_node.py` for details
     model_provider: str = "openai"# [openai, ollama, bedrock]
-    # model_version should be in ["gpt-4o", "deepseek-r1:32b-qwen-distill-fp16", "qwen2.5:32b-instruct"]
-    model_version: str = "gpt-4o"
-    temperature: float = 0.6
+    # model_version should be in ["gpt-5-mini-2025-08-07", "deepseek-r1:32b-qwen-distill-fp16", "qwen2.5:32b-instruct"]
+    model_version: str = "gpt-5-mini-2025-08-07"
+    temperature: float = 0.68
     

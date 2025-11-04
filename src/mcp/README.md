@@ -90,21 +90,26 @@ case_response = await client.call_tool(
 
 # Plan the simulation
 plan_response = await client.call_tool(
-    "plan_simulation",
+    "plan",
     {
-        "case_id": case_response["case_id"],
-        "user_requirement": "Create a simple fluid flow simulation around a cylinder"
+        "request": {
+            "user_requirement": "Create a simple fluid flow simulation around a cylinder"
+        }
     }
 )
 
 # Generate OpenFOAM files
 files_response = await client.call_tool(
-    "generate_openfoam_files",
+    "input_writer",
     {
-        "case_id": case_response["case_id"],
-        "subtasks": plan_response["subtasks"],
-        "user_requirement": "Create a simple fluid flow simulation around a cylinder",
-        "case_solver": "simpleFoam"
+        "request": {
+            "case_name": plan_response["case_name"],
+            "subtasks": plan_response["subtasks"],
+            "user_requirement": "Create a simple fluid flow simulation around a cylinder",
+            "case_solver": plan_response["case_solver"],
+            "case_domain": plan_response["case_domain"],
+            "case_category": plan_response["case_category"]
+        }
     }
 )
 ```

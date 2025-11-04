@@ -34,7 +34,6 @@ async def main():
     """
     
     results = {}
-    case_id = "lid_driven_cavity_20x20"
     
     try:
         # Connect to MCP server
@@ -52,7 +51,6 @@ async def main():
                 "plan",
                 {
                     "request": {
-                        "case_id": case_id,
                         "user_requirement": user_requirement
                     }
                 }
@@ -60,6 +58,10 @@ async def main():
             
             plan_response = plan_response.structured_content or plan_response.data or {}
             print(f"✅ Generated {len(plan_response['subtasks'])} subtasks")
+            print(f"   Case name: {plan_response['case_name']}")
+            print(f"   Solver: {plan_response['case_solver']}")
+            print(f"   Domain: {plan_response['case_domain']}")
+            print(f"   Category: {plan_response['case_category']}")
             print(plan_response)
             for i, subtask in enumerate(plan_response['subtasks']):
                 print(f"   {i+1}. {subtask['file']} in {subtask['folder']}")
@@ -73,10 +75,12 @@ async def main():
                 "input_writer",
                 {
                     "request": {
-                        "case_id": case_id,
+                        "case_name": plan_response['case_name'],
                         "subtasks": plan_response['subtasks'],
                         "user_requirement": user_requirement,
-                        "case_solver": plan_response['case_info']['solver']
+                        "case_solver": plan_response['case_solver'],
+                        "case_domain": plan_response['case_domain'],
+                        "case_category": plan_response['case_category']
                     }
                 }
             )
@@ -91,42 +95,50 @@ async def main():
 
             print(files_response)
             
-            # Step 3: Run simulation
-            print("\n🏃 Step 3: Running simulation")
+            # Step 3: Run simulation with error fixing loop
+            print("\n🏃 Step 3: Running simulation (with error fixing loop)")
             print("-" * 40)
             
-            print(f"Starting simulation in: {case_dir}")
+            max_iterations = 5  # Maximum number of fix attempts
+            iteration = 0
+            run_response = None
             
-            run_response = await client.call_tool(
-                "run",
-                {
-                    "request": {
-                        "case_dir": case_dir,
-                        "timeout": 600  # 10 minutes
+            while iteration < max_iterations:
+                iteration += 1
+                print(f"\n🔄 Iteration {iteration}/{max_iterations}")
+                print(f"Starting simulation in: {case_dir}")
+                
+                run_response = await client.call_tool(
+                    "run",
+                    {
+                        "request": {
+                            "case_dir": case_dir,
+                            "timeout": 600  # 10 minutes
+                        }
                     }
-                }
-            )
-            
-            run_response = run_response.structured_content or run_response.data or {}
-            status = run_response['status']
-
-            print(run_response)
-            print(f"✅ Simulation {status}")
-            
-            if run_response['errors']:
+                )
+                
+                run_response = run_response.structured_content or run_response.data or {}
+                status = run_response['status']
+                
+                print(run_response)
+                print(f"✅ Simulation {status}")
+                
+                if not run_response.get('errors'):
+                    print(f"   No errors detected - simulation completed successfully!")
+                    results['simulation_run'] = True
+                    results['review'] = True
+                    break
+                
+                # Errors found - review and fix
                 print(f"   Errors found: {len(run_response['errors'])}")
                 for error in run_response['errors'][:3]:
                     print(f"   - {error}")
-            else:
-                print(f"   No errors detected")
-            
-            results['simulation_run'] = (status == 'completed')
-            
-            # Step 4: Review results (only if there are errors)
-            print("\n🔍 Step 4: Reviewing results")
-            print("-" * 40)
-            
-            if run_response['errors']:
+                
+                # Step 4: Review errors
+                print(f"\n🔍 Reviewing errors (iteration {iteration})")
+                print("-" * 40)
+                
                 review_response = await client.call_tool(
                     "review",
                     {
@@ -139,35 +151,75 @@ async def main():
                 )
                 
                 review_response = review_response.structured_content or review_response.data or {}
-                print(review_response)
                 print(f"✅ Review completed")
-                suggestions = review_response.get('suggestions', [])
-                if suggestions:
-                    print(f"   Suggestions: {len(suggestions)}")
-                results['review'] = True
-            else:
-                print("✅ No errors to review - simulation completed successfully!")
-                results['review'] = True
-            
-            # Step 5: Generate visualization
-            print("\n📊 Step 5: Generating visualization")
-            print("-" * 40)
-            
-            viz_response = await client.call_tool(
-                "visualization",
-                {
-                    "request": {
-                        "case_dir": case_dir,
-                        "quantity": "velocity",
-                        "visualization_type": "pyvista"
+                analysis = review_response.get('analysis', '')
+                if analysis:
+                    print(f"   Analysis: {len(analysis)} characters")
+                    # Print first 200 characters of analysis
+                    if len(analysis) > 200:
+                        print(f"   Preview: {analysis[:200]}...")
+                    else:
+                        print(f"   Content: {analysis}")
+                
+                # Step 5: Apply fixes
+                print(f"\n🔧 Applying fixes (iteration {iteration})")
+                print("-" * 40)
+                
+                fix_response = await client.call_tool(
+                    "apply_fixes",
+                    {
+                        "request": {
+                            "case_dir": case_dir,
+                            "error_logs": run_response['errors'],
+                            "review_analysis": analysis,
+                            "user_requirement": user_requirement
+                        }
                     }
-                }
-            )
+                )
+                
+                fix_response = fix_response.structured_content or fix_response.data or {}
+                print(f"✅ Fixes applied")
+                updated_files = fix_response.get('updated_files', [])
+                fix_status = fix_response.get('status', 'unknown')
+                print(f"   Status: {fix_status}")
+                print(f"   Updated {len(updated_files)} file(s)")
+                if updated_files:
+                    for file_path in updated_files[:5]:  # Show first 5 files
+                        print(f"   - {file_path}")
+                    if len(updated_files) > 5:
+                        print(f"   ... and {len(updated_files) - 5} more")
+                
+                # Will continue loop to run simulation again
+            else:
+                # Loop completed without success
+                print(f"\n⚠️ Maximum iterations ({max_iterations}) reached")
+                print(f"   Simulation still has errors after {max_iterations} attempts")
+                results['simulation_run'] = False
+                results['review'] = True
             
-            viz_response = viz_response.structured_content or viz_response.data or {}
-            print(viz_response)
-            print(f"✅ Generated {len(viz_response.get('artifacts', []))} visualization artifacts")
-            results['visualization'] = True
+            # Step 6: Generate visualization (only if simulation succeeded)
+            if results.get('simulation_run'):
+                print("\n📊 Step 6: Generating visualization")
+                print("-" * 40)
+                
+                viz_response = await client.call_tool(
+                    "visualization",
+                    {
+                        "request": {
+                            "case_dir": case_dir,
+                            "quantity": "velocity",
+                            "visualization_type": "pyvista"
+                        }
+                    }
+                )
+                
+                viz_response = viz_response.structured_content or viz_response.data or {}
+                print(viz_response)
+                print(f"✅ Generated {len(viz_response.get('artifacts', []))} visualization artifacts")
+                results['visualization'] = True
+            else:
+                print("\n📊 Step 6: Skipping visualization (simulation did not succeed)")
+                results['visualization'] = False
         
         # Summary
         print("\n" + "=" * 60)
