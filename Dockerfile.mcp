@@ -1,5 +1,5 @@
 # --- Stage 1: Builder ---
-FROM openfoam/openfoam10-paraview510:latest AS builder
+FROM openfoam/openfoam10:latest AS builder
 USER root
 
 # Install base utilities (including ca-certificates for SSL)
@@ -53,7 +53,7 @@ RUN conda clean --all --yes && \
     rm -rf /var/lib/apt/lists/*
 
 # --- Stage 2: Runtime ---
-FROM openfoam/openfoam10-paraview510:latest
+FROM openfoam/openfoam10:latest
 USER root
 
 # Install runtime dependencies
@@ -70,9 +70,9 @@ ENV PATH=$CONDA_DIR/bin:$PATH
 ENV FoamAgent_PATH="/home/openfoam/Foam-Agent"
 
 # Copy Conda runtime and Foam-Agent from builder
-COPY --from=builder --chown=root:root $CONDA_DIR $CONDA_DIR
-COPY --from=builder --chown=root:root $FoamAgent_PATH $FoamAgent_PATH
-COPY --from=builder --chown=root:root /root/.bashrc /root/.bashrc
+COPY --from=builder $CONDA_DIR $CONDA_DIR
+COPY --from=builder $FoamAgent_PATH $FoamAgent_PATH
+COPY --from=builder /root/.bashrc /root/.bashrc
 
 # Ensure conda is properly initialized in .bashrc for interactive shells
 RUN echo '' >> /root/.bashrc && \
@@ -91,57 +91,57 @@ RUN echo '' >> /root/.bashrc && \
     echo 'cd "$FoamAgent_PATH" 2>/dev/null || true' >> /root/.bashrc
 
 # Create a startup script that automatically sets up everything
-RUN cat > /usr/local/bin/foamagent-entrypoint.sh << 'EOFSCRIPT'
-#!/bin/bash
-set -e
-
-# Source OpenFOAM environment in a controlled way: allow non-zero RC, then validate
-set +e
-source /opt/openfoam10/etc/bashrc
-openfoam_rc=$?
-set -e
-
-# Strict validation: must have WM_PROJECT_DIR and blockMesh in PATH
-if [ -z "$WM_PROJECT_DIR" ] || ! command -v blockMesh >/dev/null 2>&1; then
-    echo "ERROR: OpenFOAM environment failed to load (rc=$openfoam_rc)." >&2
-    echo "Diag: WM_PROJECT_DIR='${WM_PROJECT_DIR:-unset}', blockMesh=$(command -v blockMesh || echo 'NOT-IN-PATH')" >&2
-    exit 1
-fi
-
-# Initialize conda
-source "$CONDA_DIR/etc/profile.d/conda.sh"
-
-# Activate FoamAgent environment
-conda activate FoamAgent
-
-# Change to Foam-Agent directory
-cd "$FoamAgent_PATH"
-
-# Display welcome message
-echo "=========================================="
-echo "Foam-Agent Docker Container Ready!"
-echo "=========================================="
-echo "OpenFOAM: $WM_PROJECT_DIR"
-echo "Conda Env: FoamAgent (activated)"
-echo "Working Dir: $FoamAgent_PATH"
-echo ""
-echo "To update to latest Foam-Agent:"
-echo "  cd $FoamAgent_PATH && git pull"
-echo ""
-echo "To run Foam-Agent:"
-echo "  python foambench_main.py --openfoam_path \$WM_PROJECT_DIR --output ./output --prompt_path ./user_requirement.txt"
-echo ""
-echo "Note: Make sure OPENAI_API_KEY is set before running!"
-echo "=========================================="
-
-# Execute the command passed to the container
-if [ "$1" = "/bin/bash" ] || [ "$1" = "bash" ] || [ -z "$1" ]; then
-    exec /bin/bash -i
-else
-    exec "$@"
-fi
-EOFSCRIPT
-RUN chmod +x /usr/local/bin/foamagent-entrypoint.sh
+RUN printf '%s\n' \
+    '#!/bin/bash' \
+    'set -e' \
+    '' \
+    '# Source OpenFOAM environment in a controlled way: allow non-zero RC, then validate' \
+    'set +e' \
+    'source /opt/openfoam10/etc/bashrc' \
+    'openfoam_rc=$?' \
+    'set -e' \
+    '' \
+    '# Strict validation: must have WM_PROJECT_DIR and blockMesh in PATH' \
+    'if [ -z "$WM_PROJECT_DIR" ] || ! command -v blockMesh >/dev/null 2>&1; then' \
+    '    echo "ERROR: OpenFOAM environment failed to load (rc=$openfoam_rc)." >&2' \
+    '    echo "Diag: WM_PROJECT_DIR='"'"'${WM_PROJECT_DIR:-unset}'"'"', blockMesh=$(command -v blockMesh || echo '"'"'NOT-IN-PATH'"'"')" >&2' \
+    '    exit 1' \
+    'fi' \
+    '' \
+    '# Initialize conda' \
+    'source "$CONDA_DIR/etc/profile.d/conda.sh"' \
+    '' \
+    '# Activate FoamAgent environment' \
+    'conda activate FoamAgent' \
+    '' \
+    '# Change to Foam-Agent directory' \
+    'cd "$FoamAgent_PATH"' \
+    '' \
+    '# Display welcome message' \
+    'echo "=========================================="' \
+    'echo "Foam-Agent Docker Container Ready!"' \
+    'echo "=========================================="' \
+    'echo "OpenFOAM: $WM_PROJECT_DIR"' \
+    'echo "Conda Env: FoamAgent (activated)"' \
+    'echo "Working Dir: $FoamAgent_PATH"' \
+    'echo ""' \
+    'echo "To update to latest Foam-Agent:"' \
+    'echo "  cd $FoamAgent_PATH && git pull"' \
+    'echo ""' \
+    'echo "To run Foam-Agent:"' \
+    'echo "  python foambench_main.py --openfoam_path \$WM_PROJECT_DIR --output ./output --prompt_path ./user_requirement.txt"' \
+    'echo ""' \
+    'echo "Note: Make sure OPENAI_API_KEY is set before running!"' \
+    'echo "=========================================="' \
+    '' \
+    '# Execute the command passed to the container' \
+    'if [ "$1" = "/bin/bash" ] || [ "$1" = "bash" ] || [ -z "$1" ]; then' \
+    '    exec /bin/bash -i' \
+    'else' \
+    '    exec "$@"' \
+    'fi' \
+    > /usr/local/bin/foamagent-entrypoint.sh && \
+    chmod +x /usr/local/bin/foamagent-entrypoint.sh
 
 # ============================================================================
 # Uncomment to exclude root access but create a larger image
@@ -154,8 +154,18 @@ RUN chmod +x /usr/local/bin/foamagent-entrypoint.sh
 # ============================================================================
 
 # Set default working directory
-WORKDIR /home/openfoam/
+WORKDIR $FoamAgent_PATH
+
+# Expose port 7860 for MCP HTTP service
+EXPOSE 7860
+
+# Environment variables for MCP service
+ENV MCP_TRANSPORT=http
+ENV MCP_HOST=0.0.0.0
+ENV MCP_PORT=7860
 
 # Use the custom entrypoint script
 ENTRYPOINT ["/usr/local/bin/foamagent-entrypoint.sh"]
-CMD ["/bin/bash"]
+
+# Run MCP server by default (can override with: docker run <image> /bin/bash)
+CMD ["python", "src/mcp/start_mcp.py"]
