@@ -17,5 +17,5 @@ class Config:
     model_provider: str = "openai"# [openai, ollama, bedrock]
     # model_version should be in ["gpt-5-mini", "deepseek-r1:32b-qwen-distill-fp16", "qwen2.5:32b-instruct"]
     model_version: str = "gpt-5-mini"
-    temperature: float = 0.7
+    temperature: float = 1
     
