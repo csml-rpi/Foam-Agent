@@ -19,7 +19,7 @@ cd Foam-Agent/docker
 
 2. Build the image (everything is automated - no need to download Miniconda or copy files):
 ```bash
-docker build --tag foamagent:latest .
+docker build --platform linux/amd64 --tag foamagent:latest .
 ```
 
 **Note**: The building process should take around 15 minutes, and the final image size should be between 7-8 GB. The Dockerfile will automatically:
@@ -29,10 +29,8 @@ docker build --tag foamagent:latest .
 - Set up all necessary environment variables
 
 ### Running the Container
-
-#### Basic Usage
 ```bash
-docker run -it --name foamagent foamagent:latest
+docker run -it -e OPENAI_API_KEY=your-key-here --name foamagent foamagent:latest
 ```
 
 When the container starts, you'll automatically get:
@@ -42,17 +40,6 @@ When the container starts, you'll automatically get:
 - ✅ Working directory set to `/home/openfoam/Foam-Agent`
 - ✅ Welcome message with usage instructions
 
-#### Set OpenAI API Key
-You can either:
-1. Set it when running the container:
-```bash
-docker run -it -e OPENAI_API_KEY=your-key-here --name foamagent foamagent:latest
-```
-
-2. Or set it inside the container:
-```bash
-export OPENAI_API_KEY=your-key-here
-```
 
 #### Run Foam-Agent
 Once inside the container (everything is already set up):
@@ -71,9 +58,4 @@ git pull
 ```bash
 docker start -i foamagent
 ```
-
-Everything will be automatically configured again - no manual setup needed!
-
-## Note
-In [Dockerfile](Dockerfile) line 131-139, there is an option to exclude root access. However, the image size will increase to around 10-15 GB.
 

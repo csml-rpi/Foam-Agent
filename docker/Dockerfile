@@ -94,8 +94,18 @@ RUN cat > /usr/local/bin/foamagent-entrypoint.sh << 'EOFSCRIPT'
 #!/bin/bash
 set -e
 
-# Source OpenFOAM environment
+# Source OpenFOAM environment in a controlled way: allow non-zero RC, then validate
+set +e
 source /opt/openfoam10/etc/bashrc
+openfoam_rc=$?
+set -e
+
+# Strict validation: must have WM_PROJECT_DIR and blockMesh in PATH
+if [ -z "$WM_PROJECT_DIR" ] || ! command -v blockMesh >/dev/null 2>&1; then
+    echo "ERROR: OpenFOAM environment failed to load (rc=$openfoam_rc)." >&2
+    echo "Diag: WM_PROJECT_DIR='${WM_PROJECT_DIR:-unset}', blockMesh=$(command -v blockMesh || echo 'NOT-IN-PATH')" >&2
+    exit 1
+fi
 
 # Initialize conda
 source "$CONDA_DIR/etc/profile.d/conda.sh"
@@ -124,7 +134,11 @@ echo "Note: Make sure OPENAI_API_KEY is set before running!"
 echo "=========================================="
 
 # Execute the command passed to the container
-exec "$@"
+if [ "$1" = "/bin/bash" ] || [ "$1" = "bash" ] || [ -z "$1" ]; then
+    exec /bin/bash -i
+else
+    exec "$@"
+fi
 EOFSCRIPT
 RUN chmod +x /usr/local/bin/foamagent-entrypoint.sh
 
