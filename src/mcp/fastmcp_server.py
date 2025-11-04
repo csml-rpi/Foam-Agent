@@ -577,14 +577,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--transport",
         choices=["stdio", "http"],
-        default="stdio",
-        help="Transport method (default: stdio)"
+        default="http",
+        help="Transport method (default: http)"
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=8080,
-        help="Port for HTTP transport (default: 8080)"
+        default=7860,
+        help="Port for HTTP transport (default: 7860)"
     )
     parser.add_argument(
         "--host",
@@ -603,4 +603,4 @@ if __name__ == "__main__":
 
 
 # run the server:
-# python -m src.mcp.fastmcp_server --transport http --port 8080
+# python -m src.mcp.fastmcp_server --transport http --host 0.0.0.0 --port 7860
