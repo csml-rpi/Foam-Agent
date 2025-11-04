@@ -97,9 +97,8 @@ docker build --tag foamagent:latest .
 
 **Running the Container:**
 
-**Basic Usage:**
 ```bash
-docker run -it --name foamagent foamagent:latest
+docker run -it -e OPENAI_API_KEY=your-key-here --name foamagent foamagent:latest
 ```
 
 When the container starts, you'll automatically get:
@@ -109,17 +108,6 @@ When the container starts, you'll automatically get:
 - ✅ Working directory set to `/home/openfoam/Foam-Agent`
 - ✅ Welcome message with usage instructions
 
-**Set OpenAI API Key:**
-You can either:
-1. Set it when running the container:
-```bash
-docker run -it -e OPENAI_API_KEY=your-key-here --name foamagent foamagent:latest
-```
-
-2. Or set it inside the container:
-```bash
-export OPENAI_API_KEY=your-key-here
-```
 
 **Run Foam-Agent:**
 Once inside the container (everything is already set up):
