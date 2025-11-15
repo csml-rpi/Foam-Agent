@@ -1,6 +1,4 @@
 # Project
-*.pkl
-*.txt
 runs/
 output/
 benchmark/
