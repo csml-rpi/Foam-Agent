@@ -1,0 +1,10 @@
+database/faiss/openfoam_allrun_scripts filter=lfs diff=lfs merge=lfs -text
+database/faiss/openfoam_command_help filter=lfs diff=lfs merge=lfs -text
+database/faiss/openfoam_tutorials_details filter=lfs diff=lfs merge=lfs -text
+database/faiss/openfoam_tutorials_structure filter=lfs diff=lfs merge=lfs -text
+database/raw/openfoam_tutorials_details.txt filter=lfs diff=lfs merge=lfs -text
+database/raw/openfoam_tutorials_structure.txt filter=lfs diff=lfs merge=lfs -text
+database/raw/openfoam_allrun_scripts.txt filter=lfs diff=lfs merge=lfs -text
+database/raw/openfoam_case_stats.json filter=lfs diff=lfs merge=lfs -text
+database/raw/openfoam_command_help.txt filter=lfs diff=lfs merge=lfs -text
+database/raw/openfoam_commands.txt filter=lfs diff=lfs merge=lfs -text
