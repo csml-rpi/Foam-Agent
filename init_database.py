@@ -9,7 +9,7 @@ def parse_args():
     parser.add_argument(
         '--openfoam_path',
         type=str,
-        required=True,
+        default=os.getenv("WM_PROJECT_DIR"),
         help="Path to OpenFOAM installation (WM_PROJECT_DIR)"
     )
     return parser.parse_args()

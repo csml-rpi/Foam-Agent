@@ -67,33 +67,28 @@ git checkout v1.1.0
 Otherwise, FoamAgent will be at the latest version.
 
 #### Foam-Agent Docker
-You can skip the rest of [1](#1-clone-the-repository-and-install-dependencies) and [2](#2-install-and-configure-openfoam-v10) by using a Docker, which has the entire Foam-Agent framework already set up. Afterwards, go to [3](#3-database-preprocessing-first-time-setup).
-
-This Docker setup provides a complete Foam-Agent environment with OpenFOAM-v10 and the FoamAgent conda environment. **You must build the image from the Dockerfile** - no pre-built images are provided.
+You can skip manual installation steps [1](#1-clone-the-repository-and-install-dependencies) and [2](#2-install-and-configure-openfoam-v10) by using Docker, which provides a complete Foam-Agent environment with OpenFOAM-v10, the FoamAgent conda environment, and a pre-initialized database. **You must build the image from the Dockerfile** - no pre-built images are provided.
 
 **Features:**
-- **Fully automated setup**: Conda environment is automatically initialized and activated
-- **Direct git clone**: Foam-Agent is cloned directly from GitHub during build
-- **Easy updates**: Simply run `git pull` inside the container to get the latest code
-- **Auto-configured**: OpenFOAM and conda environments are automatically sourced
+- **Fully automated setup**: Conda environment initialized and activated automatically
+- **Pre-initialized database**: Database is built during image construction
+- **Local code copy**: Foam-Agent code copied from your local directory (no GitHub access needed)
+- **Auto-configured**: OpenFOAM and conda environments automatically sourced
+- **Optimized build**: Large files (like `runs/` directory) excluded via `.dockerignore`
 
 **Building the Docker image:**
 
-1. Navigate to the repository root directory:
+From the repository root directory:
 ```bash
-cd Foam-Agent
+docker build -f docker/Dockerfile -t foamagent:latest .
 ```
 
-2. Build the image (everything is automated - no need to download Miniconda or copy files):
-```bash
-docker build --tag foamagent:latest .
-```
+**Build Notes:**
+- Build time: ~15-20 minutes (includes database initialization)
+- Image size: ~7-8 GB
+- Your local code is copied (excluding `runs/`, `__pycache__/`, `.git/` per `.dockerignore`)
 
-**Note**: The building process should take around 15 minutes, and the final image size should be between 7-8 GB. The Dockerfile will automatically:
-- Download and install Miniconda
-- Clone the latest Foam-Agent code from GitHub
-- Create and configure the conda environment
-- Set up all necessary environment variables
+The Dockerfile automatically installs Miniconda, creates the conda environment, **pre-initializes the database**, and configures all necessary environment variables.
 
 **Running the Container:**
 
@@ -108,20 +103,21 @@ When the container starts, you'll automatically get:
 - ✅ Conda initialized
 - ✅ FoamAgent conda environment activated
 - ✅ Working directory set to `/home/openfoam/Foam-Agent`
+- ✅ Database pre-initialized (done during build)
 - ✅ Welcome message with usage instructions
 
-
 **Run Foam-Agent:**
-Once inside the container (everything is already set up):
+Once inside the container (everything is pre-configured):
 ```bash
 python foambench_main.py --openfoam_path $WM_PROJECT_DIR --output ./output --prompt_path ./user_requirement.txt
 ```
 
-**Update to Latest Foam-Agent Code:**
-To get the latest code from GitHub:
+**Updating Your Code:**
+Since code is copied during build, update by rebuilding the image:
 ```bash
-cd /home/openfoam/Foam-Agent
-git pull
+docker build -f docker/Dockerfile -t foamagent:latest .
+docker rm foamagent  # if container exists
+docker run -it -e OPENAI_API_KEY=your-key-here -p 7860:7860 --name foamagent foamagent:latest
 ```
 
 **Restarting the Container:**
@@ -129,12 +125,10 @@ git pull
 docker start -i foamagent
 ```
 
-Everything will be automatically configured again - no manual setup needed!
+**Note:** In the Dockerfile (around lines 99-107), there is an option to exclude root access. However, the image size will increase to around 10-15 GB.
 
-**Note:** In the Dockerfile (around line 131-139), there is an option to exclude root access. However, the image size will increase to around 10-15 GB.
-
-**Otherwise, continue with manual installation:**
-```
+**Manual Installation (if not using Docker):**
+```bash
 conda env create -n FoamAgent -f environment.yml
 conda activate FoamAgent
 ```
@@ -160,46 +154,24 @@ or something similar.
 
 ### 3. Database preprocessing (first-time setup)
 
-Before running any workflow, you must preprocess the OpenFOAM tutorial and command database. This can be done automatically or manually.
-
-#### Recommended: Automatic preprocessing
+Before running any workflow, you must initialize the OpenFOAM tutorial and command database. Run:
 
 ```bash
-python foambench_main.py --openfoam_path $WM_PROJECT_DIR --output ./output --prompt_path ./user_requirement.txt
+python init_database.py --openfoam_path $WM_PROJECT_DIR
 ```
 
-This script will automatically run all necessary preprocessing scripts in `database/script/` and then launch the main workflow.
-
-#### Manual preprocessing (advanced)
-
-If you prefer to run preprocessing scripts manually, execute the following:
-
-```bash
-python database/script/tutorial_parser.py --output_dir=./database/raw --wm_project_dir=$WM_PROJECT_DIR
-python database/script/faiss_command_help.py --database_path=./database
-python database/script/faiss_allrun_scripts.py --database_path=./database
-python database/script/faiss_tutorials_structure.py --database_path=./database
-python database/script/faiss_tutorials_details.py --database_path=./database
-```
+This script automatically checks and runs all necessary preprocessing scripts in `database/script/` if the database files don't exist. It's safe to run multiple times as it skips already-generated files.
 
 ### 4. Run a demo workflow
 
-#### Option 1: Automated benchmark (recommended)
-
 ```bash
 python foambench_main.py --openfoam_path $WM_PROJECT_DIR --output ./output --prompt_path ./user_requirement.txt
 ```
 
-#### Option 2: Directly run the main agent
+You can also specify a custom mesh:
 
 ```bash
-python src/main.py --prompt_path ./user_requirement.txt --output_dir ./output
-```
-
-- You can also specify a custom mesh:
-
-```bash
-python src/main.py --prompt_path ./user_requirement.txt --output_dir ./output --custom_mesh_path ./my_mesh.msh
+python foambench_main.py --openfoam_path $WM_PROJECT_DIR --output ./output --prompt_path ./user_requirement.txt --custom_mesh_path ./my_mesh.msh
 ```
 
 #### Example user_requirement.txt
@@ -213,12 +185,71 @@ do a Reynolds-Averaged Simulation (RAS) pitzdaily simulation. Use PIMPLE algorit
 - Default configuration is in `src/config.py`. You can modify model provider, database path, and other parameters there.
 - You must set the `OPENAI_API_KEY` environment variable if using OpenAI/Bedrock models.
 
-### 6. Troubleshooting
+### 6. Using Foam-Agent via MCP (Model Context Protocol)
+
+Foam-Agent exposes its capabilities as an MCP server, allowing integration with AI coding assistants like Claude Code and Cursor.
+
+#### Starting the MCP Server
+
+**Option 1: Standard I/O Mode (for MCP clients)**
+```bash
+python -m src.mcp.fastmcp_server
+```
+
+**Option 2: HTTP Mode (for web clients)**
+```bash
+python -m src.mcp.fastmcp_server --transport http --host 0.0.0.0 --port 7860
+```
+
+#### Configuring Claude Code
+
+1. Open Claude Code settings and navigate to MCP configuration
+2. Copy the following configuration and paste it into your MCP settings file:
+
+```json
+{
+  "mcpServers": {
+    "openfoam-agent": {
+      "command": "python",
+      "args": ["-m", "src.mcp.fastmcp_server"],
+      "cwd": "/path/to/Foam-Agent",
+      "env": {
+        "PYTHONPATH": "/path/to/Foam-Agent/src",
+        "OPENAI_API_KEY": "your-api-key-here"
+      }
+    }
+  }
+}
+```
+
+**Important:** Replace `/path/to/Foam-Agent` with your actual Foam-Agent installation path. If using conda, you may need to use the full path to the conda Python interpreter, e.g., `"/opt/conda/envs/FoamAgent/bin/python"` or `"$CONDA_PREFIX/bin/python"`.
+
+#### Configuring Cursor
+
+1. Open Cursor settings (Cmd/Ctrl + ,)
+2. Search for "MCP" or navigate to **Settings → Features → MCP**
+3. Click "Edit MCP Settings" or open the MCP configuration file
+4. Copy and paste the same JSON configuration as shown above
+5. Replace `/path/to/Foam-Agent` with your actual installation path
+6. Save the configuration and restart Cursor to apply the changes
+
+**Tip:** You can also use the example configuration file `mcp_config.json` in the repository root as a reference. Just update the paths to match your installation.
+
+**Note:** Ensure that:
+- The conda environment `FoamAgent` is activated, or
+- The Python interpreter used has all required dependencies installed
+- `OPENAI_API_KEY` is set in the environment or in the MCP configuration
+- The database has been initialized (run `init_database.py`)
+
+Once configured, you can use Foam-Agent tools directly in Claude Code or Cursor to create, run, and manage OpenFOAM simulations through natural language prompts.
+
+### 7. Troubleshooting
 
 - **OpenFOAM environment not found**: Ensure you have sourced the OpenFOAM bashrc and restarted your terminal.
-- **Database not initialized**: Make sure you have run `foambench_main.py` or all scripts in `database/script/`.
-- **Missing dependencies**: If dependencies are missing, recreate the environment: `conda env update -n FoamAgent -f environment.yml --prune` or `conda env remove -n FoamAgent && conda env create -n FoamAgent -f environment.yml`.
+- **Database not initialized**: Run `python init_database.py --openfoam_path $WM_PROJECT_DIR` to initialize the database.
+- **Missing dependencies**: Recreate the environment: `conda env update -n FoamAgent -f environment.yml --prune` or `conda env remove -n FoamAgent && conda env create -n FoamAgent -f environment.yml`.
 - **API key errors**: Ensure `OPENAI_API_KEY` is set in your environment.
+- **MCP connection errors**: Verify the Python path in MCP configuration matches your installation, ensure the conda environment is accessible, and check that all dependencies are installed.
 
 ## Citation
 If you use Foam-Agent in your research, please cite our paper:
