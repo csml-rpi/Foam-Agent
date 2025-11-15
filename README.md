@@ -67,11 +67,11 @@ git checkout v1.1.0
 Otherwise, FoamAgent will be at the latest version.
 
 #### Foam-Agent Docker
-You can skip manual installation steps [1](#1-clone-the-repository-and-install-dependencies) and [2](#2-install-and-configure-openfoam-v10) by using Docker, which provides a complete Foam-Agent environment with OpenFOAM-v10, the FoamAgent conda environment, and a pre-initialized database. **You must build the image from the Dockerfile** - no pre-built images are provided.
+You can skip manual installation steps [1](#1-clone-the-repository-and-install-dependencies) and [2](#2-install-and-configure-openfoam-v10) by using Docker, which provides a complete Foam-Agent environment with OpenFOAM-v10, the FoamAgent conda environment, and database files (included in the repository). **You must build the image from the Dockerfile** - no pre-built images are provided.
 
 **Features:**
 - **Fully automated setup**: Conda environment initialized and activated automatically
-- **Pre-initialized database**: Database is built during image construction
+- **Pre-initialized database**: Database files are included in the repository (no initialization needed)
 - **Local code copy**: Foam-Agent code copied from your local directory (no GitHub access needed)
 - **Auto-configured**: OpenFOAM and conda environments automatically sourced
 - **Optimized build**: Large files (like `runs/` directory) excluded via `.dockerignore`
@@ -84,11 +84,11 @@ docker build -f docker/Dockerfile -t foamagent:latest .
 ```
 
 **Build Notes:**
-- Build time: ~15-20 minutes (includes database initialization)
+- Build time: ~10-15 minutes
 - Image size: ~7-8 GB
 - Your local code is copied (excluding `runs/`, `__pycache__/`, `.git/` per `.dockerignore`)
 
-The Dockerfile automatically installs Miniconda, creates the conda environment, **pre-initializes the database**, and configures all necessary environment variables.
+The Dockerfile automatically installs Miniconda, creates the conda environment, and configures all necessary environment variables. Database files are already included in the repository, so no initialization is needed.
 
 **Running the Container:**
 
@@ -103,7 +103,7 @@ When the container starts, you'll automatically get:
 - ✅ Conda initialized
 - ✅ FoamAgent conda environment activated
 - ✅ Working directory set to `/home/openfoam/Foam-Agent`
-- ✅ Database pre-initialized (done during build)
+- ✅ Database files ready (included in repository)
 - ✅ Welcome message with usage instructions
 
 **Run Foam-Agent:**
@@ -152,17 +152,7 @@ or something similar.
 
 `WM_PROJECT_DIR` is an environment variable that comes with your OpenFOAM installation, indicating the location of OpenFOAM on your computer.
 
-### 3. Database preprocessing (first-time setup)
-
-Before running any workflow, you must initialize the OpenFOAM tutorial and command database. Run:
-
-```bash
-python init_database.py --openfoam_path $WM_PROJECT_DIR
-```
-
-This script automatically checks and runs all necessary preprocessing scripts in `database/script/` if the database files don't exist. It's safe to run multiple times as it skips already-generated files.
-
-### 4. Run a demo workflow
+### 3. Run a demo workflow
 
 ```bash
 python foambench_main.py --openfoam_path $WM_PROJECT_DIR --output ./output --prompt_path ./user_requirement.txt
@@ -239,14 +229,14 @@ python -m src.mcp.fastmcp_server --transport http --host 0.0.0.0 --port 7860
 - The conda environment `FoamAgent` is activated, or
 - The Python interpreter used has all required dependencies installed
 - `OPENAI_API_KEY` is set in the environment or in the MCP configuration
-- The database has been initialized (run `init_database.py`)
+- Database files are present in the repository (they are included by default)
 
 Once configured, you can use Foam-Agent tools directly in Claude Code or Cursor to create, run, and manage OpenFOAM simulations through natural language prompts.
 
 ### 7. Troubleshooting
 
 - **OpenFOAM environment not found**: Ensure you have sourced the OpenFOAM bashrc and restarted your terminal.
-- **Database not initialized**: Run `python init_database.py --openfoam_path $WM_PROJECT_DIR` to initialize the database.
+- **Database files missing**: Database files are included in the repository. If they are missing, ensure you have cloned the complete repository including the `database/` directory.
 - **Missing dependencies**: Recreate the environment: `conda env update -n FoamAgent -f environment.yml --prune` or `conda env remove -n FoamAgent && conda env create -n FoamAgent -f environment.yml`.
 - **API key errors**: Ensure `OPENAI_API_KEY` is set in your environment.
 - **MCP connection errors**: Verify the Python path in MCP configuration matches your installation, ensure the conda environment is accessible, and check that all dependencies are installed.

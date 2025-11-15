@@ -43,15 +43,6 @@ RUN conda config --add channels conda-forge && \
 RUN conda init bash && \
     echo "conda activate FoamAgent" >> ~/.bashrc
 
-# Source OpenFOAM and initialize database
-RUN source /opt/openfoam10/etc/bashrc && \
-    echo "WM_PROJECT_DIR: $WM_PROJECT_DIR" && \
-    source "$CONDA_DIR/etc/profile.d/conda.sh" && \
-    conda activate FoamAgent && \
-    cd "$FoamAgent_PATH" && \
-    python init_database.py --openfoam_path "$WM_PROJECT_DIR" && \
-    echo "Database initialization completed during build."
-
 RUN conda clean --all --yes && \
     rm -rf "$CONDA_DIR/pkgs" && \
     apt-get clean && \
