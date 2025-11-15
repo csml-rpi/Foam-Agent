@@ -67,16 +67,30 @@ git checkout v1.1.0
 Otherwise, FoamAgent will be at the latest version.
 
 #### Foam-Agent Docker
-You can skip manual installation steps [1](#1-clone-the-repository-and-install-dependencies) and [2](#2-install-and-configure-openfoam-v10) by using Docker, which provides a complete Foam-Agent environment with OpenFOAM-v10, the FoamAgent conda environment, and database files (included in the repository). **You must build the image from the Dockerfile** - no pre-built images are provided.
+You can skip manual installation steps [1](#1-clone-the-repository-and-install-dependencies) and [2](#2-install-and-configure-openfoam-v10) by using Docker, which provides a complete Foam-Agent environment with OpenFOAM-v10, the FoamAgent conda environment, and database files.
 
 **Features:**
 - **Fully automated setup**: Conda environment initialized and activated automatically
-- **Pre-initialized database**: Database files are included in the repository (no initialization needed)
-- **Local code copy**: Foam-Agent code copied from your local directory (no GitHub access needed)
+- **Pre-initialized database**: Database files are included (no initialization needed)
 - **Auto-configured**: OpenFOAM and conda environments automatically sourced
-- **Optimized build**: Large files (like `runs/` directory) excluded via `.dockerignore`
+- **Ready to use**: Pre-built image available for immediate use
 
-**Building the Docker image:**
+**Quick Start (Recommended):**
+
+Pull the pre-built Docker image:
+```bash
+docker pull leoyue123/foamagent
+```
+
+**Running the Container:**
+
+```bash
+docker run -it -e OPENAI_API_KEY=your-key-here -p 7860:7860 --name foamagent leoyue123/foamagent
+```
+
+**Building from Source (Alternative):**
+
+If you prefer to build the image yourself from the Dockerfile:
 
 From the repository root directory:
 ```bash
@@ -90,8 +104,7 @@ docker build -f docker/Dockerfile -t foamagent:latest .
 
 The Dockerfile automatically installs Miniconda, creates the conda environment, and configures all necessary environment variables. Database files are already included in the repository, so no initialization is needed.
 
-**Running the Container:**
-
+If building from source, run the container with:
 ```bash
 docker run -it -e OPENAI_API_KEY=your-key-here -p 7860:7860 --name foamagent foamagent:latest
 ```
@@ -113,11 +126,15 @@ python foambench_main.py --output ./output --prompt_path ./user_requirement.txt
 ```
 
 **Updating Your Code:**
-Since code is copied during build, update by rebuilding the image:
+You can update your code directly inside the running container using git pull:
 ```bash
-docker build -f docker/Dockerfile -t foamagent:latest .
-docker rm foamagent  # if container exists
-docker run -it -e OPENAI_API_KEY=your-key-here -p 7860:7860 --name foamagent foamagent:latest
+docker exec -it foamagent bash
+cd /home/openfoam/Foam-Agent
+git pull
+```
+If the container is not running, start it first:
+```bash
+docker start -i foamagent
 ```
 
 **Restarting the Container:**

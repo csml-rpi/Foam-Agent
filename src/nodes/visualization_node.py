@@ -100,6 +100,8 @@ def visualization_node(state):
         # Create visualization script
         viz_script = generate_pyvista_script(case_dir, foam_file, state['user_requirement'], error_logs)
         success, output_image, errs = run_pyvista_script(case_dir, viz_script)
+        print(f"Error: {errs}")
+        
         if success and output_image:
             error_logs = []
             print(f"PyVista visualization created successfully: {output_image}")
@@ -149,6 +151,9 @@ def visualization_node(state):
         if error_logs and current_loop < max_loop:
             fixed_script = fix_pyvista_script(foam_file, viz_script, error_logs)
             success, output_image, errs = run_pyvista_script(case_dir, fixed_script, filename="visualization.py")
+
+            print(f"Error: {errs}")
+
             if success and output_image:
                 print(f"Finished command: Return Code 0")
                 error_logs = []
