@@ -98,8 +98,10 @@ docker build --tag foamagent:latest .
 **Running the Container:**
 
 ```bash
-docker run -it -e OPENAI_API_KEY=your-key-here --name foamagent foamagent:latest
+docker run -it -e OPENAI_API_KEY=your-key-here -p 7860:7860 --name foamagent foamagent:latest
 ```
+
+**Note:** If the container already exists (from a previous run), restart it using `docker start -i foamagent` instead of running this command again. To remove the existing container first, use `docker rm foamagent`.
 
 When the container starts, you'll automatically get:
 - ✅ OpenFOAM environment sourced
