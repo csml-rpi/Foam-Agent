@@ -1,0 +1,32 @@
+# Exclude runs directory (can be very large)
+runs/
+
+# Exclude Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Exclude git files
+.git/
+.gitignore
+.gitattributes
+
+# Exclude IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Exclude test outputs and temporary files
+*.log
+*.tmp
+*.bak
+
+# Exclude database files (will be generated in container)
+# Uncomment if you want to exclude pre-built database files
+# database/faiss/
+# database/raw/
+
