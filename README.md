@@ -45,7 +45,7 @@ Our framework introduces three key innovations:
 
 **Example Usage:**
 ```bash
-python foambench_main.py --openfoam_path $WM_PROJECT_DIR --output ./output --prompt_path ./user_requirement.txt --custom_mesh_path ./tandem_wing.msh
+python foambench_main.py --output ./output --prompt_path ./user_requirement.txt --custom_mesh_path ./tandem_wing.msh
 ```
 
 **Example Mesh File:** The `geometry.msh` file in this repository is taken from the [tandem wing tutorial](https://github.com/openfoamtutorials/tandem_wing) and demonstrates a 3D tandem wing simulation with NACA 0012 airfoils.
@@ -109,7 +109,7 @@ When the container starts, you'll automatically get:
 **Run Foam-Agent:**
 Once inside the container (everything is pre-configured):
 ```bash
-python foambench_main.py --openfoam_path $WM_PROJECT_DIR --output ./output --prompt_path ./user_requirement.txt
+python foambench_main.py --output ./output --prompt_path ./user_requirement.txt
 ```
 
 **Updating Your Code:**
@@ -155,13 +155,13 @@ or something similar.
 ### 3. Run a demo workflow
 
 ```bash
-python foambench_main.py --openfoam_path $WM_PROJECT_DIR --output ./output --prompt_path ./user_requirement.txt
+python foambench_main.py --output ./output --prompt_path ./user_requirement.txt
 ```
 
 You can also specify a custom mesh:
 
 ```bash
-python foambench_main.py --openfoam_path $WM_PROJECT_DIR --output ./output --prompt_path ./user_requirement.txt --custom_mesh_path ./my_mesh.msh
+python foambench_main.py --output ./output --prompt_path ./user_requirement.txt --custom_mesh_path ./my_mesh.msh
 ```
 
 #### Example user_requirement.txt

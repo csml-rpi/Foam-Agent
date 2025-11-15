@@ -35,9 +35,16 @@ echo "To update to latest Foam-Agent:"
 echo "  cd $FoamAgent_PATH && git pull"
 echo ""
 echo "To run Foam-Agent:"
-echo "  python foambench_main.py --openfoam_path \$WM_PROJECT_DIR --output ./output --prompt_path ./user_requirement.txt"
+echo "  python foambench_main.py --output ./output --prompt_path ./user_requirement.txt"
+echo ""
+if [ -n "$OPENAI_API_KEY" ]; then
+    echo "OPENAI_API_KEY: ${OPENAI_API_KEY:0:20}... (set)"
+else
+    echo "OPENAI_API_KEY: (not set)"
+fi
 echo ""
 echo "Note: Make sure OPENAI_API_KEY is set before running!"
+echo "      To change the model provider, edit src/config.py"
 echo "=========================================="
 
 # Execute the command passed to the container
