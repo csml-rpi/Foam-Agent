@@ -54,103 +54,229 @@ python foambench_main.py --output ./output --prompt_path ./user_requirement.txt 
 
 ## Getting Started
 
-### 1. Clone the repository and install dependencies
+### 1. Quick Start with Docker (Recommended)
 
-```bash
-git clone https://github.com/csml-rpi/Foam-Agent.git
-cd Foam-Agent
-```
-If you prefer a stable version, please check the tags, and do
-```bash
-git checkout v1.1.0
-```
-Otherwise, FoamAgent will be at the latest version.
+Foam-Agent is fully pre-installed in the Docker image `leoyue123/foamagent`. This is the easiest way to get an end-to-end OpenFOAM + Foam-Agent environment.
 
-#### Foam-Agent Docker
-You can skip manual installation steps [1](#1-clone-the-repository-and-install-dependencies) and [2](#2-install-and-configure-openfoam-v10) by using Docker, which provides a complete Foam-Agent environment with OpenFOAM-v10, the FoamAgent conda environment, and database files.
+#### 1.1 Pull the image
 
-**Features:**
-- **Fully automated setup**: Conda environment initialized and activated automatically
-- **Pre-initialized database**: Database files are included (no initialization needed)
-- **Auto-configured**: OpenFOAM and conda environments automatically sourced
-- **Ready to use**: Pre-built image available for immediate use
-
-**Quick Start (Recommended):**
-
-Pull the pre-built Docker image:
 ```bash
 docker pull leoyue123/foamagent
 ```
 
-**Running the Container:**
+#### 1.2 Start a container
 
 ```bash
-docker run -it -e OPENAI_API_KEY=your-key-here -p 7860:7860 --name foamagent leoyue123/foamagent
+docker run -it \
+  -e OPENAI_API_KEY=your-key-here \
+  -p 7860:7860 \
+  --name foamagent \
+  leoyue123/foamagent
 ```
 
-**Building from Source (Alternative):**
+Inside the container you automatically get:
+- **OpenFOAM v10** installed and sourced
+- **Conda** initialized and the `FoamAgent` environment activated
+- **Working directory** set to `/home/openfoam/Foam-Agent`
+- **Database files** pre-initialized and ready to use
 
-If you prefer to build the image yourself from the Dockerfile:
+#### 1.3 Prepare your `user_requirement.txt`
 
-From the repository root directory:
+- **Default location inside Docker**: `/home/openfoam/Foam-Agent/user_requirement.txt`
+- **Edit directly in the container** (example):
+  ```bash
+  nano user_requirement.txt
+  ```
+- **Or mount a prompt file from the host**:
+  ```bash
+  docker run -it \
+    -e OPENAI_API_KEY=your-key-here \
+    -p 7860:7860 \
+    -v /absolute/path/to/my_requirement.txt:/home/openfoam/Foam-Agent/user_requirement.txt \
+    --name foamagent \
+    leoyue123/foamagent
+  ```
+
+**Example content of `user_requirement.txt`:**
+
+```text
+do a Reynolds-Averaged Simulation (RAS) pitzdaily simulation. Use PIMPLE algorithm. The domain is a 2D millimeter-scale channel geometry. Boundary conditions specify a fixed velocity of 10m/s at the inlet (left), zero gradient pressure at the outlet (right), and no-slip conditions for walls. Use timestep of 0.0001 and output every 0.01. Finaltime is 0.3. use nu value of 1e-5.
+```
+
+#### 1.4 (Optional) Provide a custom mesh
+
+If you have a Gmsh `.msh` file on the host, mount it into the container and point Foam-Agent to it:
+
 ```bash
+docker run -it \
+  -e OPENAI_API_KEY=your-key-here \
+  -p 7860:7860 \
+  -v /absolute/path/to/my_mesh.msh:/home/openfoam/Foam-Agent/my_mesh.msh \
+  --name foamagent \
+  leoyue123/foamagent
+```
+
+Then, inside the container, call:
+
+```bash
+python foambench_main.py \
+  --output ./output \
+  --prompt_path ./user_requirement.txt \
+  --custom_mesh_path ./my_mesh.msh
+```
+
+#### 1.5 Run a simulation inside Docker
+
+From `/home/openfoam/Foam-Agent` in the container:
+
+```bash
+# Basic run
+python foambench_main.py \
+  --output ./output \
+  --prompt_path ./user_requirement.txt
+
+# With a custom mesh (if provided)
+python foambench_main.py \
+  --output ./output \
+  --prompt_path ./user_requirement.txt \
+  --custom_mesh_path ./my_mesh.msh
+```
+
+To restart and reuse the same container later:
+
+```bash
+docker start -i foamagent
+```
+
+#### 1.6 (Optional) Build the image from source
+
+If you prefer to build the Docker image yourself from this repository:
+
+```bash
+git clone https://github.com/csml-rpi/Foam-Agent.git
+cd Foam-Agent
 docker build -f docker/Dockerfile -t foamagent:latest .
 ```
 
-**Build Notes:**
-- Build time: ~10-15 minutes
-- Image size: ~7-8 GB
-- Your local code is copied (excluding `runs/`, `__pycache__/`, `.git/` per `.dockerignore`)
+Run the locally built image:
 
-The Dockerfile automatically installs Miniconda, creates the conda environment, and configures all necessary environment variables. Database files are already included in the repository, so no initialization is needed.
-
-If building from source, run the container with:
 ```bash
-docker run -it -e OPENAI_API_KEY=your-key-here -p 7860:7860 --name foamagent foamagent:latest
+docker run -it \
+  -e OPENAI_API_KEY=your-key-here \
+  -p 7860:7860 \
+  --name foamagent \
+  foamagent:latest
 ```
 
-**Note:** If the container already exists (from a previous run), restart it using `docker start -i foamagent` instead of running this command again. To remove the existing container first, use `docker rm foamagent`.
+### 2. Configuring LLM provider and model
 
-When the container starts, you'll automatically get:
-- ✅ OpenFOAM environment sourced
-- ✅ Conda initialized
-- ✅ FoamAgent conda environment activated
-- ✅ Working directory set to `/home/openfoam/Foam-Agent`
-- ✅ Database files ready (included in repository)
-- ✅ Welcome message with usage instructions
+Foam-Agent selects the LLM backend and model from `src/config.py`. Inside the container, this file is at `/home/openfoam/Foam-Agent/src/config.py`.
 
-**Run Foam-Agent:**
-Once inside the container (everything is pre-configured):
-```bash
-python foambench_main.py --output ./output --prompt_path ./user_requirement.txt
+```python
+from dataclasses import dataclass
+from pathlib import Path
+
+@dataclass
+class Config:
+    ...
+    model_provider: str = "openai"  # ["openai", "ollama", "bedrock"]
+    # model_version can be e.g. "gpt-5-mini", "deepseek-r1:32b-qwen-distill-fp16", "qwen2.5:32b-instruct"
+    model_version: str = "gpt-5-mini"
+    temperature: float = 1.0
 ```
 
-**Updating Your Code:**
-You can update your code directly inside the running container using git pull:
+To change the LLM configuration inside Docker:
+
 ```bash
 docker exec -it foamagent bash
 cd /home/openfoam/Foam-Agent
-git pull
+nano src/config.py
 ```
-If the container is not running, start it first:
+
+- **OpenAI (via `OPENAI_API_KEY`)**:
+  - **model_provider**: `"openai"`
+  - **model_version**: e.g. `"gpt-5-mini"` or another supported OpenAI-compatible model name
+- **AWS Bedrock**:
+  - **model_provider**: `"bedrock"`
+  - **model_version**: your Bedrock application ARN
+- **Ollama (local models)**:
+  - **model_provider**: `"ollama"`
+  - **model_version**: the local model name, e.g. `"qwen2.5:32b-instruct"`
+
+
+### 3. Using Foam-Agent via MCP (with Docker)
+
+Foam-Agent exposes its capabilities as an MCP server. The recommended workflow is:
+1. Run Foam-Agent in Docker  
+2. Start the MCP server inside the container  
+3. Point Claude Code or Cursor to that server
+
+#### 3.1 Start the MCP server inside the container
+
+Make sure the container is running:
+
 ```bash
 docker start -i foamagent
 ```
 
-**Restarting the Container:**
+In a separate terminal, attach and start the MCP server:
+
 ```bash
-docker start -i foamagent
+docker exec -it foamagent bash
+cd /home/openfoam/Foam-Agent
+
+# HTTP mode (if your MCP client supports HTTP transport)
+python -m src.mcp.fastmcp_server --transport http --host 0.0.0.0 --port 7860
 ```
 
-**Note:** In the Dockerfile (around lines 99-107), there is an option to exclude root access. However, the image size will increase to around 10-15 GB.
+If you are running Docker on a remote server, make sure port `7860` is reachable from your local machine
+(for example, by using SSH port forwarding or a proper port mapping such as `-p 7860:7860` when starting the container).
 
-**Manual Installation (if not using Docker):**
+#### 3.2 Configure Claude Code / Cursor (HTTP mode)
+
+In your MCP configuration file, use a simple HTTP-based entry like:
+
+```json
+{
+  "mcpServers": {
+    "foam-agent": {
+      "url": "http://localhost:7860"
+    }
+  }
+}
+```
+
+Adjust `localhost` and the port if your server is running on a different host or port.
+
+#### 3.3 (Optional) stdio mode via Docker
+
+If your MCP client prefers stdio instead of HTTP, you can still use the original `docker exec` style configuration.
+Refer to the Foam-Agent repository documentation for the stdio example.
+
+#### 3.4 Configure Cursor (same MCP config)
+
+1. Open Cursor settings (Cmd/Ctrl + ,)
+2. Search for **"MCP"** or navigate to **Settings → Features → MCP**
+3. Click **"Edit MCP Settings"** or open the MCP configuration file
+4. Paste the JSON configuration from section **3.2**
+5. Save and restart Cursor
+
+Once configured, you can call Foam-Agent tools directly from Claude Code or Cursor to plan cases, write input files, run simulations, and visualize results through natural-language commands.
+
+### 4. Manual Installation (without Docker, optional)
+
+If you prefer not to use Docker, you can install Foam-Agent and its dependencies manually.
+
+#### 4.1 Clone the repository and create the environment
+
 ```bash
+git clone https://github.com/csml-rpi/Foam-Agent.git
+cd Foam-Agent
 conda env create -n FoamAgent -f environment.yml
 conda activate FoamAgent
 ```
 
-### 2. Install and configure OpenFOAM v10
+#### 4.2 Install and configure OpenFOAM v10
 
 Foam-Agent requires OpenFOAM v10. Please follow the official installation guide for your operating system:
 
@@ -161,15 +287,18 @@ Verify your installation with:
 ```bash
 echo $WM_PROJECT_DIR
 ```
-and the result should be
-```
+
+The result should be something like:
+
+```text
 /opt/openfoam10
 ```
-or something similar.
 
 `WM_PROJECT_DIR` is an environment variable that comes with your OpenFOAM installation, indicating the location of OpenFOAM on your computer.
 
-### 3. Run a demo workflow
+#### 4.3 Run a demo workflow (manual setup)
+
+From the repository root:
 
 ```bash
 python foambench_main.py --output ./output --prompt_path ./user_requirement.txt
@@ -178,85 +307,25 @@ python foambench_main.py --output ./output --prompt_path ./user_requirement.txt
 You can also specify a custom mesh:
 
 ```bash
-python foambench_main.py --output ./output --prompt_path ./user_requirement.txt --custom_mesh_path ./my_mesh.msh
+python foambench_main.py \
+  --output ./output \
+  --prompt_path ./user_requirement.txt \
+  --custom_mesh_path ./my_mesh.msh
 ```
 
-#### Example user_requirement.txt
+### 5. Configuration and environment variables (summary)
 
-```
-do a Reynolds-Averaged Simulation (RAS) pitzdaily simulation. Use PIMPLE algorithm. The domain is a 2D millimeter-scale channel geometry. Boundary conditions specify a fixed velocity of 10m/s at the inlet (left), zero gradient pressure at the outlet (right), and no-slip conditions for walls. Use timestep of 0.0001 and output every 0.01. Finaltime is 0.3. use nu value of 1e-5.
-```
+- Default configuration (including LLM provider and model) is in `src/config.py`.
+- You must set the `OPENAI_API_KEY` environment variable if using OpenAI/Bedrock-style models.
+- For AWS Bedrock or other cloud providers, ensure their credentials are configured in your environment.
 
-### 5. Configuration and environment variables
+### 6. Troubleshooting
 
-- Default configuration is in `src/config.py`. You can modify model provider, database path, and other parameters there.
-- You must set the `OPENAI_API_KEY` environment variable if using OpenAI/Bedrock models.
-
-### 6. Using Foam-Agent via MCP (Model Context Protocol)
-
-Foam-Agent exposes its capabilities as an MCP server, allowing integration with AI coding assistants like Claude Code and Cursor.
-
-#### Starting the MCP Server
-
-**Option 1: Standard I/O Mode (for MCP clients)**
-```bash
-python -m src.mcp.fastmcp_server
-```
-
-**Option 2: HTTP Mode (for web clients)**
-```bash
-python -m src.mcp.fastmcp_server --transport http --host 0.0.0.0 --port 7860
-```
-
-#### Configuring Claude Code
-
-1. Open Claude Code settings and navigate to MCP configuration
-2. Copy the following configuration and paste it into your MCP settings file:
-
-```json
-{
-  "mcpServers": {
-    "openfoam-agent": {
-      "command": "python",
-      "args": ["-m", "src.mcp.fastmcp_server"],
-      "cwd": "/path/to/Foam-Agent",
-      "env": {
-        "PYTHONPATH": "/path/to/Foam-Agent/src",
-        "OPENAI_API_KEY": "your-api-key-here"
-      }
-    }
-  }
-}
-```
-
-**Important:** Replace `/path/to/Foam-Agent` with your actual Foam-Agent installation path. If using conda, you may need to use the full path to the conda Python interpreter, e.g., `"/opt/conda/envs/FoamAgent/bin/python"` or `"$CONDA_PREFIX/bin/python"`.
-
-#### Configuring Cursor
-
-1. Open Cursor settings (Cmd/Ctrl + ,)
-2. Search for "MCP" or navigate to **Settings → Features → MCP**
-3. Click "Edit MCP Settings" or open the MCP configuration file
-4. Copy and paste the same JSON configuration as shown above
-5. Replace `/path/to/Foam-Agent` with your actual installation path
-6. Save the configuration and restart Cursor to apply the changes
-
-**Tip:** You can also use the example configuration file `mcp_config.json` in the repository root as a reference. Just update the paths to match your installation.
-
-**Note:** Ensure that:
-- The conda environment `FoamAgent` is activated, or
-- The Python interpreter used has all required dependencies installed
-- `OPENAI_API_KEY` is set in the environment or in the MCP configuration
-- Database files are present in the repository (they are included by default)
-
-Once configured, you can use Foam-Agent tools directly in Claude Code or Cursor to create, run, and manage OpenFOAM simulations through natural language prompts.
-
-### 7. Troubleshooting
-
-- **OpenFOAM environment not found**: Ensure you have sourced the OpenFOAM bashrc and restarted your terminal.
-- **Database files missing**: Database files are included in the repository. If they are missing, ensure you have cloned the complete repository including the `database/` directory.
+- **OpenFOAM environment not found**: Ensure you have sourced the OpenFOAM bashrc and restarted your terminal (for manual installations), or use the provided Docker image where this is pre-configured.
+- **Database files missing**: Database files are included in the repository (and in the Docker image). If they are missing, ensure you have cloned the complete repository including the `database/` directory.
 - **Missing dependencies**: Recreate the environment: `conda env update -n FoamAgent -f environment.yml --prune` or `conda env remove -n FoamAgent && conda env create -n FoamAgent -f environment.yml`.
-- **API key errors**: Ensure `OPENAI_API_KEY` is set in your environment.
-- **MCP connection errors**: Verify the Python path in MCP configuration matches your installation, ensure the conda environment is accessible, and check that all dependencies are installed.
+- **API key errors**: Ensure `OPENAI_API_KEY` is set in your environment or in the MCP configuration.
+- **MCP connection errors**: Verify that the Docker container is running, the MCP command in your configuration matches your setup, and that all dependencies are installed.
 
 ## Citation
 If you use Foam-Agent in your research, please cite our paper:
