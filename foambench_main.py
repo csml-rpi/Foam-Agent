@@ -7,6 +7,12 @@ import shlex
 def parse_args():
     parser = argparse.ArgumentParser(description="Benchmark Workflow Interface")
     parser.add_argument(
+        '--openfoam_path',
+        type=str,
+        required=False,
+        help="Path to OpenFOAM installation (WM_PROJECT_DIR)"
+    )
+    parser.add_argument(
         '--output',
         type=str,
         required=True,
