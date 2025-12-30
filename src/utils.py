@@ -111,7 +111,7 @@ class LLMService:
         # Check ClientError with specific error codes
         if isinstance(error, ClientError):
             error_code = error.response.get('Error', {}).get('Code', '')
-            return error_code in ('Throttling', 'TooManyRequestsException')
+            return error_code in ('Throttling', 'TooManyRequestsException', 'ThrottlingException')
         
         # Check for ThrottlingException and throttling-related error messages
         error_type = type(error).__name__
@@ -126,7 +126,7 @@ class LLMService:
         
         return any(throttling_indicators)
     
-    def _handle_throttling_retry(self, error: Exception, retry_count: int, max_retries: int) -> int:
+    def _handle_throttling_retry(self, error: Exception, retry_count: int, max_retries: int) -> Optional[int]:
         """
         Handle throttling error by implementing exponential backoff retry logic.
         
@@ -135,15 +135,16 @@ class LLMService:
             retry_count: Current retry attempt number
             max_retries: Maximum number of retries allowed
             
-        Raises:
-            Exception: If max retries exceeded
+        Returns:
+            The updated retry count if retry should continue, None if max retries exceeded
         """
         retry_count += 1
         self.retry_count += 1
         
         if retry_count > max_retries:
-            self.failed_calls += 1
-            raise Exception(f"Maximum retries ({max_retries}) exceeded: {str(error)}")
+
+            print(f"Maximum retries ({max_retries}) exceeded: {str(error)}")
+            return None
         
         # Exponential backoff with jitter
         base_delay = 1.0
@@ -217,9 +218,17 @@ class LLMService:
                 
             except Exception as e:
                 if self._is_throttling_error(e):
+                    print(f"ThrottlingException occurred: {str(e)}.")
+                    print(f"Retrying: {retry_count + 1}/{max_retries}")
                     retry_count = self._handle_throttling_retry(e, retry_count, max_retries)
+                    if retry_count is None:
+                        # Max retries exceeded
+                        self.failed_calls += 1
+                        raise Exception(f"Maximum retries ({max_retries}) exceeded for throttling error: {str(e)}")
                     continue  # Retry the request
                 else:
+                    print(f"Non-throttling error occurred: {str(e)}.")
+
                     # Non-throttling error: log and raise
                     print(f"Error occurred in LLM service: {str(e)}")
                     if isinstance(e, ClientError):
