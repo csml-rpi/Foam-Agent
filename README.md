@@ -63,15 +63,9 @@ Foam-Agent is fully pre-installed in the Docker image `leoyue123/foamagent`. Thi
 ```bash
 docker pull leoyue123/foamagent
 ```
-
-#### 1.2 Start a container
-
+If you prefer a stable version, please check the tags, and do
 ```bash
-docker run -it \
-  -e OPENAI_API_KEY=your-key-here \
-  -p 7860:7860 \
-  --name foamagent \
-  leoyue123/foamagent
+git checkout v1.1.0
 ```
 
 Inside the container you automatically get:
