@@ -54,6 +54,18 @@ python foambench_main.py --output ./output --prompt_path ./user_req_tandem_wing.
 
 ## Getting Started
 
+**Recommended model for best results:** 
+We currently recommend **Anthropic Claude Opus 4.6** for the best performances.
+
+| Framework | Model | Basic | Advanced |
+|---|---|---:|---:|
+| FoamAgent 2.0.0 (10 loops) | Opus 4.6 | 85.45% | 100% |
+| FoamAgent 2.0.0 (25 loops) | Opus 4.6 | 99.09% | 100% |
+| FoamAgent 2.0.0 (25 loops) | Sonnet 4.6 | 87.88% | 75.00% |
+| FoamAgent 2.0.0 (25 loops) | Haiku 4.6 | 54.55% | 37.50% |
+| FoamAgent 2.0.0 (25 loops) | gpt-5.4 | 45.45% | 75.00% |
+| FoamAgent 2.0.0 (25 loops) | gpt-5.3-codex | 54.55% | 62.50% |
+
 ### Choosing Input Writer generation mode (speed vs. first-pass success)
 
 Foam-Agent supports two generation modes for the **Input Writer Agent** (case file creation). You can set it in `src/config.py`:
@@ -459,6 +471,19 @@ python foambench_main.py \
 - **Missing dependencies**: Recreate the environment: `conda env update -n FoamAgent -f environment.yml --prune` or `conda env remove -n FoamAgent && conda env create -n FoamAgent -f environment.yml`.
 - **API key errors**: Ensure `OPENAI_API_KEY` is set in your environment or in the MCP configuration.
 - **MCP connection errors**: Verify that the Docker container is running, the MCP command in your configuration matches your setup, and that all dependencies are installed.
+
+
+## Community
+
+### Join the WeChat community
+
+Chinese-speaking users can join the Foam-Agent WeChat community by scanning the QR code below.
+
+微信群社区可以扫码进群：
+
+<p align="center">
+  <img src="wechat_foamagent.JPG" alt="Foam-Agent WeChat Community QR Code" width="280">
+</p>
 
 ## Citation
 If you use Foam-Agent in your research, please cite our paper:
