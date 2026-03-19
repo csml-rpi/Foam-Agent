@@ -60,7 +60,7 @@ We currently recommend **Anthropic Claude Opus 4.6** for the best performances.
 | Framework | Model | Basic | Advanced |
 |---|---|---:|---:|
 | FoamAgent 2.0.0 (10 loops) | Opus 4.6 | 85.45% | 100% |
-| FoamAgent 2.0.0 (25 loops) | Opus 4.6 | 99.09% | 100% |
+| FoamAgent 2.0.0 (25 loops) | Opus 4.6 | 100% | 100% |
 | FoamAgent 2.0.0 (25 loops) | Sonnet 4.6 | 87.88% | 75.00% |
 | FoamAgent 2.0.0 (25 loops) | Haiku 4.6 | 54.55% | 37.50% |
 | FoamAgent 2.0.0 (25 loops) | gpt-5.4 | 45.45% | 75.00% |
