@@ -756,6 +756,12 @@ class GraphState(TypedDict):
     cluster_info: Optional[dict]
     slurm_script_path: Optional[str]
     termination_reason: Optional[str]
+    interpreter_report: Optional[dict]
+    interpreter_rerun_count: Optional[int]
+    interpreter_requirement_updates: Optional[List[dict]]
+    interpreter_revise_applied: Optional[bool]
+    flow_analysis_text: Optional[str]
+    flow_analysis_bundle: Optional[dict]
 
 def tokenize(text: str) -> str:
     # Replace underscores with spaces

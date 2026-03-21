@@ -43,6 +43,14 @@ class Config:
     embedding_provider: str = "huggingface"  # [openai, huggingface, ollama]
     embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"  # e.g. "text-embedding-3-small", "text-embedding-3-large", "Qwen/Qwen3-Embedding-0.6B", "Qwen/Qwen3-Embedding-8B"
 
+    # Post-run interpreter (viz + VLM); optional requirement revision loop back through planner
+    enable_post_run_interpreter: bool = True
+    interpreter_max_reruns: int = 10
+    # If set, overrides model_version for interpreter/viz LLM only (vision-capable model recommended)
+    interpreter_model_version: str = ""
+    # After interpreter marks case OK: extra viz + narrative (cfd-scientist-style analysis)
+    enable_flow_field_analysis: bool = True
+
     def __post_init__(self) -> None:
         """Load config overrides from environment variables.
 
@@ -80,3 +88,26 @@ class Config:
             print(f"[Config] model_version={self.model_version} (env:{version_key})")
         else:
             print(f"[Config] model_version={self.model_version} (default)")
+
+        interp_en = _env_nonempty("FOAMAGENT_ENABLE_INTERPRETER")
+        if interp_en is not None:
+            self.enable_post_run_interpreter = interp_en.lower() in ("1", "true", "yes", "on")
+            print(f"[Config] enable_post_run_interpreter={self.enable_post_run_interpreter} (env:FOAMAGENT_ENABLE_INTERPRETER)")
+
+        interp_max = _env_nonempty("FOAMAGENT_INTERPRETER_MAX_RERUNS")
+        if interp_max is not None:
+            try:
+                self.interpreter_max_reruns = max(0, int(interp_max))
+                print(f"[Config] interpreter_max_reruns={self.interpreter_max_reruns} (env:FOAMAGENT_INTERPRETER_MAX_RERUNS)")
+            except ValueError:
+                print(f"[Config] interpreter_max_reruns={self.interpreter_max_reruns} (default; invalid env)")
+
+        interp_mv = _env_nonempty("FOAMAGENT_INTERPRETER_MODEL_VERSION")
+        if interp_mv is not None:
+            self.interpreter_model_version = interp_mv
+            print(f"[Config] interpreter_model_version={self.interpreter_model_version!r} (env:FOAMAGENT_INTERPRETER_MODEL_VERSION)")
+
+        fa = _env_nonempty("FOAMAGENT_ENABLE_FLOW_ANALYSIS")
+        if fa is not None:
+            self.enable_flow_field_analysis = fa.lower() in ("1", "true", "yes", "on")
+            print(f"[Config] enable_flow_field_analysis={self.enable_flow_field_analysis} (env:FOAMAGENT_ENABLE_FLOW_ANALYSIS)")

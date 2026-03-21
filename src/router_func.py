@@ -142,6 +142,10 @@ def route_after_runner(state: GraphState):
     if state.get("error_logs") and len(state["error_logs"]) > 0:
         return "reviewer"
 
+    cfg = state["config"]
+    if getattr(cfg, "enable_post_run_interpreter", True):
+        return "interpreter"
+
     requires_visualization = state.get("requires_visualization")
     if requires_visualization is None:
         requires_visualization = llm_requires_visualization(state)
@@ -150,6 +154,66 @@ def route_after_runner(state: GraphState):
     if requires_visualization:
         return "visualization"
     return END
+
+
+def _interpreter_approved_for_analysis(interp: dict) -> bool:
+    if not isinstance(interp, dict):
+        return False
+    if interp.get("rerun_required"):
+        return False
+    if interp.get("interpreter_error"):
+        return False
+    if interp.get("requirement_met") is True:
+        return True
+    if interp.get("requirement_met") is False:
+        return False
+    return bool(interp.get("simulation_success", False))
+
+
+def route_after_interpreter(state: GraphState):
+    cfg = state["config"]
+    interp = state.get("interpreter_report") or {}
+    rerun = bool(interp.get("rerun_required", False))
+    n = int(state.get("interpreter_rerun_count") or 0)
+    mx = int(getattr(cfg, "interpreter_max_reruns", 10) or 10)
+    if rerun and n < mx:
+        print(f"Router: Interpreter requests rerun (attempt {n + 1}/{mx}). Routing to interpreter_revise.")
+        return "interpreter_revise"
+
+    if getattr(cfg, "enable_flow_field_analysis", True) and _interpreter_approved_for_analysis(interp):
+        print("Router: Interpreter approved; routing to flow field analysis.")
+        return "flow_analysis"
+
+    requires_visualization = state.get("requires_visualization")
+    if requires_visualization is None:
+        requires_visualization = llm_requires_visualization(state)
+        state["requires_visualization"] = requires_visualization
+
+    if requires_visualization:
+        print("Router: Routing to visualization after interpreter.")
+        return "visualization"
+    return END
+
+
+def route_after_flow_analysis(state: GraphState):
+    requires_visualization = state.get("requires_visualization")
+    if requires_visualization is None:
+        requires_visualization = llm_requires_visualization(state)
+        state["requires_visualization"] = requires_visualization
+
+    if requires_visualization:
+        print("Router: Routing to visualization after flow analysis.")
+        return "visualization"
+    return END
+
+
+def route_after_interpreter_revise(state: GraphState):
+    if state.get("interpreter_revise_applied"):
+        print("Router: Revised requirement from interpreter; restarting from planner.")
+        return "planner"
+    print("Router: Interpreter revision skipped or failed; ending workflow.")
+    return END
+
 
 def route_after_reviewer(state: GraphState):
     loop_count = state.get("loop_count", 0)

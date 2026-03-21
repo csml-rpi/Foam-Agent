@@ -14,11 +14,17 @@ from nodes.local_runner_node import local_runner_node
 from nodes.reviewer_node import reviewer_node
 from nodes.visualization_node import visualization_node
 from nodes.hpc_runner_node import hpc_runner_node
+from nodes.interpreter_node import interpreter_node
+from nodes.interpreter_revise_node import interpreter_revise_node
+from nodes.flow_analysis_node import flow_analysis_node
 from router_func import (
-    route_after_planner, 
-    route_after_input_writer, 
-    route_after_runner, 
-    route_after_reviewer
+    route_after_planner,
+    route_after_input_writer,
+    route_after_runner,
+    route_after_reviewer,
+    route_after_interpreter,
+    route_after_interpreter_revise,
+    route_after_flow_analysis,
 )
 import json
 
@@ -36,7 +42,10 @@ def create_foam_agent_graph() -> StateGraph:
     workflow.add_node("hpc_runner", hpc_runner_node)
     workflow.add_node("reviewer", reviewer_node)
     workflow.add_node("visualization", visualization_node)
-    
+    workflow.add_node("interpreter", interpreter_node)
+    workflow.add_node("interpreter_revise", interpreter_revise_node)
+    workflow.add_node("flow_analysis", flow_analysis_node)
+
     # Add edges
     workflow.add_edge(START, "planner")
     workflow.add_conditional_edges("planner", route_after_planner)
@@ -45,8 +54,11 @@ def create_foam_agent_graph() -> StateGraph:
     workflow.add_conditional_edges("hpc_runner", route_after_runner)
     workflow.add_conditional_edges("local_runner", route_after_runner)
     workflow.add_conditional_edges("reviewer", route_after_reviewer)
+    workflow.add_conditional_edges("interpreter", route_after_interpreter)
+    workflow.add_conditional_edges("interpreter_revise", route_after_interpreter_revise)
+    workflow.add_conditional_edges("flow_analysis", route_after_flow_analysis)
     workflow.add_edge("visualization", END)
-    
+
     return workflow
 
 def initialize_state(user_requirement: str, config: Config, custom_mesh_path: Optional[str] = None) -> GraphState:
@@ -91,7 +103,13 @@ def initialize_state(user_requirement: str, config: Config, custom_mesh_path: Op
         job_id=None,
         cluster_info=None,
         slurm_script_path=None,
-        termination_reason=None
+        termination_reason=None,
+        interpreter_report=None,
+        interpreter_rerun_count=0,
+        interpreter_requirement_updates=[],
+        interpreter_revise_applied=None,
+        flow_analysis_text=None,
+        flow_analysis_bundle=None,
     )
     if custom_mesh_path:
         print(f"Custom mesh path: {custom_mesh_path}")
