@@ -149,6 +149,8 @@ class ResultsInterpreterAgent:
                     or "too many requests" in err_str
                     or "rate" in err_str
                     or "validation error" in err_str
+                    or "timeout" in err_str
+                    or "timed out" in err_str
                 )
                 if attempt >= max_retries or not is_retryable:
                     raise

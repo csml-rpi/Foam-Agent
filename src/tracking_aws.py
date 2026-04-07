@@ -25,6 +25,7 @@ from typing import Any
 from contextlib import contextmanager
 
 import boto3
+from botocore.config import Config as BotocoreConfig
 
 
 
@@ -136,7 +137,7 @@ def new_default_client(default='boto3') -> boto3.client:
     """Set the `default_client` to a new tracked client, based on the current
     aws credentials. If your credentials change you should call this method again."""
     global default_client
-    default_client = track_usage(boto3.client('bedrock-runtime', region_name='us-west-2'))  # create a client with default args, and modify it 
+    default_client = track_usage(boto3.client('bedrock-runtime', region_name='us-west-2', config=BotocoreConfig(read_timeout=300, connect_timeout=10)))  # create a client with default args, and modify it
                                                    # so that it will store its usage in a local file 
     return default_client
 
