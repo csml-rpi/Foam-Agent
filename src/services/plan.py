@@ -69,7 +69,8 @@ def parse_requirement_to_case_info(user_requirement: str, case_stats: Dict[str, 
         f"Note: case solver must be one of {case_stats.get('case_solver', [])}."
     )
     parse_user_prompt = f"User requirement: {user_requirement}."
-    res = global_llm_service.invoke(parse_user_prompt, parse_system_prompt, pydantic_obj=CaseSummaryModel)
+    res = global_llm_service.invoke(parse_user_prompt, parse_system_prompt, pydantic_obj=CaseSummaryModel,
+                                    log_context={"step": "plan", "substep": "parse_case_info"})
     return {
         "case_name": res.case_name.replace(" ", "_"),
         "case_domain": res.case_domain,
@@ -198,7 +199,8 @@ def _build_advice(
         "per_file (list of {folder_name, file_name, classification, delta})."
     )
 
-    return global_llm_service.invoke(user_prompt, sys_prompt, pydantic_obj=SimilarCaseAdviceModel)
+    return global_llm_service.invoke(user_prompt, sys_prompt, pydantic_obj=SimilarCaseAdviceModel,
+                                     log_context={"step": "plan", "substep": "build_advice"})
 
 
 def retrieve_references(case_name: str,
@@ -271,6 +273,7 @@ def decompose_to_subtasks(user_requirement: str, dir_structure: str, dir_counts_
         "Your final output must strictly follow the JSON schema below and include no additional keys or information:\n\n"
         "```\n{\n  \"subtasks\": [\n    {\n      \"file_name\": \"<string>\",\n      \"folder_name\": \"<string>\"\n    }\n    // ... more subtasks\n  ]\n}\n```\n\n"
         "Make sure that your output is valid JSON and strictly adheres to the provided schema. "
+        "Make sure you generate all the necessary files for the user's requirements."
     )
 
     decompose_user_prompt = (
@@ -282,7 +285,8 @@ def decompose_to_subtasks(user_requirement: str, dir_structure: str, dir_counts_
         "Please generate the output as structured JSON."
     )
 
-    res = global_llm_service.invoke(decompose_user_prompt, decompose_system_prompt, pydantic_obj=OpenFOAMPlanModel)
+    res = global_llm_service.invoke(decompose_user_prompt, decompose_system_prompt, pydantic_obj=OpenFOAMPlanModel,
+                                    log_context={"step": "plan", "substep": "decompose_subtasks"})
     return [{"file_name": s.file_name, "folder_name": s.folder_name} for s in res.subtasks]
 
 

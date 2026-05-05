@@ -799,6 +799,9 @@ class GraphState(TypedDict):
     cluster_info: Optional[dict]
     slurm_script_path: Optional[str]
     termination_reason: Optional[str]
+    # Best-state snapshot for restore-on-max-loop
+    best_case_snapshot_dir: Optional[str]
+    best_progress_score: Optional[float]
 
 def tokenize(text: str) -> str:
     # Replace underscores with spaces

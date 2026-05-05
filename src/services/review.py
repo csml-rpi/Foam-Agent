@@ -47,7 +47,9 @@ def review_error_logs(
             "Please review the error logs and provide guidance on how to resolve the reported errors. Make sure your suggestions adhere to user requirements and do not contradict them."
         )
 
-    review_response = global_llm_service.invoke(reviewer_user_prompt, REVIEWER_SYSTEM_PROMPT)
+    review_response = global_llm_service.invoke(reviewer_user_prompt, REVIEWER_SYSTEM_PROMPT,
+                                                 log_context={"step": "review_analysis", "substep": "error_analysis",
+                                                              "loop_iteration": loop_count})
     review_content = review_response
 
     attempt_num = sum(1 for item in updated_history if item.startswith("<Attempt ")) + 1

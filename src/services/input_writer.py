@@ -168,14 +168,16 @@ def initial_write(
 
         code_user_prompt, code_system_prompt = _build_prompts(file_name, folder_name, written_files_ctx)
 
+        log_ctx = {"step": "initial_write", "substep": "generate_file",
+                   "file_target": f"{folder_name}/{file_name}"}
         if generation_mode == "parallel_no_context":
             # Avoid shared global LLM instance in parallel mode.
             from utils import LLMService
             from config import Config
             llm = LLMService(Config())
-            generation_response = llm.invoke(code_user_prompt, code_system_prompt)
+            generation_response = llm.invoke(code_user_prompt, code_system_prompt, log_context=log_ctx)
         else:
-            generation_response = global_llm_service.invoke(code_user_prompt, code_system_prompt)
+            generation_response = global_llm_service.invoke(code_user_prompt, code_system_prompt, log_context=log_ctx)
 
         code_context = parse_context(generation_response)
         save_file(file_path, code_context)
@@ -350,7 +352,8 @@ def build_allrun(
     if mesh_type == "custom_mesh":
         command_user_prompt += f"{mesh_commands_info}\n"
     
-    command_response = global_llm_service.invoke(command_user_prompt, command_system_prompt, pydantic_obj=CommandsPydantic)
+    command_response = global_llm_service.invoke(command_user_prompt, command_system_prompt, pydantic_obj=CommandsPydantic,
+                                                  log_context={"step": "initial_write", "substep": "allrun_commands"})
 
     if progress_callback:
         try:
@@ -403,7 +406,8 @@ def build_allrun(
         allrun_user_prompt += "CRITICAL: Do not include any other mesh commands other than the custom mesh commands.\n"
         allrun_user_prompt += "CRITICAL: Do not include any gmshToFoam commands in the Allrun script."
 
-    allrun_response = global_llm_service.invoke(allrun_user_prompt, allrun_system_prompt)
+    allrun_response = global_llm_service.invoke(allrun_user_prompt, allrun_system_prompt,
+                                                 log_context={"step": "initial_write", "substep": "allrun_script"})
 
     if progress_callback:
         try:
@@ -510,7 +514,9 @@ def rewrite_files(
         "Please update the relevant OpenFOAM files to resolve the reported errors, ensuring that all modifications strictly adhere to the specified formats. Ensure all modifications adhere to user requirement."
     )
 
-    response = global_llm_service.invoke(rewrite_user_prompt, rewrite_system_prompt, pydantic_obj=FoamPydantic)
+    response = global_llm_service.invoke(rewrite_user_prompt, rewrite_system_prompt, pydantic_obj=FoamPydantic,
+                                          log_context={"step": "rewrite", "substep": "rewrite_files",
+                                                       "loop_iteration": loop_count})
 
     # Prepare updated structures
     updated_dir = dict(dir_structure) if dir_structure else {}
