@@ -6,19 +6,8 @@ import re
 from typing import List
 from pydantic import BaseModel, Field
 
-# System prompts for different modes
-INITIAL_WRITE_SYSTEM_PROMPT = (
-    "You are an expert in OpenFOAM simulation and numerical modeling."
-    f"Your task is to generate a complete and functional file named: <file_name>{{file_name}}</file_name> within the <folder_name>{{folder_name}}</folder_name> directory. "
-    "Ensure all required values are present and match with the files content already generated."
-    "Before finalizing the output, ensure:\n"
-    "- All necessary fields exist (e.g., if `nu` is defined in `constant/transportProperties`, it must be used correctly in `0/U`).\n"
-    "- Cross-check field names between different files to avoid mismatches.\n"
-    "- Ensure units and dimensions are correct** for all physical variables.\n"
-    f"- Ensure case solver settings are consistent with the user's requirements. Available solvers are: {{case_solver}}.\n"
-    "Provide only the code—no explanations, comments, or additional text."
-)
-        
+
+
 
 def parse_allrun(text: str) -> str:
     match = re.search(r'```(.*?)```', text, re.DOTALL)
@@ -56,17 +45,17 @@ def _rewrite_mode(state):
         print("No review analysis available for rewrite mode.")
         print("</input_writer>")
         return state
-    out = rewrite_files(
+
+    return rewrite_files(
         case_dir=state["case_dir"],
         error_logs=state.get("error_logs", []),
         review_analysis=state.get("review_analysis", ""),
-        rewrite_plan=state.get("rewrite_plan"),
+        rewrite_plan=None,
         user_requirement=state.get("user_requirement", ""),
         foamfiles=state.get("foamfiles"),
         dir_structure=state.get("dir_structure", {}),
+        loop_count=state.get("loop_count", 0),
     )
-    print("</input_writer>")
-    return out
 
 def _initial_write_mode(state):
     """
@@ -92,6 +81,9 @@ def _initial_write_mode(state):
     # Build Allrun via service
     mesh_type = state.get("mesh_type")
     mesh_commands = state.get("mesh_commands") or []
+    advice = state.get("similar_case_advice")
+    advice_d = advice.model_dump() if hasattr(advice, "model_dump") else (advice if isinstance(advice, dict) else {})
+    pre_solver_steps = advice_d.get("pre_solver_steps") if advice_d else None
     allrun_out = build_allrun(
         case_dir=state["case_dir"],
         database_path=config.database_path,
@@ -101,6 +93,7 @@ def _initial_write_mode(state):
         allrun_reference=state["allrun_reference"],
         mesh_type=mesh_type,
         mesh_commands=mesh_commands,
+        pre_solver_steps=pre_solver_steps,
     )
 
     print("</input_writer>")

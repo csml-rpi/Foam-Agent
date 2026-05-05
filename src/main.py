@@ -12,13 +12,15 @@ from nodes.meshing_node import meshing_node
 from nodes.input_writer_node import input_writer_node
 from nodes.local_runner_node import local_runner_node
 from nodes.reviewer_node import reviewer_node
+from nodes.restore_best_node import restore_best_node
 from nodes.visualization_node import visualization_node
 from nodes.hpc_runner_node import hpc_runner_node
 from router_func import (
     route_after_planner,
     route_after_input_writer,
     route_after_runner,
-    route_after_reviewer
+    route_after_reviewer,
+    route_after_restore_best,
 )
 from logger import close_logging
 import json
@@ -36,8 +38,9 @@ def create_foam_agent_graph() -> StateGraph:
     workflow.add_node("local_runner", local_runner_node)
     workflow.add_node("hpc_runner", hpc_runner_node)
     workflow.add_node("reviewer", reviewer_node)
+    workflow.add_node("restore_best", restore_best_node)
     workflow.add_node("visualization", visualization_node)
-    
+
     # Add edges
     workflow.add_edge(START, "planner")
     workflow.add_conditional_edges("planner", route_after_planner)
@@ -46,6 +49,7 @@ def create_foam_agent_graph() -> StateGraph:
     workflow.add_conditional_edges("hpc_runner", route_after_runner)
     workflow.add_conditional_edges("local_runner", route_after_runner)
     workflow.add_conditional_edges("reviewer", route_after_reviewer)
+    workflow.add_conditional_edges("restore_best", route_after_restore_best)
     workflow.add_edge("visualization", END)
     
     return workflow
@@ -92,7 +96,9 @@ def initialize_state(user_requirement: str, config: Config, custom_mesh_path: Op
         job_id=None,
         cluster_info=None,
         slurm_script_path=None,
-        termination_reason=None
+        termination_reason=None,
+        best_case_snapshot_dir=None,
+        best_progress_score=None,
     )
     if custom_mesh_path:
         print(f"<custom_mesh_path>{custom_mesh_path}</custom_mesh_path>")
@@ -164,7 +170,19 @@ if __name__ == "__main__":
             "If a file exists at <reuse_generated_dir>/<folder>/<file>, Foam-Agent will copy it into the current output and skip generation for that file."
         ),
     )
-    
+    parser.add_argument(
+        "--dataset_log_path",
+        type=str,
+        default="",
+        help="Path to per-case dataset.jsonl for fine-tuning data extraction.",
+    )
+    parser.add_argument(
+        "--case_id",
+        type=str,
+        default="",
+        help="Case identifier, e.g. 'Basic/Cavity/1' or 'Advanced/Cavity_LES'.",
+    )
+
     args = parser.parse_args()
     print(f"args: {args}")
     
@@ -178,7 +196,16 @@ if __name__ == "__main__":
 
     if args.reuse_generated_dir:
         config.reuse_generated_dir = args.reuse_generated_dir
-    
+    if args.dataset_log_path:
+        config.dataset_log_path = args.dataset_log_path
+    if args.case_id:
+        config.case_id = args.case_id
+
+    # Sync global LLM service with CLI-provided dataset_log_path/case_id
+    from services import global_llm_service
+    global_llm_service.dataset_log_path = config.dataset_log_path
+    global_llm_service.case_id = config.case_id
+
     with open(args.prompt_path, 'r') as f:
         user_requirement = f.read()
     

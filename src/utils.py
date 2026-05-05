@@ -416,6 +416,7 @@ class LLMService:
         1) $CODEX_HOME/auth.json (Codex CLI file-based cache)
         2) ~/.codex/auth.json (Codex CLI default)
         3) ~/.clawdbot/agents/main/agent/auth-profiles.json (Clawdbot OpenAI-Codex OAuth cache)
+        4) ~/.openclaw/agents/main/agent/auth-profiles.json (OpenClaw OpenAI-Codex OAuth cache)
 
         Note: These files contain access/refresh tokens. Treat them like passwords.
         """
@@ -431,6 +432,16 @@ class LLMService:
         candidates.append(
             Path.home()
             / ".clawdbot"
+            / "agents"
+            / "main"
+            / "agent"
+            / "auth-profiles.json"
+        )
+
+        # OpenClaw stores the OpenAI-Codex OAuth profile here.
+        candidates.append(
+            Path.home()
+            / ".openclaw"
             / "agents"
             / "main"
             / "agent"
@@ -462,7 +473,9 @@ class LLMService:
         self.temperature = getattr(config, "temperature", 0)
         self.model_provider = getattr(config, "model_provider", "openai")
         self._config = config
-        
+        self.dataset_log_path = getattr(config, "dataset_log_path", "") or ""
+        self.case_id = getattr(config, "case_id", "") or ""
+
         # Initialize statistics
         self.total_calls = 0
         self.total_prompt_tokens = 0
@@ -596,11 +609,35 @@ class LLMService:
         
         return retry_count
     
-    def invoke(self, 
-              user_prompt: str, 
-              system_prompt: Optional[str] = None, 
+    def _log_dataset_record(self, log_context: dict, system_prompt: str,
+                            user_prompt: str, response: str,
+                            prompt_tokens: int, completion_tokens: int) -> None:
+        import json as _json
+        from datetime import datetime, timezone
+        record = {
+            "case_id": self.case_id,
+            "step": log_context.get("step", ""),
+            "substep": log_context.get("substep", ""),
+            "loop_iteration": log_context.get("loop_iteration", 0),
+            "file_target": log_context.get("file_target", ""),
+            "system_prompt": system_prompt or "",
+            "user_prompt": user_prompt,
+            "response": response,
+            "model": self.model_version,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        os.makedirs(os.path.dirname(self.dataset_log_path), exist_ok=True)
+        with open(self.dataset_log_path, "a") as f:
+            f.write(_json.dumps(record, ensure_ascii=False) + "\n")
+
+    def invoke(self,
+              user_prompt: str,
+              system_prompt: Optional[str] = None,
               pydantic_obj: Optional[Type[BaseModel]] = None,
-              max_retries: int = 10) -> Any:
+              max_retries: int = 10,
+              log_context: Optional[dict] = None) -> Any:
         """
         Invoke the LLM with the given prompts and return the response.
         
@@ -651,7 +688,13 @@ class LLMService:
                 self.total_prompt_tokens += prompt_tokens
                 self.total_completion_tokens += completion_tokens
                 self.total_tokens += total_tokens
-                
+
+                if log_context and self.dataset_log_path:
+                    self._log_dataset_record(
+                        log_context, system_prompt, user_prompt,
+                        response_content, prompt_tokens, completion_tokens,
+                    )
+
                 return response
                 
             except Exception as e:
@@ -756,6 +799,9 @@ class GraphState(TypedDict):
     cluster_info: Optional[dict]
     slurm_script_path: Optional[str]
     termination_reason: Optional[str]
+    # Best-state snapshot for restore-on-max-loop
+    best_case_snapshot_dir: Optional[str]
+    best_progress_score: Optional[float]
 
 def tokenize(text: str) -> str:
     # Replace underscores with spaces

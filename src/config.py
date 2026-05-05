@@ -23,6 +23,8 @@ class Config:
     # If set, InputWriter will check <reuse_generated_dir>/<folder>/<file> first.
     # When present, it will copy into the current case_dir and skip LLM generation.
     reuse_generated_dir: str = ""
+    dataset_log_path: str = ""
+    case_id: str = ""
     # LLM backend:
     # - "openai": OpenAI Platform usage-based (API key)
     # - "openai-codex": ChatGPT/Codex subscription sign-in (Codex auth cache)
