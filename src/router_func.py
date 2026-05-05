@@ -1,28 +1,9 @@
 import os
-import glob
-import re
 from typing import TypedDict, List, Optional
 from config import Config
 from utils import LLMService, GraphState
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Command
-
-
-def _all_logs_end_with_end(case_dir: str) -> bool:
-    """Return True iff every log.* in case_dir ends with an 'End' line."""
-    logs = glob.glob(os.path.join(case_dir, "log.*"))
-    if not logs:
-        return False
-    end_pattern = re.compile(r"^\s*End\s*$", re.MULTILINE)
-    for log_path in logs:
-        try:
-            with open(log_path, errors="ignore") as f:
-                content = f.read()
-            if not end_pattern.search(content):
-                return False
-        except Exception:
-            return False
-    return True
 
 
 def llm_requires_custom_mesh(state: GraphState) -> int:
@@ -175,17 +156,14 @@ def route_after_reviewer(state: GraphState):
     loop_count = state.get("loop_count", 0)
     max_loop = state["config"].max_loop
     if loop_count >= max_loop:
-        print(f"Maximum loop count ({max_loop}) reached. Restoring best state.")
+        print(f"<router>Maximum loop count ({max_loop}) reached.</router>")
         state["termination_reason"] = "max_review_loop_reached"
-        return "restore_best"
+
+        requires_visualization = state.get("requires_visualization")
+        if requires_visualization is None:
+            requires_visualization = llm_requires_visualization(state)
+            state["requires_visualization"] = requires_visualization
+        return "visualization" if requires_visualization else END
 
     print(f"<router>Loop {loop_count}: Continuing to fix errors.</router>")
     return "input_writer"
-
-
-def route_after_restore_best(state: GraphState):
-    requires_visualization = state.get("requires_visualization")
-    if requires_visualization is None:
-        requires_visualization = llm_requires_visualization(state)
-        state["requires_visualization"] = requires_visualization
-    return "visualization" if requires_visualization else END

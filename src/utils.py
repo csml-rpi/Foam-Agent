@@ -748,15 +748,6 @@ class GraphState(TypedDict):
     rewrite_plan: Optional[dict]
     input_writer_mode: Optional[str]
     similar_case_advice: Optional[dict]
-    # Best-state snapshot (Fix 2)
-    best_case_snapshot_dir: Optional[str]
-    best_progress_score: Optional[float]
-    # History enrichment pending patch (Fix 1)
-    pending_rewrite_plan: Optional[str]
-    pending_file_diff: Optional[str]
-    # Oscillation detection (Fix 3)
-    last_plan_target_files: Optional[List[str]]
-    last_error_sig: Optional[str]
     # Routing decision cache
     requires_hpc: Optional[bool]
     requires_visualization: Optional[bool]

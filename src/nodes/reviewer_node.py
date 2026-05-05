@@ -1,22 +1,16 @@
 # reviewer_node.py
-from pydantic import BaseModel, Field
-from typing import List
-from services.review import review_error_logs, generate_rewrite_plan
+from services.review import review_error_logs
 from logger import log_review
 
 
 def reviewer_node(state):
-    """
-    Reviewer node: single-call review (FA 1.1.0 style).
-    No rewrite_plan generation, no snapshot, no oscillation detection.
-    """
+    """Reviewer node: single-call review (FA 1.1.0 style)."""
     print("<reviewer>")
     if len(state["error_logs"]) == 0:
         print("No error to review.")
         print("</reviewer>")
         return state
 
-    # Log error logs to review.log
     log_review(str(state["error_logs"]), "error_logs")
 
     error_logs = state.get("error_logs", [])
@@ -31,9 +25,6 @@ def reviewer_node(state):
         similar_case_advice=state.get("similar_case_advice"),
         history_text=history_text,
         loop_count=loop_count,
-        pending_rewrite_plan=None,
-        pending_file_diff=None,
-        oscillation_hint="",
     )
 
     log_review(review_content, "review_analysis")
