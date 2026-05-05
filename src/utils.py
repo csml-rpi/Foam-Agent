@@ -416,6 +416,7 @@ class LLMService:
         1) $CODEX_HOME/auth.json (Codex CLI file-based cache)
         2) ~/.codex/auth.json (Codex CLI default)
         3) ~/.clawdbot/agents/main/agent/auth-profiles.json (Clawdbot OpenAI-Codex OAuth cache)
+        4) ~/.openclaw/agents/main/agent/auth-profiles.json (OpenClaw OpenAI-Codex OAuth cache)
 
         Note: These files contain access/refresh tokens. Treat them like passwords.
         """
@@ -431,6 +432,16 @@ class LLMService:
         candidates.append(
             Path.home()
             / ".clawdbot"
+            / "agents"
+            / "main"
+            / "agent"
+            / "auth-profiles.json"
+        )
+
+        # OpenClaw stores the OpenAI-Codex OAuth profile here.
+        candidates.append(
+            Path.home()
+            / ".openclaw"
             / "agents"
             / "main"
             / "agent"
