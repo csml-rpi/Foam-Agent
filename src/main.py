@@ -164,7 +164,19 @@ if __name__ == "__main__":
             "If a file exists at <reuse_generated_dir>/<folder>/<file>, Foam-Agent will copy it into the current output and skip generation for that file."
         ),
     )
-    
+    parser.add_argument(
+        "--dataset_log_path",
+        type=str,
+        default="",
+        help="Path to per-case dataset.jsonl for fine-tuning data extraction.",
+    )
+    parser.add_argument(
+        "--case_id",
+        type=str,
+        default="",
+        help="Case identifier, e.g. 'Basic/Cavity/1' or 'Advanced/Cavity_LES'.",
+    )
+
     args = parser.parse_args()
     print(f"args: {args}")
     
@@ -178,7 +190,11 @@ if __name__ == "__main__":
 
     if args.reuse_generated_dir:
         config.reuse_generated_dir = args.reuse_generated_dir
-    
+    if args.dataset_log_path:
+        config.dataset_log_path = args.dataset_log_path
+    if args.case_id:
+        config.case_id = args.case_id
+
     with open(args.prompt_path, 'r') as f:
         user_requirement = f.read()
     

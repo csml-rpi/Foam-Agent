@@ -35,6 +35,18 @@ def parse_args():
         default=None,
         help="Path to custom mesh file (e.g., .msh, .stl, .obj). If not provided, no custom mesh will be used."
     )
+    parser.add_argument(
+        '--dataset_log_path',
+        type=str,
+        default="",
+        help="Path to per-case dataset.jsonl for fine-tuning data extraction."
+    )
+    parser.add_argument(
+        '--case_id',
+        type=str,
+        default="",
+        help="Case identifier, e.g. 'Basic/Cavity/1' or 'Advanced/Cavity_LES'."
+    )
     return parser.parse_args()
 
 def run_command(command_str):
@@ -76,6 +88,10 @@ def main():
     main_cmd = f"python src/main.py --prompt_path='{args.prompt_path}' --output_dir='{args.output}'"
     if args.custom_mesh_path:
         main_cmd += f" --custom_mesh_path='{args.custom_mesh_path}'"
+    if args.dataset_log_path:
+        main_cmd += f" --dataset_log_path='{args.dataset_log_path}'"
+    if args.case_id:
+        main_cmd += f" --case_id='{args.case_id}'"
     
     print(f"Main workflow command: {main_cmd}")
     
