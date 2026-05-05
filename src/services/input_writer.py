@@ -103,14 +103,14 @@ def initial_write(
 
     # System prompt for file generation
     INITIAL_WRITE_SYSTEM_PROMPT = (
-        "You are an expert in OpenFOAM simulation and numerical modeling."
-        f"Your task is to generate a complete and functional file named: <file_name>{{file_name}}</file_name> within the <folder_name>{{folder_name}}</folder_name> directory. "
-        "Ensure all required values are present and match with the files content already generated."
+        "You are an expert in OpenFOAM simulation and numerical modeling. "
+        "Your task is to generate a complete and functional file named: <file_name>{file_name}</file_name> within the <folder_name>{folder_name}</folder_name> directory. "
+        "Ensure all required values are present and match with the files content already generated. "
         "Before finalizing the output, ensure:\n"
         "- All necessary fields exist (e.g., if `nu` is defined in `constant/transportProperties`, it must be used correctly in `0/U`).\n"
         "- Cross-check field names between different files to avoid mismatches.\n"
-        "- Ensure units and dimensions are correct** for all physical variables.\n"
-        f"- Ensure case solver settings are consistent with the user's requirements. Available solvers are: {{case_solver}}.\n"
+        "- Ensure units and dimensions are correct for all physical variables.\n"
+        "- Ensure case solver settings are consistent with the user's requirements. Available solvers are: {case_solver}.\n"
         "Provide only the code—no explanations, comments, or additional text."
     )
 
@@ -121,30 +121,21 @@ def initial_write(
             case_solver=case_solver,
         )
 
-        advice_text = ""
-        if isinstance(similar_case_advice, dict):
-            advice_text = (
-                f"Similar case match level: {similar_case_advice.get('match_level')}\n"
-                f"Use scope: {similar_case_advice.get('use_scope')}\n"
-                f"Advice: {similar_case_advice.get('advice')}\n"
-            )
-        elif similar_case_advice:
-            advice_text = str(similar_case_advice)
-
         similar_ref_block = (
-            f"Refer to the following similar case file content if helpful:\n<similar_case_reference>{tutorial_reference}</similar_case_reference>\n"
+            f"Refer to the following similar case file content to ensure the generated file aligns with the user requirement:\n"
+            f"<similar_case_reference>{tutorial_reference}</similar_case_reference>\n"
+            "Similar case reference is always correct. If you find the user requirement is very consistent with the similar case reference, "
+            "you should use the similar case reference as the template to generate the file. "
+            "Just modify the necessary parts to make the file complete and functional.\n"
             if tutorial_reference else "No suitable similar case was found for this domain.\n"
         )
 
         code_user_prompt = (
             f"User requirement: {user_requirement}\n"
             f"{similar_ref_block}"
-            f"{advice_text}"
-            "If the similar case is a weak match, do not copy it blindly. Use it only where it is consistent with the user requirement. "
-            "Just modify the necessary parts to make the file complete and functional."
-            "Please ensure that the generated file is complete, functional, and logically sound."
-            "Additionally, apply your domain expertise to verify that all numerical values are consistent with the user's requirements, maintaining accuracy and coherence."
-            "When generating controlDict, do not include anything to preform post processing. Just include the necessary settings to run the simulation."
+            "Please ensure that the generated file is complete, functional, and logically sound. "
+            "Additionally, apply your domain expertise to verify that all numerical values are consistent with the user's requirements, maintaining accuracy and coherence. "
+            "When generating controlDict, do not include anything to perform post processing. Just include the necessary settings to run the simulation."
         )
 
         if generation_mode == "sequential_dependency" and written_files_ctx:
@@ -263,6 +254,7 @@ def build_allrun(
     mesh_type: str,
     mesh_commands: List[str],
     user_requirement: str = "",
+    pre_solver_steps: Optional[List[str]] = None,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     progress_offset: int = 0,
     total_steps: int = 0,
@@ -351,7 +343,8 @@ def build_allrun(
         f"Case directory structure: {dir_structure}\n"
         f"User case information: {case_info}\n"
         f"Reference Allrun scripts from similar cases: {allrun_reference}\n"
-        "Generate only the required OpenFOAM command list—no extra text."
+        + (f"Required pre-solver steps (must be included in this order before the solver): {pre_solver_steps}\n" if pre_solver_steps else "")
+        + "Generate only the required OpenFOAM command list—no extra text."
     )
 
     if mesh_type == "custom_mesh":
@@ -380,12 +373,12 @@ def build_allrun(
 
     # Allrun generation system prompt
     allrun_system_prompt = (
-        "You are an expert in OpenFOAM. Generate an Allrun script based on the provided details."
+        "You are an expert in OpenFOAM. Generate an Allrun script based on the provided details. "
         f"Available commands with descriptions: {commands_help}\n\n"
         f"Reference Allrun scripts from similar cases: {allrun_reference}\n\n"
         "If custom mesh commands are provided, make sure to include them in the appropriate order in the Allrun script. "
-        "CRITICAL: Do not include any post processing commands in the Allrun script."
-        "CRITICAL: Do not include any commands to convert mesh to foam format like gmshToFoam or others."
+        "CRITICAL: Do not include any post processing commands in the Allrun script. "
+        "CRITICAL: Do not include any commands to convert mesh to foam format like gmshToFoam or others. "
     )
 
     if mesh_type == "custom_mesh":
@@ -395,14 +388,14 @@ def build_allrun(
     allrun_user_prompt = (
         f"User requirement: {user_requirement}\n"
         f"Case directory structure: {dir_structure}\n"
-        f"User case infomation: {case_info}\n"
+        f"User case information: {case_info}\n"
         f"{mesh_commands_info}\n"
         "All run scripts for these similar cases are for reference only and may not be correct, as you might be a different case solver or have a different directory structure. " 
         "You need to rely on your OpenFOAM and physics knowledge to discern this, and pay more attention to user requirements, " 
-        "as your ultimate goal is to fulfill the user's requirements and generate an allrun script that meets those requirements."
-        "CRITICAL: Do not include any post processing commands in the Allrun script."
-        "CRITICAL: Do not include any commands to convert mesh to foam format like gmshToFoam or others."
-        "CRITICAL: Do not include any commands that run gmsh to create the mesh."
+        "as your ultimate goal is to fulfill the user's requirements and generate an allrun script that meets those requirements. "
+        "CRITICAL: Do not include any post processing commands in the Allrun script. "
+        "CRITICAL: Do not include any commands to convert mesh to foam format like gmshToFoam or others. "
+        "CRITICAL: Do not include any commands that run gmsh to create the mesh. "
         "Generate the Allrun script strictly based on the above information. Do not include explanations, comments, or additional text. Put the code in ``` tags."
     )
 
@@ -421,7 +414,7 @@ def build_allrun(
     allrun_script = parse_allrun(allrun_response)
     allrun_file_path = os.path.join(case_dir, "Allrun")
     save_file(allrun_file_path, allrun_script)
-    
+
     return {"allrun_path": allrun_file_path, "allrun_script": allrun_script, "commands": command_response.commands}
 
 
@@ -430,10 +423,11 @@ def rewrite_files(
     case_dir: str,
     error_logs: List[str],
     review_analysis: str,
-    rewrite_plan: Optional[Dict[str, Any]],
     user_requirement: str,
+    rewrite_plan: Optional[Dict[str, Any]] = None,  # unused; kept for backwards-compat
     foamfiles: Optional[Any] = None,
-    dir_structure: Optional[Dict[str, List[str]]] = None
+    dir_structure: Optional[Dict[str, List[str]]] = None,
+    loop_count: int = 0
 ) -> Dict[str, Any]:
     """
     Rewrite OpenFOAM files based on error analysis and reviewer suggestions.
@@ -499,33 +493,24 @@ def rewrite_files(
 
     rewrite_system_prompt = (
         "You are an expert in OpenFOAM simulation and numerical modeling. "
-        "Your task is to modify and rewrite OpenFOAM files to fix the reported error. "
+        "Your task is to modify and rewrite the necessary OpenFOAM files to fix the reported error. "
         "Please do not propose solutions that require modifying any parameters declared in the user requirement, try other approaches instead. "
-        "You will receive a rewrite_plan. Follow it strictly: only modify files listed in rewrite_plan.target_files and apply only the requested changes. "
-        "Do not modify files outside the plan. "
-        "Return the complete, corrected file contents in JSON format: "
+        "The user will provide the error content, error command, reviewer's suggestions, and all relevant foam files. "
+        "Only return files that require rewriting, modification, or addition; do not include files that remain unchanged. "
+        "Return the complete, corrected file contents in the following JSON format: "
         "list of foamfile: [{file_name: 'file_name', folder_name: 'folder_name', content: 'content'}]. "
-        "Ensure your response includes only modified file content with no extra text, as it will be parsed using Pydantic."
+        "Ensure your response includes only the modified file content with no extra text, as it will be parsed using Pydantic."
     )
 
     rewrite_user_prompt = (
         f"<foamfiles>{str(foamfiles)}</foamfiles>\n"
         f"<error_logs>{error_logs}</error_logs>\n"
-        f"<reviewer_analysis>{review_analysis}</reviewer_analysis>\n"
-        f"<rewrite_plan>{rewrite_plan}</rewrite_plan>\n\n"
+        f"<reviewer_analysis>{review_analysis}</reviewer_analysis>\n\n"
         f"<user_requirement>{user_requirement}</user_requirement>\n\n"
-        "Please update OpenFOAM files according to rewrite_plan only. "
-        "Only include files from rewrite_plan.target_files in your output."
+        "Please update the relevant OpenFOAM files to resolve the reported errors, ensuring that all modifications strictly adhere to the specified formats. Ensure all modifications adhere to user requirement."
     )
 
     response = global_llm_service.invoke(rewrite_user_prompt, rewrite_system_prompt, pydantic_obj=FoamPydantic)
-
-    allowed_files = set()
-    if rewrite_plan and isinstance(rewrite_plan, dict):
-        for item in rewrite_plan.get("target_files", []):
-            file_path = item.get("file") if isinstance(item, dict) else None
-            if file_path:
-                allowed_files.add(file_path.strip().lstrip("./"))
 
     # Prepare updated structures
     updated_dir = dict(dir_structure) if dir_structure else {}
@@ -534,11 +519,6 @@ def rewrite_files(
         foamfiles_list = list(foamfiles.list_foamfile)
 
     for foamfile in response.list_foamfile:
-        rel_path = os.path.join(foamfile.folder_name, foamfile.file_name).replace('\\', '/').lstrip('./')
-        if allowed_files and rel_path not in allowed_files:
-            print(f"Warning: Skipping unplanned rewrite file: {rel_path}")
-            continue
-
         file_path = os.path.join(case_dir, foamfile.folder_name, foamfile.file_name)
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         save_file(file_path, foamfile.content)

@@ -1,8 +1,28 @@
+import os
+import glob
+import re
 from typing import TypedDict, List, Optional
 from config import Config
 from utils import LLMService, GraphState
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Command
+
+
+def _all_logs_end_with_end(case_dir: str) -> bool:
+    """Return True iff every log.* in case_dir ends with an 'End' line."""
+    logs = glob.glob(os.path.join(case_dir, "log.*"))
+    if not logs:
+        return False
+    end_pattern = re.compile(r"^\s*End\s*$", re.MULTILINE)
+    for log_path in logs:
+        try:
+            with open(log_path, errors="ignore") as f:
+                content = f.read()
+            if not end_pattern.search(content):
+                return False
+        except Exception:
+            return False
+    return True
 
 
 def llm_requires_custom_mesh(state: GraphState) -> int:
@@ -25,7 +45,7 @@ def llm_requires_custom_mesh(state: GraphState) -> int:
         "If the user explicitly mentions or implies they want to use a custom mesh file, return 'custom_mesh'. "
         "If they want to use standard OpenFOAM mesh generation (blockMesh, snappyHexMesh with STL, etc.), return 'standard_mesh'. "
         "Look for keywords like gmsh and determine if they want to create mesh using gmsh. If they want to create mesh using gmsh, return 'gmsh_mesh'. "
-        "Be conservative - if unsure, assume 'standard_mesh' unless clearly specified otherwise."
+        "Be conservative - if unsure, assume 'standard_mesh' unless clearly specified otherwise. "
         "Only return 'custom_mesh' or 'standard_mesh' or 'gmsh_mesh'. Don't return anything else."
     )
     
@@ -155,13 +175,17 @@ def route_after_reviewer(state: GraphState):
     loop_count = state.get("loop_count", 0)
     max_loop = state["config"].max_loop
     if loop_count >= max_loop:
-        print(f"<router>Maximum loop count ({max_loop}) reached. Ending workflow.</router>")
+        print(f"Maximum loop count ({max_loop}) reached. Restoring best state.")
         state["termination_reason"] = "max_review_loop_reached"
-        requires_visualization = state.get("requires_visualization")
-        if requires_visualization is None:
-            requires_visualization = llm_requires_visualization(state)
-            state["requires_visualization"] = requires_visualization
-        return "visualization" if requires_visualization else END
+        return "restore_best"
 
     print(f"<router>Loop {loop_count}: Continuing to fix errors.</router>")
     return "input_writer"
+
+
+def route_after_restore_best(state: GraphState):
+    requires_visualization = state.get("requires_visualization")
+    if requires_visualization is None:
+        requires_visualization = llm_requires_visualization(state)
+        state["requires_visualization"] = requires_visualization
+    return "visualization" if requires_visualization else END

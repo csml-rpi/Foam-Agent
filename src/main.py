@@ -12,13 +12,15 @@ from nodes.meshing_node import meshing_node
 from nodes.input_writer_node import input_writer_node
 from nodes.local_runner_node import local_runner_node
 from nodes.reviewer_node import reviewer_node
+from nodes.restore_best_node import restore_best_node
 from nodes.visualization_node import visualization_node
 from nodes.hpc_runner_node import hpc_runner_node
 from router_func import (
     route_after_planner,
     route_after_input_writer,
     route_after_runner,
-    route_after_reviewer
+    route_after_reviewer,
+    route_after_restore_best,
 )
 from logger import close_logging
 import json
@@ -36,6 +38,7 @@ def create_foam_agent_graph() -> StateGraph:
     workflow.add_node("local_runner", local_runner_node)
     workflow.add_node("hpc_runner", hpc_runner_node)
     workflow.add_node("reviewer", reviewer_node)
+    workflow.add_node("restore_best", restore_best_node)
     workflow.add_node("visualization", visualization_node)
     
     # Add edges
@@ -46,6 +49,7 @@ def create_foam_agent_graph() -> StateGraph:
     workflow.add_conditional_edges("hpc_runner", route_after_runner)
     workflow.add_conditional_edges("local_runner", route_after_runner)
     workflow.add_conditional_edges("reviewer", route_after_reviewer)
+    workflow.add_conditional_edges("restore_best", route_after_restore_best)
     workflow.add_edge("visualization", END)
     
     return workflow
@@ -87,6 +91,12 @@ def initialize_state(user_requirement: str, config: Config, custom_mesh_path: Op
         review_analysis=None,
         rewrite_plan=None,
         input_writer_mode="initial",
+        best_case_snapshot_dir=None,
+        best_progress_score=None,
+        pending_rewrite_plan=None,
+        pending_file_diff=None,
+        last_plan_target_files=None,
+        last_error_sig=None,
         requires_hpc=None,
         requires_visualization=None,
         job_id=None,
