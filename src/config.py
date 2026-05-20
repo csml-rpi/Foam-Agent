@@ -29,7 +29,7 @@ class Config:
     # - "ollama": local models
     # - "bedrock": AWS Bedrock
     # - "anthropic": Anthropic Claude API (requires ANTHROPIC_API_KEY)
-    model_provider: str = "openai-codex"  # [openai, openai-codex, ollama, bedrock, anthropic]
+    model_provider: str = "openai-codex"  # [openai, openai-codex, ollama, bedrock, anthropic, deepseek]
     # model_version examples:
     # - OpenAI: "gpt-5-mini"
     # - OpenAI Codex subscription: "gpt-5.3-codex" (or whichever Codex model you have access to)
@@ -63,7 +63,7 @@ class Config:
 
         provider_env = _env_nonempty(provider_key)
         if provider_env is not None:
-            allowed = {"openai", "openai-codex", "ollama", "bedrock", "anthropic"}
+            allowed = {"openai", "openai-codex", "ollama", "bedrock", "anthropic", "deepseek"}
             if provider_env in allowed:
                 self.model_provider = provider_env
                 print(f"<config>model_provider={self.model_provider} (env:{provider_key})</config>")
