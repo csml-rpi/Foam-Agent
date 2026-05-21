@@ -104,6 +104,7 @@ def run_pyvista_script(
       - If expected_png is provided, we only consider success if that file exists after execution.
       - Apply a timeout so headless/VTK hangs don't block forever.
     """
+    case_dir = os.path.abspath(case_dir)
     script_path = os.path.join(case_dir, filename)
     save_file(script_path, script)
 
