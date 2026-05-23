@@ -6,19 +6,23 @@
   "keyword_swaps": [
     {
       "pattern": "\\bmodel\\s+kEpsilon;",
-      "replacement": "RASModel kEpsilon;"
+      "replacement": "RASModel kEpsilon;",
+      "scope": ["turbulenceProperties"]
     },
     {
       "pattern": "\\bmodel\\s+kOmegaSST;",
-      "replacement": "RASModel kOmegaSST;"
+      "replacement": "RASModel kOmegaSST;",
+      "scope": ["turbulenceProperties"]
     },
     {
       "pattern": "\\bmodel\\s+RNGkEpsilon;",
-      "replacement": "RASModel RNGkEpsilon;"
+      "replacement": "RASModel RNGkEpsilon;",
+      "scope": ["turbulenceProperties"]
     },
     {
       "pattern": "\\bmodel\\s+realizableKE;",
-      "replacement": "RASModel realizableKE;"
+      "replacement": "RASModel realizableKE;",
+      "scope": ["turbulenceProperties"]
     },
     {
       "pattern": "\\bapplication\\s+buoyantFoam;",

@@ -44,8 +44,8 @@ class ESITranslator:
     def run_translation_pipeline(self) -> None:
         print(f"<esi_patch>Booting ESI translation for: {self.case_path}</esi_patch>")
         self._defensive_solver_intercept()
-        self._translate_all_files()
         self._remap_structure()
+        self._translate_all_files()
         self._fix_physical_properties()
         self._provision_transport_properties()
         self._sanitize_foundation_function_objects()
@@ -119,7 +119,7 @@ class ESITranslator:
             return
 
         modified = self._sanitize_llm_artifacts(original, file_path)
-        modified = self._apply_keyword_swaps(modified)
+        modified = self._apply_keyword_swaps(modified, file_path)
 
         if modified != original:
             file_path.write_text(modified, encoding="utf-8")
@@ -174,8 +174,11 @@ FoamFile
         )
         return header + content
 
-    def _apply_keyword_swaps(self, content: str) -> str:
+    def _apply_keyword_swaps(self, content: str, file_path: Path) -> str:
         for rule in self.rules.get("keyword_swaps", []):
+            scope = rule.get("scope")
+            if scope and file_path.name not in scope:
+                continue
             pattern = rule["pattern"]
             replacement = rule["replacement"]
             content = re.sub(pattern, replacement, content)

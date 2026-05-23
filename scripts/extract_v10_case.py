@@ -9,13 +9,15 @@ without invoking an LLM.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_DB = ROOT / "database" / "raw" / "openfoam_tutorials_details.txt"
+_ENV_DB = os.environ.get("FOAMAGENT_DB_PATH")
+DEFAULT_DB = Path(_ENV_DB) if _ENV_DB else (ROOT / "database" / "raw" / "openfoam_tutorials_details.txt")
 
 _DIR_LINE = re.compile(
     r"<dir>directory name:\s*(.+?)\.\s*File names in this directory:\s*\[(.*?)\]</dir>"
