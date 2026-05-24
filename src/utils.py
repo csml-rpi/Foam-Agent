@@ -105,7 +105,7 @@ class FoamPydantic(BaseModel):
 class ResponseWithThinkPydantic(BaseModel):
     think: str = Field(description="Thought process of the LLM")
     response: str = Field(description="Response of the LLM")
-    
+
 class _CodexResponsesWrapper:
     """Wrapper for an OpenAI Responses-compatible endpoint.
 
@@ -482,7 +482,7 @@ class LLMService:
             )
         elif self.model_provider.lower() == "anthropic":
             self.llm = ChatAnthropic(
-                model=self.model_version, 
+                model=self.model_version,
                 temperature=self.temperature
             )
         elif self.model_provider.lower() == "openai":
@@ -532,6 +532,20 @@ class LLMService:
                 num_predict=-1,
                 num_ctx=131072,
                 base_url="http://localhost:11434"
+            )
+        elif self.model_provider.lower() == "deepseek":
+            from langchain_openai import ChatOpenAI
+            reasoning = os.getenv("FOAMAGENT_REASONING_EFFORT", "max")
+            if reasoning not in ("low", "medium", "high", "max"):
+                reasoning = "max"
+            # Note: temperature is ignored by DeepSeek in thinking mode.
+            self.llm = ChatOpenAI(
+                model=self.model_version,
+                temperature=self.temperature,
+                base_url="https://api.deepseek.com/v1",
+                api_key=os.getenv("DEEPSEEK_API_KEY"),
+                reasoning_effort=reasoning,
+                extra_body={"thinking": {"type": "enabled"}},
             )
         else:
             raise ValueError(f"{self.model_provider} is not a supported model_provider")
@@ -595,8 +609,8 @@ class LLMService:
         time.sleep(sleep_time)
         
         return retry_count
-    
-    def invoke(self, 
+
+    def invoke(self,
               user_prompt: str, 
               system_prompt: Optional[str] = None, 
               pydantic_obj: Optional[Type[BaseModel]] = None,
@@ -629,18 +643,30 @@ class LLMService:
         while True:
             try:
                 if pydantic_obj:
-                    structured_llm = self.llm.with_structured_output(pydantic_obj)
-                    response = structured_llm.invoke(messages)
-                else:
-                    if self.model_version.startswith("deepseek"):
-                        structured_llm = self.llm.with_structured_output(ResponseWithThinkPydantic)
-                        response = structured_llm.invoke(messages)
-
-                        # Extract the resposne without the think
-                        response = response.response
+                    if self.model_provider.lower() == "deepseek":
+                        # DeepSeek thinking mode does not support response_format,
+                        # so with_structured_output fails. Use JSON prompt fallback.
+                        schema = pydantic_obj.model_json_schema()
+                        json_instruction = (
+                            "Return ONLY valid JSON (no markdown, no extra text) matching this schema:\n"
+                            + str(schema)
+                        )
+                        json_messages = list(messages)
+                        json_messages.append({"role": "user", "content": json_instruction})
+                        raw_response = self.llm.invoke(json_messages)
+                        raw_text = raw_response.content
+                        # Strip markdown fences if present
+                        t = raw_text.strip()
+                        if t.startswith("```"):
+                            t = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", t)
+                            t = re.sub(r"\n?```\s*$", "", t).strip()
+                        response = pydantic_obj.model_validate_json(t)
                     else:
-                        response = self.llm.invoke(messages)
-                        response = response.content
+                        structured_llm = self.llm.with_structured_output(pydantic_obj)
+                        response = structured_llm.invoke(messages)
+                else:
+                    response = self.llm.invoke(messages)
+                    response = response.content
 
                 # Calculate completion tokens
                 response_content = str(response)
