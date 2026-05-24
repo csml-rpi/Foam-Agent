@@ -20,6 +20,7 @@ echo "[3/4] blockMesh + solver in container"
 docker run --rm \
   -u "$(id -u):$(id -g)" \
   -v "${CASE_DIR}:${CASE_DIR}" \
+  -v "${ROOT}/scripts/mock_sbatch.sh:/usr/local/bin/mock_sbatch.sh" \
   "${IMAGE}" \
   bash -lc "
     set -e

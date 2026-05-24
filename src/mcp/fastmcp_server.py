@@ -25,8 +25,9 @@ from services.plan import (
 from services.input_writer import initial_write
 from services.run_local import run_allrun_and_collect_errors
 
-from utils import FoamPydantic
+from utils import FoamPydantic, read_case_foamfiles, scan_case_directory
 from services.review import review_error_logs
+from translation.esi_translator import convert_case_to_esi_if_needed
 from services.visualization import (
     ensure_foam_file,
     generate_pyvista_script,
@@ -48,12 +49,7 @@ mcp = FastMCP(
 Foam-Agent is a multi-agent framework that automates the entire OpenFOAM-based CFD simulation workflow from a single natural language prompt.
 By managing the full pipeline—from meshing and case setup to execution and post-processing—Foam-Agent dramatically lowers the expertise barrier for Computational Fluid Dynamics.
 
-IMPORTANT: This tool targets **Foundation OpenFOAM v10** (openfoam.org) exclusively. All generated case files,
-dictionary names, and solver commands follow Foundation v10 conventions. It is NOT compatible with ESI OpenFOAM
-(openfoam.com, e.g., v2312, v2406, v2512), which uses different file names and solver binaries. For example:
-- Foundation v10 uses `constant/momentumTransport`, ESI uses `constant/turbulenceProperties`
-- Foundation v10 uses `constant/physicalProperties`, ESI uses `constant/thermophysicalProperties`
-- Foundation v10 uses `buoyantFoam`, ESI uses `buoyantBoussinesqPimpleFoam`
+IMPORTANT: This tool internally generates cases using **Foundation OpenFOAM v10** conventions but automatically translates them to **ESI OpenFOAM** (openfoam.com) formatting before returning the files if configured to do so. You do not need to worry about the syntax differences between the forks.
 
 To run simulations, you must have Foundation OpenFOAM v10 installed, or use the Foam-Agent Docker image
 which includes it pre-installed.
@@ -87,9 +83,7 @@ async def plan(
     """Plan the simulation structure by analyzing requirements and generating subtasks.
 
     This function uses AI to break down user requirements into manageable subtasks
-    for OpenFOAM file generation. The plan targets Foundation OpenFOAM v10 (openfoam.org)
-    conventions — solvers, dictionary names, and file structure all follow v10 defaults.
-    Not compatible with ESI OpenFOAM (openfoam.com).
+    for OpenFOAM file generation.
     """
     try:
         await ctx.info("Planning simulation structure from user requirements")
@@ -153,11 +147,9 @@ async def input_writer(
 ) -> GenerateFilesResponse:
     """Generate OpenFOAM input files based on subtasks and requirements.
 
-    This function creates all necessary OpenFOAM input files (system/, constant/, 0/)
-    using Foundation OpenFOAM v10 (openfoam.org) conventions. Generated files use v10
-    dictionary names (e.g., momentumTransport, physicalProperties) and solver binaries
-    (e.g., buoyantFoam). These files are NOT compatible with ESI OpenFOAM (openfoam.com)
-    without manual adaptation.
+    This function creates all necessary OpenFOAM input files (system/, constant/, 0/).
+    It generates files using v10 conventions and then automatically translates them
+    to ESI OpenFOAM conventions if configured.
     """
     try:
         await ctx.info(f"Generating OpenFOAM files for case: {request.case_name}")
@@ -253,6 +245,16 @@ async def input_writer(
         foamfiles = result.get("foamfiles")
         if not foamfiles:
             raise ValueError("No foamfiles returned from initial_write")
+
+        # Convert to ESI if needed
+        convert_case_to_esi_if_needed(case_dir, global_config)
+        
+        # Rescan the directory and foam files to reflect any translations
+        dir_structure = scan_case_directory(case_dir)
+        foamfiles = read_case_foamfiles(case_dir, dir_structure)
+
+        if not foamfiles:
+            raise ValueError("No foamfiles returned after translation")
 
         allrun_script = os.path.join(case_dir, "Allrun")
 

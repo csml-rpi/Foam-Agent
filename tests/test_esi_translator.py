@@ -20,7 +20,7 @@ from translation.esi_translator import (  # noqa: E402
 
 @pytest.fixture
 def rules_path() -> Path:
-    return ROOT / "config" / "esi_translation_rules.json"
+    return ROOT / "src" / "translation" / "esi_translation_rules.json"
 
 
 @pytest.fixture
@@ -139,6 +139,18 @@ class TestESITranslator:
         text = (case_dir / "system" / "controlDict").read_text()
         assert "```" not in text
         assert "FoamFile" in text
+
+    def test_skips_allrun_and_logs(self, case_dir: Path, rules_path: Path) -> None:
+        allrun = case_dir / "Allrun"
+        allrun.write_text("#!/bin/sh\necho test\n", encoding="utf-8")
+        log_file = case_dir / "log.icoFoam"
+        log_file.write_text("Execution log\n", encoding="utf-8")
+        
+        ESITranslator(case_dir, rules_path=rules_path).run_translation_pipeline()
+        
+        # Verify they don't have the FoamFile header
+        assert "FoamFile" not in allrun.read_text(encoding="utf-8")
+        assert "FoamFile" not in log_file.read_text(encoding="utf-8")
 
     def test_chemkin_properties_reset(self, case_dir: Path, rules_path: Path) -> None:
         (case_dir / "system" / "controlDict").write_text(

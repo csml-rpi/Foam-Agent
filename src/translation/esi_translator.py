@@ -11,11 +11,11 @@ from pathlib import Path
 from typing import Any
 
 _DEFAULT_RULES_PATH = (
-    Path(__file__).resolve().parent.parent.parent / "config" / "esi_translation_rules.json"
+    Path(__file__).resolve().parent / "esi_translation_rules.json"
 )
 
-_SKIP_FILENAMES = {".", ".."}
-_SKIP_SUFFIXES = ("~", ".bak", ".orig")
+_SKIP_FILENAMES = {".", "..", "Allrun", "Allclean"}
+_SKIP_SUFFIXES = ("~", ".bak", ".orig", ".sh", ".out", ".err", ".log")
 _BINARY_EXTENSIONS = {
     ".stl", ".gz", ".zip", ".foam", ".vtk", ".obj", ".ans", ".dat",
     ".eMesh", ".face", ".edge", ".points", ".faces", ".owner", ".neighbour",
@@ -104,7 +104,7 @@ class ESITranslator:
         for root, dirs, files in os.walk(self.case_path):
             dirs[:] = [d for d in dirs if not d.startswith(".")]
             for name in files:
-                if name in _SKIP_FILENAMES or name.endswith(_SKIP_SUFFIXES):
+                if name in _SKIP_FILENAMES or name.endswith(_SKIP_SUFFIXES) or name.startswith("log."):
                     continue
                 path = Path(root) / name
                 if path.suffix.lower() in _BINARY_EXTENSIONS:
