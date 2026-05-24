@@ -59,3 +59,8 @@ namespaces = true
 
 [tool.setuptools.package-data]
 "*" = ["*.json", "*.md"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: tests that read the full RAG tutorial database",
+]

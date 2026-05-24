@@ -1,7 +1,8 @@
 # input_writer_node.py
 import os
-from utils import save_file, parse_context, retrieve_faiss, FoamPydantic, FoamfilePydantic
+from utils import save_file, parse_context, retrieve_faiss, FoamPydantic, FoamfilePydantic, read_case_foamfiles, scan_case_directory
 from services.input_writer import initial_write, build_allrun, rewrite_files
+from translation.esi_translator import convert_case_to_esi_if_needed
 import re
 from typing import List
 from pydantic import BaseModel, Field
@@ -66,6 +67,13 @@ def _rewrite_mode(state):
         dir_structure=state.get("dir_structure", {}),
     )
     print("</input_writer>")
+    
+    convert_case_to_esi_if_needed(state["case_dir"], state["config"])
+    
+    # Rescan the directory and foam files to reflect any translations
+    out["dir_structure"] = scan_case_directory(state["case_dir"])
+    out["foamfiles"] = read_case_foamfiles(state["case_dir"], out["dir_structure"])
+
     return out
 
 def _initial_write_mode(state):
@@ -105,8 +113,15 @@ def _initial_write_mode(state):
 
     print("</input_writer>")
 
+    convert_case_to_esi_if_needed(state["case_dir"], config)
+    
+    # Rescan the directory and foam files to reflect any translations
+    dir_structure = scan_case_directory(state["case_dir"])
+    foamfiles = read_case_foamfiles(state["case_dir"], dir_structure)
+
     return {
         "dir_structure": dir_structure,
         "commands": [],
         "foamfiles": foamfiles,
     }
+

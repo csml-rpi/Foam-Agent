@@ -38,7 +38,8 @@ class Config:
     # - Anthropic: claude-3-5-sonnet-latest
     model_version: str = "gpt-5.3-codex"
     temperature: float = 1
-
+    openfoam_fork: str = "foundation"  # Default to Foundation v10
+    
     # Embedding Configuration
     embedding_provider: str = "huggingface"  # [openai, huggingface, ollama]
     embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"  # e.g. "text-embedding-3-small", "text-embedding-3-large", "Qwen/Qwen3-Embedding-0.6B", "Qwen/Qwen3-Embedding-8B"
@@ -104,3 +105,17 @@ class Config:
             print(f"<config>embedding_model={self.embedding_model} (env:{emb_model_key})</config>")
         else:
             print(f"<config>embedding_model={self.embedding_model} (default)</config>")
+
+        # OpenFOAM Fork Override
+        fork_key = "FOAMAGENT_OPENFOAM_FORK"
+        fork_env = _env_nonempty(fork_key)
+        if fork_env is not None:
+            allowed_forks = {"foundation", "esi"}
+            if fork_env.lower() in allowed_forks:
+                self.openfoam_fork = fork_env.lower()
+                print(f"<config>openfoam_fork={self.openfoam_fork} (env:{fork_key})</config>")
+            else:
+                self.openfoam_fork = "foundation"  # Safe fallback assignment
+                print(f"<config>openfoam_fork={self.openfoam_fork} (default; invalid env:{fork_key}={fork_env!r})</config>")
+        else:
+            print(f"<config>openfoam_fork={self.openfoam_fork} (default)</config>")
