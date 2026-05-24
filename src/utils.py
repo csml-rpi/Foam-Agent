@@ -284,7 +284,15 @@ class _CodexResponsesWrapper:
 
         payload = self._build_payload(messages)
 
-        r = requests.post(url, headers=headers, json=payload, timeout=60, stream=bool(self._stream))
+        # ChatGPT Codex backend can take 60-180s on complex prompts when
+        # reasoning.summary=auto is enabled — the model spends time on the
+        # reasoning trace before emitting tokens. The previous hardcoded 60s
+        # was too tight: prompts with non-trivial BC topology (e.g. a 2-inlet
+        # elbow channel) deterministically exceeded it on gpt-5.5, raising
+        # `HTTPSConnectionPool ... Read timed out. (read timeout=60)` and
+        # failing the workflow. Allow operator override via env var.
+        timeout = int(os.environ.get("FOAMAGENT_HTTP_TIMEOUT", "300"))
+        r = requests.post(url, headers=headers, json=payload, timeout=timeout, stream=bool(self._stream))
 
         # If we get an error, surface the response body to aid debugging.
         if not r.ok:
