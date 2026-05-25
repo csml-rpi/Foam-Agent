@@ -2,7 +2,7 @@
 
 Expose OpenFOAM CFD simulation as tools for any AI coding assistant via [MCP (Model Context Protocol)](https://modelcontextprotocol.io/).
 
-> **OpenFOAM version:** This server targets **Foundation OpenFOAM v10** ([openfoam.org](https://openfoam.org)) exclusively. All generated case files, dictionary names (e.g., `momentumTransport`, `physicalProperties`), and solver binaries (e.g., `buoyantFoam`) follow Foundation v10 conventions. **ESI OpenFOAM** ([openfoam.com](https://openfoam.com), e.g., v2312, v2406, v2512) uses different naming and is **not supported**.
+> **OpenFOAM version:** This server targets **Foundation OpenFOAM v10** ([openfoam.org](https://openfoam.org)) by default. If `FOAMAGENT_OPENFOAM_FORK=esi` is set, generated input files are translated to ESI OpenFOAM ([openfoam.com](https://openfoam.com), e.g., v2312, v2406, v2512) naming and dictionary conventions on a best-effort basis. The run/review/fix workflow is still primarily validated with Foundation OpenFOAM v10.
 
 ## Quick Start
 
@@ -70,15 +70,17 @@ export ANTHROPIC_API_KEY=sk-ant-...                # API key for your provider
 
 ## Available MCP Tools
 
-All tools generate output following **Foundation OpenFOAM v10** conventions.
+Foam-Agent generates output following **Foundation OpenFOAM v10** conventions by default. If
+`FOAMAGENT_OPENFOAM_FORK=esi` is set, generated input files are translated to ESI OpenFOAM
+conventions on a best-effort basis before they are returned.
 
 | Tool | Description |
 |------|-------------|
-| `plan` | Analyze user requirements and plan simulation structure (solver, domain, subtasks) using Foundation v10 conventions |
-| `input_writer` | Generate all OpenFOAM configuration files (system/, constant/, 0/) targeting Foundation v10 |
-| `run` | Execute Allrun script locally with error collection (requires Foundation OpenFOAM v10) |
-| `review` | Analyze simulation errors and suggest fixes via LLM |
-| `apply_fixes` | Rewrite OpenFOAM files based on review analysis |
+| `plan` | Analyze user requirements and plan simulation structure (solver, domain, subtasks) using Foundation v10 references |
+| `input_writer` | Generate OpenFOAM configuration files; optionally translate generated files when `FOAMAGENT_OPENFOAM_FORK=esi` |
+| `run` | Execute Allrun script locally with error collection; primarily validated with Foundation OpenFOAM v10 |
+| `review` | Analyze simulation errors and suggest fixes via LLM using Foundation v10 references |
+| `apply_fixes` | Rewrite OpenFOAM files based on review analysis; ESI cases remain best-effort |
 | `visualization` | Generate PyVista visualization of simulation results |
 
 ## Typical Workflow
@@ -97,7 +99,7 @@ The assistant will call the tools in sequence:
 ## Prerequisites
 
 - **Python 3.10+** with dependencies installed
-- **Foundation OpenFOAM v10** ([openfoam.org](https://openfoam.org)) installed and available in PATH (for running simulations). ESI OpenFOAM (openfoam.com) is not compatible.
+- **Foundation OpenFOAM v10** ([openfoam.org](https://openfoam.org)) installed and available in PATH for the default, fully validated runtime path. ESI OpenFOAM (`openfoam.com`) generation is available as best-effort translation with `FOAMAGENT_OPENFOAM_FORK=esi`, but execution and repair loops should be verified per case.
 - An LLM API key (OpenAI, Anthropic, or local via Ollama)
 
 ## Architecture
@@ -120,6 +122,7 @@ OpenFOAM + LLM Services
 | `FOAMAGENT_MODEL_VERSION` | Model identifier | `gpt-5.3-codex` |
 | `FOAMAGENT_EMBEDDING_PROVIDER` | Embedding backend | `huggingface` |
 | `FOAMAGENT_EMBEDDING_MODEL` | Embedding model | `Qwen/Qwen3-Embedding-0.6B` |
+| `FOAMAGENT_OPENFOAM_FORK` | OpenFOAM target fork for generated files: `foundation` or `esi` | `foundation` |
 | `OPENAI_API_KEY` | OpenAI API key | — |
 | `ANTHROPIC_API_KEY` | Anthropic API key | — |
 
@@ -132,7 +135,7 @@ OpenFOAM + LLM Services
 python init_database.py --openfoam_path $WM_PROJECT_DIR --force
 ```
 
-**OpenFOAM not found:** The `run` tool requires Foundation OpenFOAM v10 ([openfoam.org](https://openfoam.org)). ESI OpenFOAM (openfoam.com) is not compatible. Install Foundation v10 or use the Docker image:
+**OpenFOAM not found:** The default validated runtime path requires Foundation OpenFOAM v10 ([openfoam.org](https://openfoam.org)). If using ESI OpenFOAM, set `FOAMAGENT_OPENFOAM_FORK=esi` and verify the generated case against your local ESI installation. Install Foundation v10 or use the Docker image:
 ```bash
 docker build -f docker/Dockerfile -t foamagent:latest .
 docker run -it -p 7860:7860 foamagent:latest foamagent-mcp --transport http

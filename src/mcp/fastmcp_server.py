@@ -49,10 +49,12 @@ mcp = FastMCP(
 Foam-Agent is a multi-agent framework that automates the entire OpenFOAM-based CFD simulation workflow from a single natural language prompt.
 By managing the full pipeline—from meshing and case setup to execution and post-processing—Foam-Agent dramatically lowers the expertise barrier for Computational Fluid Dynamics.
 
-IMPORTANT: This tool internally generates cases using **Foundation OpenFOAM v10** conventions but automatically translates them to **ESI OpenFOAM** (openfoam.com) formatting before returning the files if configured to do so. You do not need to worry about the syntax differences between the forks.
+IMPORTANT: Foam-Agent generates cases using **Foundation OpenFOAM v10** conventions by default. If
+`FOAMAGENT_OPENFOAM_FORK=esi` is set, generated input files are translated to ESI OpenFOAM
+(openfoam.com) naming and dictionary conventions on a best-effort basis before they are returned.
 
-To run simulations, you must have Foundation OpenFOAM v10 installed, or use the Foam-Agent Docker image
-which includes it pre-installed.
+The run/review/fix workflow is still primarily validated with Foundation OpenFOAM v10. ESI execution
+support is experimental and should be verified for each case.
 """
 )
 
@@ -148,8 +150,9 @@ async def input_writer(
     """Generate OpenFOAM input files based on subtasks and requirements.
 
     This function creates all necessary OpenFOAM input files (system/, constant/, 0/).
-    It generates files using v10 conventions and then automatically translates them
-    to ESI OpenFOAM conventions if configured.
+    It generates files using Foundation v10 conventions by default. If
+    FOAMAGENT_OPENFOAM_FORK=esi is set, it applies a best-effort post-generation
+    translation to ESI naming and dictionary conventions before returning files.
     """
     try:
         await ctx.info(f"Generating OpenFOAM files for case: {request.case_name}")
@@ -297,8 +300,9 @@ async def run(
     """Run the OpenFOAM simulation locally.
 
     This function executes the Allrun script and collects any errors.
-    Requires Foundation OpenFOAM v10 (openfoam.org) installed and sourced in PATH.
-    Will not work with ESI OpenFOAM (openfoam.com).
+    It is primarily validated with Foundation OpenFOAM v10 (openfoam.org). Cases translated
+    with FOAMAGENT_OPENFOAM_FORK=esi may run on ESI OpenFOAM, but that path is experimental
+    and depends on the active OpenFOAM environment.
     """
     try:
         await ctx.info(f"Running simulation in directory: {request.case_dir}")
@@ -375,8 +379,8 @@ async def review(
     """Review simulation errors and suggest improvements.
 
     This function analyzes simulation errors and provides suggestions for fixes.
-    All analysis is based on Foundation OpenFOAM v10 (openfoam.org) conventions and
-    tutorial references. Not applicable to ESI OpenFOAM (openfoam.com) cases.
+    The RAG references and fix reasoning are based on Foundation OpenFOAM v10 tutorials.
+    ESI-translated cases can be reviewed, but suggested fixes should be treated as best-effort.
     """
     try:
         await ctx.info(f"Reviewing errors for case directory: {request.case_dir}")
@@ -463,7 +467,8 @@ async def apply_fixes(
 
     This tool rewrites OpenFOAM files to fix errors identified during review.
     It must be called after the 'review' tool has provided analysis.
-    All fixes target Foundation OpenFOAM v10 (openfoam.org) conventions.
+    Fix generation targets Foundation OpenFOAM v10 conventions by default. If the case is
+    later translated with FOAMAGENT_OPENFOAM_FORK=esi, those fixes are best-effort for ESI.
     
     The tool directly calls rewrite_files which handles:
     - Reading current foamfiles and directory structure from case_dir
@@ -567,7 +572,8 @@ async def visualization(
     """Generate visualization for the simulation results.
 
     This function creates visualization artifacts using PyVista.
-    Expects case output from a Foundation OpenFOAM v10 (openfoam.org) simulation.
+    It is primarily validated with Foundation OpenFOAM v10 outputs; ESI outputs should be
+    verified per case.
     """
     try:
         await ctx.info(f"Generating visualization for case directory: {request.case_dir}")
