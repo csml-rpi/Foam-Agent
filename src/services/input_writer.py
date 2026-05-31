@@ -147,6 +147,16 @@ def initial_write(
             "When generating controlDict, do not include anything to preform post processing. Just include the necessary settings to run the simulation."
         )
 
+        if file_name == "fvSolution":
+            code_user_prompt += (
+                "CRITICAL: For pressure-velocity coupling solvers (PISO/PIMPLE), "
+                "the solvers dictionary MUST include "
+                "corresponding *Final sub-dictionaries for each solver entry "
+                "(e.g., pFinal for p, UFinal for U). "
+                "Typically { $<field>; relTol 0; }. "
+                "Also ensure the PIMPLE/PISO sub-dictionary matches the solver's requirement."
+            )
+
         if generation_mode == "sequential_dependency" and written_files_ctx:
             code_user_prompt += (
                 f"The following are files content already generated: {str(written_files_ctx)}\n\n\n"
