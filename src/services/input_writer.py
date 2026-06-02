@@ -149,12 +149,14 @@ def initial_write(
 
         if file_name == "fvSolution":
             code_user_prompt += (
-                "CRITICAL: For pressure-velocity coupling solvers (PISO/PIMPLE), "
-                "the solvers dictionary MUST include "
-                "corresponding *Final sub-dictionaries for each solver entry "
-                "(e.g., pFinal for p, UFinal for U). "
-                "Typically { $<field>; relTol 0; }. "
-                "Also ensure the PIMPLE/PISO sub-dictionary matches the solver's requirement."
+                "\n\nCRITICAL for transient pressure-velocity coupling solvers using PISO/PIMPLE: "
+                "the solvers dictionary must include matching Final solver entries for fields used on the final correction. "
+                "For example, if p is defined, include pFinal { $p; relTol 0; }; "
+                "if U is defined, include UFinal { $U; relTol 0; }. "
+                "For grouped regex entries, use the matching grouped Final entry, e.g. "
+                "\"(U|k|epsilon)Final\" { $U; relTol 0; }. "
+                "Do not emit placeholder text such as $<field>; in the generated file. "
+                "Also ensure the PIMPLE/PISO sub-dictionary matches the selected solver."
             )
 
         if generation_mode == "sequential_dependency" and written_files_ctx:
