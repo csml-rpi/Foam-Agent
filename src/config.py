@@ -38,8 +38,18 @@ class Config:
     # - Anthropic: claude-3-5-sonnet-latest
     model_version: str = "gpt-5.3-codex"
     temperature: float = 1
+    # Optional base URL for OpenAI-compatible endpoints (OpenRouter, vLLM, LiteLLM, ...).
+    # Only used when model_provider == "openai". Empty means the official OpenAI endpoint.
+    openai_base_url: str = ""
     openfoam_fork: str = "foundation"  # Default to Foundation v10
-    
+
+    # OpenFOAM execution runtime:
+    # - "native": source $WM_PROJECT_DIR/etc/bashrc in the current machine
+    # - "docker": run inside openfoam_image, mounting the case at the same absolute path
+    openfoam_runtime: str = "native"
+    openfoam_image: str = "foam-bench:latest"
+    openfoam_bashrc: str = "/opt/openfoam10/etc/bashrc"  # bashrc path inside the image
+
     # Embedding Configuration
     embedding_provider: str = "huggingface"  # [openai, huggingface, ollama]
     embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"  # e.g. "text-embedding-3-small", "text-embedding-3-large", "Qwen/Qwen3-Embedding-0.6B", "Qwen/Qwen3-Embedding-8B"
@@ -105,6 +115,52 @@ class Config:
             print(f"<config>embedding_model={self.embedding_model} (env:{emb_model_key})</config>")
         else:
             print(f"<config>embedding_model={self.embedding_model} (default)</config>")
+
+        # Integer overrides (loop / time limits)
+        for env_key, attr in (
+            ("FOAMAGENT_MAX_LOOP", "max_loop"),
+            ("FOAMAGENT_MAX_TIME_LIMIT", "max_time_limit"),
+        ):
+            raw = _env_nonempty(env_key)
+            if raw is None:
+                continue
+            try:
+                setattr(self, attr, int(raw))
+                print(f"<config>{attr}={getattr(self, attr)} (env:{env_key})</config>")
+            except ValueError:
+                print(f"<config>{attr}={getattr(self, attr)} (default; invalid env:{env_key}={raw!r})</config>")
+
+        # OpenAI-compatible base URL override
+        base_url_key = "FOAMAGENT_OPENAI_BASE_URL"
+        base_url_env = _env_nonempty(base_url_key)
+        if base_url_env is not None:
+            self.openai_base_url = base_url_env
+            print(f"<config>openai_base_url={self.openai_base_url} (env:{base_url_key})</config>")
+
+        # OpenFOAM execution runtime overrides
+        runtime_key = "FOAMAGENT_OPENFOAM_RUNTIME"
+        runtime_env = _env_nonempty(runtime_key)
+        if runtime_env is not None:
+            allowed_runtimes = {"native", "docker"}
+            if runtime_env.lower() in allowed_runtimes:
+                self.openfoam_runtime = runtime_env.lower()
+                print(f"<config>openfoam_runtime={self.openfoam_runtime} (env:{runtime_key})</config>")
+            else:
+                print(
+                    f"<config>openfoam_runtime={self.openfoam_runtime} (default; invalid env:{runtime_key}={runtime_env!r})</config>"
+                )
+        else:
+            print(f"<config>openfoam_runtime={self.openfoam_runtime} (default)</config>")
+
+        image_env = _env_nonempty("FOAMAGENT_OPENFOAM_IMAGE")
+        if image_env is not None:
+            self.openfoam_image = image_env
+            print(f"<config>openfoam_image={self.openfoam_image} (env:FOAMAGENT_OPENFOAM_IMAGE)</config>")
+
+        bashrc_env = _env_nonempty("FOAMAGENT_OPENFOAM_BASHRC")
+        if bashrc_env is not None:
+            self.openfoam_bashrc = bashrc_env
+            print(f"<config>openfoam_bashrc={self.openfoam_bashrc} (env:FOAMAGENT_OPENFOAM_BASHRC)</config>")
 
         # OpenFOAM Fork Override
         fork_key = "FOAMAGENT_OPENFOAM_FORK"

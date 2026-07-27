@@ -6,6 +6,31 @@ from utils import save_file
 from . import global_llm_service
 
 
+def _strip_code_fences(text: str) -> str:
+    """Remove Markdown code fences from an LLM response.
+
+    The prompts ask for bare Python, but several models still wrap the answer in
+    ```python ... ```. Saving that verbatim makes the script fail with a SyntaxError
+    on its first line, so strip the fences before the script is written to disk.
+    """
+    if not isinstance(text, str):
+        return text
+
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return text
+
+    lines = stripped.splitlines()
+    # Drop the opening fence (``` or ```python) and everything after the closing fence.
+    lines = lines[1:]
+    for i, line in enumerate(lines):
+        if line.strip().startswith("```"):
+            lines = lines[:i]
+            break
+
+    return "\n".join(lines).strip() + "\n"
+
+
 def ensure_foam_file(case_dir: str) -> str:
     """
     Ensure a .foam file exists in the case directory for OpenFOAM visualization.
@@ -87,7 +112,7 @@ def generate_pyvista_script(
         f"<visualization_requirements>{user_requirement}</visualization_requirements>\n"
         f"<previous_errors>{previous_errors}</previous_errors>\n"
     )
-    return global_llm_service.invoke(prompt, system_prompt)
+    return _strip_code_fences(global_llm_service.invoke(prompt, system_prompt))
 
 
 def run_pyvista_script(
@@ -168,7 +193,7 @@ def fix_pyvista_script(foam_file: str, original_script: str, error_logs: List[st
         f"<foam_file>{foam_file}</foam_file>\n"
         f"<original_script>{original_script}</original_script>\n"
     )
-    return global_llm_service.invoke(prompt, system_prompt)
+    return _strip_code_fences(global_llm_service.invoke(prompt, system_prompt))
 
 
 def generate_deterministic_pyvista_script(

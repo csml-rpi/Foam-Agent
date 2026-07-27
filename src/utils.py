@@ -1,5 +1,6 @@
 # utils.py
 import re
+import json
 import subprocess
 import os
 import signal
@@ -494,12 +495,17 @@ class LLMService:
                 temperature=self.temperature
             )
         elif self.model_provider.lower() == "openai":
-            # Usage-based API access (requires OPENAI_API_KEY or equivalent OpenAI SDK config)
-            self.llm = init_chat_model(
-                self.model_version,
-                model_provider=self.model_provider,
-                temperature=self.temperature,
-            )
+            # Usage-based API access (requires OPENAI_API_KEY or equivalent OpenAI SDK config).
+            # An OpenAI-compatible endpoint (OpenRouter, vLLM, LiteLLM, ...) can be used by
+            # setting FOAMAGENT_OPENAI_BASE_URL.
+            init_kwargs = {
+                "model_provider": self.model_provider,
+                "temperature": self.temperature,
+            }
+            base_url = getattr(config, "openai_base_url", "") or ""
+            if base_url:
+                init_kwargs["base_url"] = base_url
+            self.llm = init_chat_model(self.model_version, **init_kwargs)
         elif self.model_provider.lower() in {"openai-codex", "codex", "chatgpt-oauth"}:
             # Subscription-based access via "Sign in with ChatGPT" (Codex auth cache).
             # We use the OpenAI Responses API, which is the typical surface for Codex subscription access.
@@ -558,10 +564,25 @@ class LLMService:
         else:
             raise ValueError(f"{self.model_provider} is not a supported model_provider")
     
+    def _is_structured_output_error(self, error: Exception) -> bool:
+        """Check whether an exception means the model returned an off-schema answer.
+
+        Covers Pydantic validation errors (wrong shape, missing field) and the JSON
+        decoding errors raised when the answer is not valid JSON at all. These are
+        worth retrying because a second attempt often returns the correct shape.
+        """
+        from pydantic import ValidationError
+
+        if isinstance(error, (ValidationError, json.JSONDecodeError)):
+            return True
+
+        name = type(error).__name__
+        return name in {"OutputParserException", "ValidationError", "JSONDecodeError"}
+
     def _is_throttling_error(self, error: Exception) -> bool:
         """
         Check if an exception is a throttling-related error.
-        
+
         Args:
             error: The exception to check
             
@@ -648,6 +669,8 @@ class LLMService:
             prompt_tokens += self.llm.get_num_tokens(message["content"])
         
         retry_count = 0
+        structured_retry_count = 0
+        max_structured_retries = 3
         while True:
             try:
                 if pydantic_obj:
@@ -698,6 +721,27 @@ class LLMService:
                         self.failed_calls += 1
                         raise Exception(f"Maximum retries ({max_retries}) exceeded for throttling error: {str(e)}")
                     continue  # Retry the request
+                elif pydantic_obj is not None and self._is_structured_output_error(e) \
+                        and structured_retry_count < max_structured_retries:
+                    # The model answered with a shape that does not match the schema
+                    # (e.g. a bare JSON array where an object is expected). Ask again
+                    # with the mismatch quoted back, rather than failing the workflow.
+                    structured_retry_count += 1
+                    self.retry_count += 1
+                    print(
+                        f"Structured output did not match {pydantic_obj.__name__}: {str(e)[:200]}. "
+                        f"Retrying: {structured_retry_count}/{max_structured_retries}"
+                    )
+                    messages = list(messages) + [{
+                        "role": "user",
+                        "content": (
+                            "Your previous answer did not match the required schema and was rejected "
+                            f"with this error:\n{str(e)[:500]}\n"
+                            "Return ONLY a JSON object matching this schema (no markdown, no extra text):\n"
+                            + str(pydantic_obj.model_json_schema())
+                        ),
+                    }]
+                    continue
                 else:
                     print(f"Non-throttling error occurred: {str(e)}.")
 
@@ -947,25 +991,62 @@ def read_case_foamfiles(case_dir: str, dir_structure: Optional[Dict[str, List[st
     
     return FoamPydantic(list_foamfile=foamfile_list)
 
-def run_command(script_path: str, out_file: str, err_file: str, working_dir: str, max_time_limit: int) -> None:
-    print(f"Executing script {script_path} in {working_dir}")
-    os.chmod(script_path, 0o777)
+def _build_openfoam_argv(script_path: str, working_dir: str) -> tuple[list, Optional[str]]:
+    """Build the argv that executes ``script_path`` inside an OpenFOAM environment.
+
+    Returns ``(argv, container_name)``. ``container_name`` is None for native runs and
+    is used to kill the container when the run exceeds its time limit.
+
+    Runtime selection follows FOAMAGENT_OPENFOAM_RUNTIME:
+    - "native" (default): source $WM_PROJECT_DIR/etc/bashrc on this machine.
+    - "docker": run inside FOAMAGENT_OPENFOAM_IMAGE. The working directory is mounted at
+      the same absolute path so that paths in the logs match the host.
+    """
+    abs_script = os.path.abspath(script_path)
+    abs_work_dir = os.path.abspath(working_dir)
+    runtime = (os.getenv("FOAMAGENT_OPENFOAM_RUNTIME") or "native").strip().lower()
+
+    if runtime == "docker":
+        image = (os.getenv("FOAMAGENT_OPENFOAM_IMAGE") or "foam-bench:latest").strip()
+        bashrc_path = (os.getenv("FOAMAGENT_OPENFOAM_BASHRC") or "/opt/openfoam10/etc/bashrc").strip()
+        container_name = f"foamagent-run-{os.getpid()}-{int(time.time())}"
+        inner = f"source {bashrc_path} && bash {abs_script}"
+        argv = [
+            "docker", "run", "--rm",
+            "--name", container_name,
+            "--user", f"{os.getuid()}:{os.getgid()}",
+            "-e", "HOME=/tmp",
+            "-v", f"{abs_work_dir}:{abs_work_dir}",
+            "-w", abs_work_dir,
+            "--entrypoint", "bash",
+            image, "-c", inner,
+        ]
+        return argv, container_name
+
     openfoam_dir = os.getenv("WM_PROJECT_DIR")
     if not openfoam_dir:
         raise RuntimeError(
             "WM_PROJECT_DIR is not set. Please source OpenFOAM environment before running Foam-Agent "
-            "(e.g., source env/common.sh and env/foamagent.sh)."
+            "(e.g., source env/common.sh and env/foamagent.sh), or set "
+            "FOAMAGENT_OPENFOAM_RUNTIME=docker to run OpenFOAM in a container."
         )
 
     bashrc_path = os.path.join(openfoam_dir, "etc", "bashrc")
     if not os.path.exists(bashrc_path):
         raise RuntimeError(f"OpenFOAM bashrc not found at: {bashrc_path}")
 
-    command = f"source {bashrc_path} && bash {os.path.abspath(script_path)}"
+    return ['bash', "-c", f"source {bashrc_path} && bash {abs_script}"], None
+
+
+def run_command(script_path: str, out_file: str, err_file: str, working_dir: str, max_time_limit: int) -> None:
+    print(f"Executing script {script_path} in {working_dir}")
+    os.chmod(script_path, 0o777)
+
+    argv, container_name = _build_openfoam_argv(script_path, working_dir)
 
     with open(out_file, 'w') as out, open(err_file, 'w') as err:
         process = subprocess.Popen(
-            ['bash', "-c", command],
+            argv,
             cwd=working_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -979,8 +1060,12 @@ def run_command(script_path: str, out_file: str, err_file: str, working_dir: str
             out.write(stdout)
             err.write(stderr)
         except subprocess.TimeoutExpired:
-            os.killpg(os.getpgid(process.pid), signal.SIGKILL) 
-            
+            if container_name:
+                # Killing the docker client leaves the container running; stop it explicitly.
+                subprocess.run(["docker", "kill", container_name],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+
             stdout, stderr = process.communicate()
             timeout_message = (
                 "OpenFOAM execution took too long. "
