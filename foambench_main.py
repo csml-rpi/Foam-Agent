@@ -73,7 +73,7 @@ def main():
     os.makedirs(args.output, exist_ok=True)
 
     # Build main workflow command with optional custom mesh path
-    main_cmd = f"python src/main.py --prompt_path='{args.prompt_path}' --output_dir='{args.output}'"
+    main_cmd = f"{sys.executable} -m foamagent.main --prompt_path='{args.prompt_path}' --output_dir='{args.output}'"
     if args.custom_mesh_path:
         main_cmd += f" --custom_mesh_path='{args.custom_mesh_path}'"
     

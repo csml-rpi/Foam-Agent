@@ -8,19 +8,18 @@ from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "src"))
-
-from translation.esi_translator import (  # noqa: E402
+from foamagent.translation.esi_translator import (
     ESITranslator,
     _find_dict_block,
     convert_case_to_esi_if_needed,
 )
 
+ROOT = Path(__file__).resolve().parent.parent
+
 
 @pytest.fixture
 def rules_path() -> Path:
-    return ROOT / "src" / "translation" / "esi_translation_rules.json"
+    return ROOT / "src" / "foamagent" / "translation" / "esi_translation_rules.json"
 
 
 @pytest.fixture

@@ -22,10 +22,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from translation.esi_translator import ESITranslator  # noqa: E402
+from foamagent.translation.esi_translator import ESITranslator  # noqa: E402
 from extract_v10_case import _PRESETS, extract_case  # noqa: E402
 
 

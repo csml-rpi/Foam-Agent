@@ -56,7 +56,7 @@ That's it. Foam-Agent will plan the case, generate all OpenFOAM files, run the s
 
 ## Configuration
 
-All settings live in `src/config.py` with sensible defaults. Every setting can be overridden via environment variables — no need to edit files, especially useful for Docker and CI.
+All settings live in `src/foamagent/config.py` with sensible defaults. Every setting can be overridden via environment variables — no need to edit files, especially useful for Docker and CI.
 
 ### LLM Provider and Model
 
@@ -94,7 +94,7 @@ Defaults to `huggingface` with `Qwen/Qwen3-Embedding-0.6B` (runs locally, no API
 
 ### Input Writer Generation Mode
 
-Set in `src/config.py` via `input_writer_generation_mode`:
+Set in `src/foamagent/config.py` via `input_writer_generation_mode`:
 
 | Mode | Behavior | Best for |
 |---|---|---|
@@ -145,7 +145,7 @@ Foam-Agent exposes its full CFD workflow as an **MCP server** — the universal 
 
 ```bash
 # 1. Install (adds the foamagent-mcp command)
-pip install -e .
+uv sync --extra rag-local --extra direct-api --extra viz
 
 # 2. Register with your AI tool
 claude mcp add foamagent -- foamagent-mcp                # Claude Code
@@ -244,12 +244,31 @@ Foam-Agent searches for OAuth tokens at (first match wins):
 
 ### Manual Installation (Without Docker)
 
+Dependencies are managed with [uv](https://docs.astral.sh/uv/).
+
 ```bash
 git clone https://github.com/csml-rpi/Foam-Agent.git
 cd Foam-Agent
-conda env create -n FoamAgent -f environment.yml
-conda activate FoamAgent
+
+# The FAISS indices under database/ are stored with Git LFS. Without this step they are
+# ~130-byte pointer files and retrieval fails.
+git lfs install --local && git lfs pull
+
+# Core only. Add the extras you need (see the table below).
+uv sync --extra rag-local --extra direct-api --extra viz
 ```
+
+The core install deliberately excludes anything heavy. Pick the extras for what you use:
+
+| Extra | Provides | Needed when |
+|---|---|---|
+| `rag-local` | FAISS, sentence-transformers, torch (CPU) | Retrieval over the bundled tutorial database (the default) |
+| `direct-api` | langchain-openai / -anthropic, openai, anthropic | Inference from inside this process |
+| `viz` | PyVista | Post-processing images |
+| `web` | FastAPI, uvicorn | The `app.py` web UI |
+| `hpc` | boto3 | SLURM/HPC submission |
+| `ollama`, `bedrock` | provider SDKs | Those providers |
+| `all` | everything above | |
 
 You also need **Foundation OpenFOAM v10** ([openfoam.org](https://openfoam.org)) installed and sourced for the default, fully validated runtime path. ESI OpenFOAM (`openfoam.com`) file generation is available as best-effort translation by setting `FOAMAGENT_OPENFOAM_FORK=esi`, but ESI execution and repair loops should be verified per case. Follow the [official Foundation v10 installation guide](https://openfoam.org/version/10/) and verify with:
 
@@ -281,7 +300,8 @@ docker run -it \
 |---|---|
 | OpenFOAM environment not found | Ensure the intended OpenFOAM bashrc is sourced. The default validated path is Foundation OpenFOAM v10 ([openfoam.org](https://openfoam.org)); ESI OpenFOAM requires `FOAMAGENT_OPENFOAM_FORK=esi` and per-case verification |
 | Database files missing | Ensure the full repo is cloned including `database/`. Docker image has these pre-built |
-| Missing dependencies | `conda env update -n FoamAgent -f environment.yml --prune` |
+| `Index type 0x73726576 ("vers") not recognized` | The FAISS indices are unfetched Git LFS pointers. Run `git lfs install --local && git lfs pull` |
+| Missing dependencies | `uv sync --all-extras` |
 | API key errors | Ensure the appropriate key is set (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.) |
 | MCP connection errors | Verify the container is running and port 7860 is accessible |
 

@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Note: none of these jobs fetch Git LFS content. That is deliberate — the unit tests must
+# not depend on the bundled FAISS indices, and this is how we keep that true.
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --no-install-project
+      - run: uv run --no-sync ruff check .
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --python ${{ matrix.python-version }}
+      # No credentials are provided on purpose: importing the package or collecting the
+      # tests must never require them.
+      - run: uv run --no-sync pytest -m "not integration" -q
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv build
+      # Install the built wheel into a clean environment: catches packaging mistakes that
+      # an editable install hides, such as a module left out of the wheel.
+      - run: |
+          uv venv /tmp/wheel-check
+          uv pip install --python /tmp/wheel-check/bin/python dist/*.whl
+          # An installed wheel has no repository around it, so FOAMAGENT_ROOT is how the
+          # data directory gets located. Assert that path rather than the (meaningless)
+          # value repo_root() infers from site-packages.
+          FOAMAGENT_ROOT=/tmp/somewhere /tmp/wheel-check/bin/python -c "
+          import foamagent
+          from foamagent import paths
+          from foamagent.translation.esi_translator import ESITranslator
+          assert paths.repo_root().as_posix() == '/tmp/somewhere', paths.repo_root()
+          assert (paths.package_dir() / 'codex_instructions_default.txt').is_file()
+          assert (paths.package_dir() / 'translation' / 'esi_translation_rules.json').is_file()
+          print('wheel ok')
+          "
