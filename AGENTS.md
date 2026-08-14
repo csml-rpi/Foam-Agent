@@ -11,30 +11,31 @@ Foam-Agent is a multi-agent framework that automates CFD (Computational Fluid Dy
 ## Build and Run
 
 ```bash
-# Environment setup
-conda env create -n FoamAgent -f environment.yml
-conda activate FoamAgent
+# Environment setup (uv). Core is intentionally lightweight; add the extras you need.
+git lfs install --local && git lfs pull        # database/ is stored with Git LFS
+uv sync --extra rag-local --extra direct-api --extra viz
 
 # Run a simulation
-python foambench_main.py --output ./output --prompt_path ./user_requirement.txt
+uv run python foambench_main.py --output ./output --prompt_path ./user_requirement.txt
 
 # Run with custom mesh
-python foambench_main.py --output ./output --prompt_path ./user_requirement.txt --custom_mesh_path ./mesh.msh
+uv run python foambench_main.py --output ./output --prompt_path ./user_requirement.txt --custom_mesh_path ./mesh.msh
 
-# Run tests
-pytest tests/ -v
+# Run tests. Unit tests need no credentials, network, Docker, or LFS content.
+uv run pytest -m "not integration" -q
+uv run ruff check .
 
 # Start MCP server
-python -m src.mcp.fastmcp_server --transport http --host 0.0.0.0 --port 7860
+uv run python -m foamagent.mcp.fastmcp_server --transport http --host 0.0.0.0 --port 7860
 ```
 
-Requires **Foundation OpenFOAM v10** ([openfoam.org](https://openfoam.org)) at runtime (`$WM_PROJECT_DIR` must be set). ESI OpenFOAM (openfoam.com) is not compatible. Python 3.12.9 via Conda.
+Requires **Foundation OpenFOAM v10** ([openfoam.org](https://openfoam.org)) at runtime. Either source it natively (`$WM_PROJECT_DIR` must be set) or set `FOAMAGENT_OPENFOAM_RUNTIME=docker` to run solvers inside a container. ESI OpenFOAM (openfoam.com) file generation is best-effort translation only.
 
 ## Architecture
 
 ### Workflow Pipeline (LangGraph StateGraph)
 
-Defined in `src/main.py`:
+Defined in `src/foamagent/main.py`:
 
 ```
 PLANNER -> [mesh routing] -> MESHING (if needed) -> INPUT_WRITER -> [HPC/local routing]
@@ -42,12 +43,12 @@ PLANNER -> [mesh routing] -> MESHING (if needed) -> INPUT_WRITER -> [HPC/local r
 -> VISUALIZATION (if requested) -> END
 ```
 
-All routing decisions (mesh type, HPC vs local, visualization) are LLM calls in `src/router_func.py`.
+All routing decisions (mesh type, HPC vs local, visualization) are LLM calls in `src/foamagent/router_func.py`.
 
 ### Directory Structure
 
 ```
-src/
+src/foamagent/          # the importable package (`import foamagent`)
   main.py              # LangGraph workflow definition and entry point
   config.py            # Config dataclass with env var overrides
   utils.py             # GraphState (TypedDict), LLMService (unified LLM interface)
@@ -70,24 +71,26 @@ src/
     run_hpc.py         # HPC job submission
     review.py          # Error diagnosis and fix planning
     visualization.py   # PyVista-based post-processing
+  paths.py             # Resolves database/ and runs/ (FOAMAGENT_ROOT overrides)
   mcp/                 # FastMCP server exposing workflow as tools
 database/
   faiss/               # Pre-built FAISS vector indices (do NOT regenerate unless necessary)
   raw/                 # Raw OpenFOAM tutorial data
-tests/                 # pytest tests (service layer + MCP integration)
+tests/                 # unit tests: no credentials, network, Docker, or LFS content
+scripts/manual/        # end-to-end scripts that DO need credentials; run by hand
 docker/                # Dockerfile for containerized deployment
 ```
 
 ### Key Abstractions
 
-- **`GraphState`** (`src/utils.py`): TypedDict threaded through all workflow nodes. Contains user requirement, case metadata, generated files, error logs, loop count.
-- **`LLMService`** (`src/utils.py`): Unified LLM interface supporting OpenAI, Anthropic, Bedrock, Ollama. Provides `invoke()` and `structure_output()` (Pydantic-validated).
-- **`Config`** (`src/config.py`): Global config dataclass. Every field can be overridden via `FOAMAGENT_*` env vars.
-- **Pydantic models** (`src/models.py`): `FoamPydantic`/`FoamfilePydantic` for generated files, `RewritePlan` for error fixes, `CaseSummaryModel` for case metadata.
+- **`GraphState`** (`src/foamagent/utils.py`): TypedDict threaded through all workflow nodes. Contains user requirement, case metadata, generated files, error logs, loop count.
+- **`LLMService`** (`src/foamagent/utils.py`): Unified LLM interface supporting OpenAI, Anthropic, Bedrock, Ollama. Provides `invoke()` and `structure_output()` (Pydantic-validated).
+- **`Config`** (`src/foamagent/config.py`): Global config dataclass. Every field can be overridden via `FOAMAGENT_*` env vars.
+- **Pydantic models** (`src/foamagent/models.py`): `FoamPydantic`/`FoamfilePydantic` for generated files, `RewritePlan` for error fixes, `CaseSummaryModel` for case metadata.
 
 ### Design Patterns
 
-1. **Service-oriented**: Nodes in `src/nodes/` are thin orchestration wrappers. All logic lives in `src/services/`.
+1. **Service-oriented**: Nodes in `src/foamagent/nodes/` are thin orchestration wrappers. All logic lives in `src/foamagent/services/`.
 2. **Error correction loop**: Runner detects errors -> Reviewer diagnoses via LLM -> Input Writer rewrites targeted files -> re-run (up to `max_loop` iterations).
 3. **RAG retrieval**: FAISS indices built from OpenFOAM tutorials provide reference cases to the input writer.
 4. **Two generation modes** (`config.input_writer_generation_mode`):
@@ -104,20 +107,25 @@ docker/                # Dockerfile for containerized deployment
 | `FOAMAGENT_EMBEDDING_MODEL` | Embedding model (default: `Qwen/Qwen3-Embedding-0.6B`) |
 | `OPENAI_API_KEY` | Required for `openai` provider |
 | `ANTHROPIC_API_KEY` | Required for `anthropic` provider |
-| `WM_PROJECT_DIR` | OpenFOAM installation path (required at runtime) |
+| `WM_PROJECT_DIR` | OpenFOAM installation path (required for `native` runtime) |
+| `FOAMAGENT_OPENAI_BASE_URL` | OpenAI-compatible endpoint (OpenRouter, vLLM, LiteLLM, ...) |
+| `FOAMAGENT_OPENFOAM_RUNTIME` | `native` (default) or `docker` |
+| `FOAMAGENT_OPENFOAM_IMAGE` / `_BASHRC` | Image and bashrc path for the `docker` runtime |
+| `FOAMAGENT_ROOT` | Overrides where `database/` and `runs/` are looked up |
+| `FOAMAGENT_LOG_LEVEL` | Log verbosity (default `INFO`). Logs go to stderr |
 
 ## Common Tasks
 
 ### Adding a new LLM provider
-Extend `LLMService` in `src/utils.py`. Follow the pattern of existing providers (each has an `if` branch in the constructor).
+Extend `LLMService` in `src/foamagent/utils.py`. Follow the pattern of existing providers (each has an `if` branch in the constructor).
 
 ### Adding a new workflow node
-1. Create service logic in `src/services/`.
-2. Create a thin node wrapper in `src/nodes/`.
-3. Wire it into the StateGraph in `src/main.py`.
+1. Create service logic in `src/foamagent/services/`.
+2. Create a thin node wrapper in `src/foamagent/nodes/`.
+3. Wire it into the StateGraph in `src/foamagent/main.py`.
 
 ### Modifying file generation
-The input writer logic is in `src/services/input_writer.py`. It uses RAG context from FAISS indices and LLM calls to generate OpenFOAM configuration files.
+The input writer logic is in `src/foamagent/services/input_writer.py`. It uses RAG context from FAISS indices and LLM calls to generate OpenFOAM configuration files.
 
 ### Rebuilding FAISS indices
 Only needed if OpenFOAM tutorials change:

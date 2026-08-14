@@ -7,20 +7,15 @@ RUN apt-get update \
     && apt-get install -y \
         build-essential \
         wget \
-        python3 \
-        python3-pip \
-        libboost-all-dev \
         ca-certificates \
+        libboost-all-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Download and install Miniconda directly
-ENV CONDA_DIR=/opt/conda
-ENV PATH=$CONDA_DIR/bin:$PATH
-RUN wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/Miniconda3-latest-Linux-x86_64.sh \
-    && bash /tmp/Miniconda3-latest-Linux-x86_64.sh -b -p "$CONDA_DIR" \
-    && rm -f /tmp/Miniconda3-latest-Linux-x86_64.sh \
-    && ln -s "$CONDA_DIR/bin/conda" /usr/bin/conda \
-    && conda --version
+# uv manages both the Python toolchain and the virtual environment, so this image needs
+# neither a system Python nor conda.
+ENV UV_INSTALL_DIR=/usr/local/bin
+RUN wget -qO- https://astral.sh/uv/install.sh | sh \
+    && uv --version
 
 # Copy Foam-Agent from local directory (build context)
 ENV FoamAgent_PATH="/home/openfoam/Foam-Agent"
@@ -32,21 +27,14 @@ COPY . Foam-Agent
 # Switch to bash to source OpenFOAM environment
 SHELL ["/bin/bash", "-c"]
 
-# Create the Foam-Agent environment
+# Build the virtual environment at a fixed path so the runtime stage can copy it whole.
 WORKDIR $FoamAgent_PATH
-RUN conda config --add channels conda-forge && \
-    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main && \
-    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r && \
-    conda env create --file environment.yml --yes
-
-# Initialize conda for bash (automatic setup)
-RUN conda init bash && \
-    echo "conda activate FoamAgent" >> ~/.bashrc
-
-RUN conda clean --all --yes && \
-    rm -rf "$CONDA_DIR/pkgs" && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+ENV UV_PROJECT_ENVIRONMENT=/opt/foamagent-venv \
+    UV_PYTHON_INSTALL_DIR=/opt/uv-python \
+    UV_LINK_MODE=copy
+RUN uv sync --frozen --no-dev \
+        --extra rag-local --extra direct-api --extra viz --extra web --extra hpc \
+    && uv cache clean
 
 # --- Stage 2: Runtime ---
 FROM openfoam/openfoam10-paraview510:latest
@@ -64,22 +52,18 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Environment variables in a FoamAgent container
-ENV CONDA_DIR="/opt/conda"
-ENV PATH=$CONDA_DIR/bin:$PATH
 ENV FoamAgent_PATH="/home/openfoam/Foam-Agent"
+ENV VIRTUAL_ENV=/opt/foamagent-venv
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-# Copy Conda runtime and Foam-Agent from builder
-COPY --from=builder --chown=root:root $CONDA_DIR $CONDA_DIR
+# Copy the Python runtime, the virtual environment, and Foam-Agent from the builder
+COPY --from=builder --chown=root:root /opt/uv-python /opt/uv-python
+COPY --from=builder --chown=root:root /opt/foamagent-venv /opt/foamagent-venv
 COPY --from=builder --chown=root:root $FoamAgent_PATH $FoamAgent_PATH
-COPY --from=builder --chown=root:root /root/.bashrc /root/.bashrc
 
-# Ensure conda is properly initialized in .bashrc for interactive shells
 RUN echo '' >> /root/.bashrc && \
-    echo '# Auto-activate FoamAgent environment' >> /root/.bashrc && \
-    echo 'if [ -f "$CONDA_DIR/etc/profile.d/conda.sh" ]; then' >> /root/.bashrc && \
-    echo '    source "$CONDA_DIR/etc/profile.d/conda.sh"' >> /root/.bashrc && \
-    echo '    conda activate FoamAgent 2>/dev/null || true' >> /root/.bashrc && \
-    echo 'fi' >> /root/.bashrc && \
+    echo '# Foam-Agent virtual environment' >> /root/.bashrc && \
+    echo 'export PATH="/opt/foamagent-venv/bin:$PATH"' >> /root/.bashrc && \
     echo '' >> /root/.bashrc && \
     echo '# Auto-source OpenFOAM' >> /root/.bashrc && \
     echo 'if [ -f /opt/openfoam10/etc/bashrc ]; then' >> /root/.bashrc && \

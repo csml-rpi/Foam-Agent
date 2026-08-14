@@ -14,11 +14,8 @@ if [ -z "$WM_PROJECT_DIR" ] || ! command -v blockMesh >/dev/null 2>&1; then
     exit 1
 fi
 
-# Initialize conda
-source "$CONDA_DIR/etc/profile.d/conda.sh"
-
-# Activate FoamAgent environment
-conda activate FoamAgent
+# Put the pre-built virtual environment first on PATH
+export PATH="/opt/foamagent-venv/bin:$PATH"
 
 # Change to Foam-Agent directory
 cd "$FoamAgent_PATH"
@@ -72,13 +69,13 @@ if [ "${FOAMAGENT_SKIP_UPDATE:-0}" != "1" ]; then
             echo "[entrypoint] WARNING: Could not checkout $FOAMAGENT_VERSION" >&2
     fi
 
-    # If environment.yml changed, update conda env (best-effort)
-    if [ -d "$FoamAgent_PATH/.git" ]; then
-        # Compare bundled environment snapshot with current
-        if ! git diff --quiet HEAD@{1} -- environment.yml 2>/dev/null; then
-            echo "[entrypoint] environment.yml changed — updating conda env (this may take a while) ..."
-            conda env update --file environment.yml --prune 2>&1 | tail -5 || \
-                echo "[entrypoint] WARNING: conda env update failed. Some new dependencies may be missing." >&2
+    # If the dependency set changed, re-sync the virtual environment (best-effort)
+    if [ -d "$FoamAgent_PATH/.git" ] && command -v uv >/dev/null 2>&1; then
+        if ! git diff --quiet HEAD@{1} -- pyproject.toml uv.lock 2>/dev/null; then
+            echo "[entrypoint] Dependencies changed — re-syncing (this may take a while) ..."
+            UV_PROJECT_ENVIRONMENT=/opt/foamagent-venv uv sync --frozen --no-dev \
+                --extra rag-local --extra direct-api --extra viz --extra web --extra hpc 2>&1 | tail -5 || \
+                echo "[entrypoint] WARNING: uv sync failed. Some new dependencies may be missing." >&2
         fi
     fi
 else
@@ -92,7 +89,7 @@ echo "=========================================="
 echo "Foam-Agent Docker Container Ready!"
 echo "=========================================="
 echo "OpenFOAM: $WM_PROJECT_DIR"
-echo "Conda Env: FoamAgent (activated)"
+echo "Python:   $(command -v python)"
 echo "Working Dir: $FoamAgent_PATH"
 if [ -d "$FoamAgent_PATH/.git" ]; then
     echo "Git:        $(git log --oneline -1 2>/dev/null || echo 'unknown')"

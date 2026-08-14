@@ -22,31 +22,54 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
+# Core: what the package needs to be imported and to orchestrate a run. Everything that
+# pulls a model runtime, a vector store, a renderer, or a cloud SDK lives in an extra, so
+# that `pip install foamagent` does not drag in ~3GB of torch for a user who never embeds
+# anything locally. See src/foamagent/utils.py::_require for the failure message a missing
+# extra produces.
 dependencies = [
     "fastmcp>=2.0.0",
     "pydantic>=2.0",
     "langchain>=0.3",
     "langchain-core>=0.3",
-    "langchain-openai>=0.2",
-    "langchain-anthropic>=0.2",
-    "langchain-community>=0.3",
-    "langchain-huggingface>=0.1",
     "langgraph>=0.2",
-    "faiss-cpu>=1.7",
-    "openai>=1.0",
-    "anthropic>=0.20",
-    "uvicorn>=0.30",
-    "pyvista>=0.44",
+    "requests>=2.28",
+    "tiktoken>=0.7",
 ]
 
 [project.optional-dependencies]
+# Local retrieval: FAISS indices plus the embedding model that queries them.
+rag-local = [
+    "faiss-cpu>=1.7",
+    "langchain-community>=0.3",
+    "langchain-huggingface>=0.1",
+    "sentence-transformers>=3.0",
+    "torch>=2.0",
+]
+# Inference from inside this process. Deprecated in favour of harness-side inference;
+# see plan_docs/04-phase4-core-swap.md.
+direct-api = [
+    "langchain-openai>=0.2",
+    "langchain-anthropic>=0.2",
+    "openai>=1.0",
+    "anthropic>=0.20",
+]
+viz = ["pyvista>=0.44"]
+web = ["fastapi>=0.110", "uvicorn>=0.30"]
 hpc = ["boto3"]
 ollama = ["langchain-ollama>=0.3", "ollama>=0.4"]
 bedrock = ["langchain-aws>=0.2", "boto3"]
-all = ["foamagent[hpc,ollama,bedrock]"]
+all = ["foamagent[rag-local,direct-api,viz,web,hpc,ollama,bedrock]"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+]
 
 [project.scripts]
-foamagent-mcp = "src.mcp.cli:main"
+foamagent-mcp = "foamagent.mcp.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/csml-rpi/Foam-Agent"
@@ -54,13 +77,43 @@ Repository = "https://github.com/csml-rpi/Foam-Agent"
 Issues = "https://github.com/csml-rpi/Foam-Agent/issues"
 
 [tool.setuptools.packages.find]
-include = ["src", "src.*"]
-namespaces = true
+where = ["src"]
+include = ["foamagent", "foamagent.*"]
 
 [tool.setuptools.package-data]
-"*" = ["*.json", "*.md"]
+"foamagent" = ["*.txt"]
+"foamagent.translation" = ["*.json"]
+
+# torch's default wheels carry CUDA and are several GB. Nothing here needs a GPU, so pin
+# the CPU build; drop this if GPU embedding ever becomes a supported configuration.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
 markers = [
-    "integration: tests that read the full RAG tutorial database",
+    "integration: tests that need the full RAG tutorial database (Git LFS contents)",
 ]
+
+[tool.ruff]
+line-length = 120
+src = ["src"]
+
+[tool.ruff.lint]
+# Deliberately narrow: catch real errors and keep stdout clean for the MCP stdio
+# transport. Formatting is not enforced, to keep diffs reviewable.
+select = ["E9", "F63", "F7", "F82", "T201"]
+
+[tool.ruff.lint.per-file-ignores]
+# Standalone tools and data-preparation scripts report to a person on stdout. The stdout
+# ban exists to protect the MCP stdio channel, which none of these ever speak.
+"scripts/**" = ["T201"]
+"database/**" = ["T201"]
+"foambench_main.py" = ["T201"]
+"init_database.py" = ["T201"]
+"app.py" = ["T201"]
