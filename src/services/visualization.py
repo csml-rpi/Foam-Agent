@@ -1,7 +1,8 @@
 import os
 import sys
 import subprocess
-from typing import List, Tuple, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 from utils import save_file
 from . import global_llm_service
 
@@ -33,7 +34,7 @@ def ensure_foam_file(case_dir: str) -> str:
     
     # Create or update the .foam file
     if not os.path.exists(foam_path):
-        with open(foam_path, 'w') as f:
+        with open(foam_path, "w", encoding="utf-8"):
             pass
     else:
         # Update timestamp if file exists
@@ -46,7 +47,10 @@ def generate_pyvista_script(
     case_dir: str,
     foam_file: str,
     user_requirement: str,
-    previous_errors: List[str]
+    previous_errors: List[str],
+    *,
+    output_png: str = "visualization.png",
+    llm_service: Optional[Any] = None,
 ) -> str:
     """
     Generate PyVista visualization script for OpenFOAM case using LLM.
@@ -84,10 +88,12 @@ def generate_pyvista_script(
     prompt = (
         f"<case_directory>{case_dir}</case_directory>\n"
         f"<foam_file>{foam_file}</foam_file>\n"
+        f"<required_output_png>{output_png}</required_output_png>\n"
         f"<visualization_requirements>{user_requirement}</visualization_requirements>\n"
         f"<previous_errors>{previous_errors}</previous_errors>\n"
     )
-    return global_llm_service.invoke(prompt, system_prompt)
+    llm_client = llm_service if llm_service is not None else global_llm_service
+    return llm_client.invoke(prompt, system_prompt)
 
 
 def run_pyvista_script(
@@ -108,10 +114,39 @@ def run_pyvista_script(
     script_path = os.path.join(case_dir, filename)
     save_file(script_path, script)
 
-    expected_png_abs = os.path.abspath(os.path.join(case_dir, expected_png)) if expected_png else None
+    expected_png_abs = None
+    if expected_png:
+        case_root = Path(case_dir).resolve()
+        requested_path = case_root / expected_png
+        expected_path = requested_path.resolve()
+        try:
+            expected_path.relative_to(case_root)
+        except ValueError:
+            return False, "", [
+                "Expected visualization artifact must remain inside the case directory",
+                f"expected_png={expected_png}",
+            ]
+        if requested_path.is_symlink():
+            return False, "", [
+                "Expected visualization artifact must not be a symbolic link",
+                f"expected_png={requested_path}",
+            ]
+        if expected_path.exists():
+            if expected_path.is_dir():
+                return False, "", [
+                    "Expected visualization artifact is an existing directory",
+                    f"expected_png={expected_path}",
+                ]
+            if not expected_path.is_file():
+                return False, "", [
+                    "Expected visualization artifact is not a regular file",
+                    f"expected_png={expected_path}",
+                ]
+            expected_path.unlink()
+        expected_png_abs = str(expected_path)
 
     try:
-        completed = subprocess.run(
+        subprocess.run(
             [sys.executable, script_path],
             cwd=case_dir,
             check=True,
@@ -121,7 +156,11 @@ def run_pyvista_script(
         )
 
         if expected_png_abs:
-            if os.path.exists(expected_png_abs) and os.path.getsize(expected_png_abs) > 0:
+            if (
+                os.path.isfile(expected_png_abs)
+                and not os.path.islink(expected_png_abs)
+                and os.path.getsize(expected_png_abs) > 0
+            ):
                 return True, expected_png_abs, []
             return False, "", [
                 "Visualization script executed but expected PNG was not created",
@@ -155,20 +194,29 @@ def run_pyvista_script(
     except FileNotFoundError:
         return False, "", [f"Python interpreter not found: {sys.executable}"]
 
-    except Exception as e:
-        return False, "", [f"Unexpected error running visualization script: {str(e)}"]
+    except OSError as e:
+        return False, "", [f"Unable to run visualization script: {e}"]
 
 
-def fix_pyvista_script(foam_file: str, original_script: str, error_logs: List[str]) -> str:
+def fix_pyvista_script(
+    foam_file: str,
+    original_script: str,
+    error_logs: List[str],
+    *,
+    output_png: str = "visualization.png",
+    llm_service: Optional[Any] = None,
+) -> str:
     system_prompt = (
         "You are an expert in PyVista visualization. Fix the provided script to load the .foam file, render geometry, and save a PNG with colorbar. Return ONLY Python code."
     )
     prompt = (
         f"<error_logs>{error_logs}</error_logs>\n"
         f"<foam_file>{foam_file}</foam_file>\n"
+        f"<required_output_png>{output_png}</required_output_png>\n"
         f"<original_script>{original_script}</original_script>\n"
     )
-    return global_llm_service.invoke(prompt, system_prompt)
+    llm_client = llm_service if llm_service is not None else global_llm_service
+    return llm_client.invoke(prompt, system_prompt)
 
 
 def generate_deterministic_pyvista_script(
@@ -198,11 +246,14 @@ try:
 except Exception:
     pass
 
-try:
-    pv.start_xvfb()
-except Exception:
-    # start_xvfb is optional and may be unavailable
-    pass
+if not os.environ.get('DISPLAY'):
+    try:
+        pv.start_xvfb()
+    except Exception as exc:
+        raise RuntimeError(
+            'Headless visualization requires Xvfb (or a preconfigured DISPLAY). '
+            'Install Xvfb in the runtime image or set DISPLAY explicitly.'
+        ) from exc
 
 foam_path = os.path.abspath({foam_file!r})
 out_png = os.path.abspath({output_png!r})
@@ -265,7 +316,9 @@ else:
     plotter.add_mesh(mesh, color='lightgray')
 
 plotter.view_isometric()
-plotter.show(auto_close=False)
+# ``show()`` can enter an interactive event loop even when off-screen mode is
+# requested (notably in containerized VTK builds). ``screenshot`` renders the
+# scene itself, so skipping ``show`` keeps this generated script batch-safe.
 plotter.screenshot(out_png)
 plotter.close()
 
@@ -273,3 +326,186 @@ print('Wrote', out_png)
 """
 
 
+def _visualization_success(
+    *,
+    case_dir: str,
+    field_name: str,
+    output_image: str,
+    script: str,
+    strategy: str,
+) -> Dict[str, Any]:
+    """Build the stable workflow payload for a successful visualization."""
+    return {
+        "plot_configs": [
+            {
+                "plot_type": "pyvista",
+                "field_name": field_name,
+                "time_step": "latest",
+                "output_format": "png",
+                "output_path": output_image,
+            }
+        ],
+        "plot_outputs": [output_image],
+        "visualization_summary": {
+            "total_plots_generated": 1,
+            "plot_types": ["pyvista"],
+            "fields_visualized": [field_name],
+            "output_directory": case_dir,
+            "pyvista_success": True,
+            "used": strategy,
+        },
+        "pyvista_visualization": {
+            "success": True,
+            "output_image": output_image,
+            "script": script,
+            "used": strategy,
+        },
+    }
+
+
+def _visualization_failure(
+    *,
+    case_dir: str | None,
+    error_message: str,
+    error_logs: List[str] | None = None,
+) -> Dict[str, Any]:
+    """Build the stable workflow payload for a failed visualization."""
+    logs = error_logs or []
+    summary: Dict[str, Any] = {
+        "total_plots_generated": 0,
+        "plot_types": [],
+        "fields_visualized": [],
+        "output_directory": case_dir,
+        "pyvista_success": False,
+        "error": error_message,
+    }
+    visualization: Dict[str, Any] = {"success": False, "error": error_message}
+    if logs:
+        summary["error_logs"] = logs
+        visualization["error_logs"] = logs
+    return {
+        "plot_configs": [],
+        "plot_outputs": [],
+        "visualization_summary": summary,
+        "pyvista_visualization": visualization,
+    }
+
+
+def visualize_case(
+    case_dir: str | None,
+    user_requirement: str,
+    *,
+    max_loop: int = 2,
+    llm_service: Optional[Any] = None,
+    timeout_s: int = 180,
+    allow_llm_fallback: bool = True,
+) -> Dict[str, Any]:
+    """Render a case, optionally falling back from deterministic rendering to LLM repair.
+
+    This owns visualization execution and its stable result contract, leaving the
+    LangGraph node as an adapter.  A generated image is accepted only when it is
+    written at the declared path by :func:`run_pyvista_script`.
+    """
+    if not case_dir:
+        return _visualization_failure(case_dir=None, error_message="Missing case_dir")
+
+    case_dir = os.path.abspath(case_dir)
+    if not os.path.isdir(case_dir):
+        return _visualization_failure(
+            case_dir=case_dir,
+            error_message=f"Case directory does not exist: {case_dir}",
+        )
+
+    foam_file = ensure_foam_file(case_dir)
+    output_png = "visualization.png"
+    field_name = "U"
+    error_logs: List[str] = []
+
+    deterministic_script = generate_deterministic_pyvista_script(
+        foam_file=foam_file,
+        output_png=output_png,
+        field_preference=field_name,
+    )
+    success, output_image, errors = run_pyvista_script(
+        case_dir,
+        deterministic_script,
+        filename="visualization.py",
+        expected_png=output_png,
+        timeout_s=timeout_s,
+    )
+    if success and output_image:
+        return _visualization_success(
+            case_dir=case_dir,
+            field_name=field_name,
+            output_image=output_image,
+            script=deterministic_script,
+            strategy="deterministic_template",
+        )
+    error_logs.extend(errors)
+
+    if not allow_llm_fallback:
+        return _visualization_failure(
+            case_dir=case_dir,
+            error_message="Deterministic visualization failed and LLM fallback is disabled.",
+            error_logs=error_logs,
+        )
+
+    for attempt in range(1, max_loop + 1):
+        print(f"LLM visualization attempt {attempt} of {max_loop}")
+        generated_script = generate_pyvista_script(
+            case_dir,
+            foam_file,
+            user_requirement,
+            error_logs[-2:],
+            output_png=output_png,
+            llm_service=llm_service,
+        )
+        success, output_image, errors = run_pyvista_script(
+            case_dir,
+            generated_script,
+            filename="visualization_llm.py",
+            expected_png=output_png,
+            timeout_s=timeout_s,
+        )
+        if success and output_image:
+            return _visualization_success(
+                case_dir=case_dir,
+                field_name=field_name,
+                output_image=output_image,
+                script=generated_script,
+                strategy="llm_script",
+            )
+        error_logs.extend(errors)
+
+        if attempt == max_loop:
+            continue
+
+        fixed_script = fix_pyvista_script(
+            foam_file,
+            generated_script,
+            error_logs[-2:],
+            output_png=output_png,
+            llm_service=llm_service,
+        )
+        success, output_image, errors = run_pyvista_script(
+            case_dir,
+            fixed_script,
+            filename="visualization_fixed.py",
+            expected_png=output_png,
+            timeout_s=timeout_s,
+        )
+        if success and output_image:
+            return _visualization_success(
+                case_dir=case_dir,
+                field_name=field_name,
+                output_image=output_image,
+                script=fixed_script,
+                strategy="llm_fixed_script",
+            )
+        error_logs.extend(errors)
+
+    return _visualization_failure(
+        case_dir=case_dir,
+        error_message=f"Visualization failed after {max_loop} LLM attempts",
+        error_logs=error_logs,
+    )

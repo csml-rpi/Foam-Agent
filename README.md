@@ -54,6 +54,44 @@ python foambench_main.py --output ./output --prompt_path ./user_requirement.txt
 
 That's it. Foam-Agent will plan the case, generate all OpenFOAM files, run the simulation, and fix errors automatically.
 
+### 4. Run an Existing Case
+
+An existing case can be supplied instead of a natural-language prompt. This
+mode does not invoke Planner, Meshing, or Input Writer. Instead it enters the
+workflow's protected existing-case branch (`case_import` → shared local runner
+with a controlled-import policy → shared reviewer with a deterministic
+safe-repair policy), preserving the uploaded dictionaries and running a
+validated, controlled equivalent of its `Allrun`.
+
+```bash
+python foambench_main.py \
+  --output ./imported-dam-break \
+  --case_path /path/to/damBreak \
+  --visualize
+```
+
+`--visualize` is optional. When supplied, a successful imported case uses the
+same read-only PyVista visualization node as a prompt-generated case.
+
+`--case_path` accepts either a case directory or a ZIP archive. If an archive
+contains multiple cases, select one explicitly:
+
+```bash
+python foambench_main.py \
+  --output ./imported-case \
+  --case_path ./tutorials.zip \
+  --case_subdir multiphase/interFoam/laminar/damBreak/damBreak
+```
+
+The output directory contains `original/` (a hashed source copy with read-only files),
+`work/` (the only directory executed or repaired), and `report/` (the manifest,
+attempt history, and any diffs). User-provided numeric tokens are never changed
+automatically. The importer only permits a small set of Foundation v10
+utilities/solver commands; custom compilation, dynamic code, ESI cases, and
+unsafe shell setup are reported as blockers rather than executed. If `Allrun`
+is absent, Foam-Agent can infer only the minimal `blockMesh`/`checkMesh`/solver
+plan for a case that already provides enough files.
+
 ## Configuration
 
 All settings live in `src/config.py` with sensible defaults. Every setting can be overridden via environment variables — no need to edit files, especially useful for Docker and CI.
@@ -63,7 +101,7 @@ All settings live in `src/config.py` with sensible defaults. Every setting can b
 | Environment Variable | Purpose | Allowed Values |
 |---|---|---|
 | `FOAMAGENT_MODEL_PROVIDER` | LLM backend | `openai`, `openai-codex`, `anthropic`, `bedrock`, `ollama` |
-| `FOAMAGENT_MODEL_VERSION` | Model identifier | e.g., `gpt-5-mini`, `gpt-5.3-codex`, `claude-opus-4-6` |
+| `FOAMAGENT_MODEL_VERSION` | Model identifier | e.g., `gpt-5-mini`, `gpt-5.6-terra`, `claude-opus-4-6` |
 
 Example:
 ```bash
@@ -229,7 +267,7 @@ If you have a ChatGPT/Codex subscription, you can authenticate via OAuth instead
 ```bash
 docker run -it \
   -e FOAMAGENT_MODEL_PROVIDER=openai-codex \
-  -e FOAMAGENT_MODEL_VERSION=gpt-5.3-codex \
+  -e FOAMAGENT_MODEL_VERSION=gpt-5.6-terra \
   -v ~/.codex/auth.json:/root/.codex/auth.json:ro \
   -p 7860:7860 \
   leoyue123/foamagent

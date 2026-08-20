@@ -7,14 +7,13 @@ exposing OpenFOAM simulation capabilities through clean, well-typed interfaces.
 import asyncio
 import os
 import json
-from typing import Dict, List, Optional, Any
+from typing import Dict, List
 
 from fastmcp import FastMCP, Context
 from pydantic import BaseModel, Field
 
 # Import existing services
 import sys
-import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from services.plan import (
@@ -28,12 +27,8 @@ from services.run_local import run_allrun_and_collect_errors
 from utils import FoamPydantic, read_case_foamfiles, scan_case_directory
 from services.review import review_error_logs
 from translation.esi_translator import convert_case_to_esi_if_needed
-from services.visualization import (
-    ensure_foam_file,
-    generate_pyvista_script,
-    run_pyvista_script,
-    fix_pyvista_script
-)
+from services.visualization import visualize_case
+from services.output_safety import prepare_output_directory
 from config import Config
 
 
@@ -133,6 +128,10 @@ class GenerateFilesRequest(BaseModel):
     case_solver: str = Field(description="OpenFOAM solver to use")
     case_domain: str = Field(description="Simulation domain")
     case_category: str = Field(description="Case category")
+    overwrite_output: bool = Field(
+        default=False,
+        description="Allow replacing an existing Foam-Agent-owned output directory.",
+    )
 
 
 class GenerateFilesResponse(BaseModel):
@@ -163,6 +162,7 @@ async def input_writer(
             case_dir="",
             run_times=global_config.run_times
         )
+        prepare_output_directory(case_dir, overwrite=request.overwrite_output)
 
         await ctx.info(f"Case directory: {case_dir}")
 
@@ -582,27 +582,18 @@ async def visualization(
         if not os.path.exists(request.case_dir):
             raise ValueError(f"Case directory does not exist: {request.case_dir}")
         
-        # Ensure foam file exists
-        foam_file = ensure_foam_file(request.case_dir)
-        
-        # Generate visualization script
-        script = generate_pyvista_script(
-            case_dir=request.case_dir,
-            foam_file=foam_file,
-            user_requirement=request.quantity,
-            previous_errors=[]
+        result = await asyncio.to_thread(
+            visualize_case,
+            request.case_dir,
+            request.quantity,
+            max_loop=max(1, min(global_config.max_loop, 2)),
+            timeout_s=max(1, min(global_config.max_time_limit, 180)),
         )
-        
-        # Run visualization script
-        ok, img, errs = run_pyvista_script(request.case_dir, script)
-        
-        if ok and img:
-            artifacts = [img]
-        else:
-            # Try to fix the script
-            fixed = fix_pyvista_script(foam_file, script, errs)
-            ok2, img2, errs2 = run_pyvista_script(request.case_dir, fixed)
-            artifacts = [img2] if ok2 and img2 else []
+        visualization_result = result["pyvista_visualization"]
+        if not visualization_result["success"]:
+            raise RuntimeError(visualization_result["error"])
+        artifacts = result["plot_outputs"]
+        script = visualization_result["script"]
         
         await ctx.info(f"Generated {len(artifacts)} visualization artifact(s)")
         

@@ -1,39 +1,8 @@
-# input_writer_node.py
-import os
-from utils import save_file, parse_context, retrieve_faiss, FoamPydantic, FoamfilePydantic, read_case_foamfiles, scan_case_directory
+"""Thin LangGraph adapter for OpenFOAM input generation and rewriting."""
+
+from utils import read_case_foamfiles, scan_case_directory
 from services.input_writer import initial_write, build_allrun, rewrite_files
 from translation.esi_translator import convert_case_to_esi_if_needed
-import re
-from typing import List
-from pydantic import BaseModel, Field
-
-# System prompts for different modes
-INITIAL_WRITE_SYSTEM_PROMPT = (
-    "You are an expert in OpenFOAM simulation and numerical modeling."
-    f"Your task is to generate a complete and functional file named: <file_name>{{file_name}}</file_name> within the <folder_name>{{folder_name}}</folder_name> directory. "
-    "Ensure all required values are present and match with the files content already generated."
-    "Before finalizing the output, ensure:\n"
-    "- All necessary fields exist (e.g., if `nu` is defined in `constant/transportProperties`, it must be used correctly in `0/U`).\n"
-    "- Cross-check field names between different files to avoid mismatches.\n"
-    "- Ensure units and dimensions are correct** for all physical variables.\n"
-    f"- Ensure case solver settings are consistent with the user's requirements. Available solvers are: {{case_solver}}.\n"
-    "Provide only the code—no explanations, comments, or additional text."
-)
-        
-
-def parse_allrun(text: str) -> str:
-    match = re.search(r'```(.*?)```', text, re.DOTALL)
-    
-    return match.group(1).strip() 
-
-def retrieve_commands(command_path) -> str:
-    with open(command_path, 'r') as file:
-        commands = file.readlines()
-    
-    return f"[{', '.join([command.strip() for command in commands])}]"
-    
-class CommandsPydantic(BaseModel):
-    commands: List[str] = Field(description="List of commands")
 
 def input_writer_node(state):
     """
@@ -65,6 +34,9 @@ def _rewrite_mode(state):
         user_requirement=state.get("user_requirement", ""),
         foamfiles=state.get("foamfiles"),
         dir_structure=state.get("dir_structure", {}),
+        openfoam_fork=getattr(state["config"], "openfoam_fork", "foundation"),
+        case_solver=state.get("case_solver", ""),
+        llm_service=state.get("llm_service"),
     )
     print("</input_writer>")
     
@@ -88,10 +60,13 @@ def _initial_write_mode(state):
         subtasks=state["subtasks"],
         user_requirement=state["user_requirement"],
         tutorial_reference=state["tutorial_reference"],
-        case_solver=state['case_stats']['case_solver'],
+        case_solver=state["case_solver"],
+        openfoam_fork=getattr(config, "openfoam_fork", "foundation"),
         generation_mode=getattr(config, "input_writer_generation_mode", "sequential_dependency"),
         similar_case_advice=state.get("similar_case_advice"),
         reuse_generated_dir=getattr(config, "reuse_generated_dir", ""),
+        llm_service=state.get("llm_service"),
+        config=config,
     )
 
     dir_structure = write_out["dir_structure"]
@@ -109,6 +84,9 @@ def _initial_write_mode(state):
         allrun_reference=state["allrun_reference"],
         mesh_type=mesh_type,
         mesh_commands=mesh_commands,
+        user_requirement=state["user_requirement"],
+        llm_service=state.get("llm_service"),
+        config=config,
     )
 
     print("</input_writer>")
@@ -121,7 +99,6 @@ def _initial_write_mode(state):
 
     return {
         "dir_structure": dir_structure,
-        "commands": [],
+        "commands": allrun_out["commands"],
         "foamfiles": foamfiles,
     }
-
