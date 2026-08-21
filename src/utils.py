@@ -9,13 +9,14 @@ from langchain.chat_models import init_chat_model
 from langchain_community.vectorstores import FAISS
 from langchain_openai.embeddings import OpenAIEmbeddings
 import tiktoken
-from langchain_aws import ChatBedrock, ChatBedrockConverse
+from langchain_aws import ChatBedrockConverse
 from langchain_anthropic import ChatAnthropic
 from pathlib import Path
 import tracking_aws
 import requests
 import time
 import random
+import threading
 from botocore.exceptions import ClientError
 import shutil
 from config import Config
@@ -26,8 +27,29 @@ except ImportError:
     HuggingFaceEmbeddings = None
 
 
-# Global dictionary to store loaded FAISS databases
-FAISS_DB_CACHE = {}
+FAISSCacheKey = tuple[str, str, str]
+
+# Cache FAISS indices by their full retrieval configuration.  A process can
+# serve more than one workflow (notably through MCP), so a single global index
+# set would otherwise mix embeddings or tutorial corpora from unrelated
+# Config instances.
+FAISS_DB_CACHE: Dict[FAISSCacheKey, Dict[str, Any]] = {}
+_FAISS_DB_CACHE_LOCK = threading.RLock()
+
+
+def _configured_database_path(config: Config) -> Path:
+    """Resolve the configured database root without silently using the repo one."""
+    configured_path = getattr(config, "database_path", None)
+    if not configured_path:
+        configured_path = Path(__file__).resolve().parent.parent / "database"
+    return Path(configured_path).expanduser().resolve()
+
+
+def _faiss_cache_key(config: Config) -> FAISSCacheKey:
+    """Return the cache identity for one embedding/index configuration."""
+    provider = str(getattr(config, "embedding_provider", "openai") or "openai").casefold()
+    model = str(getattr(config, "embedding_model", "") or "")
+    return (str(_configured_database_path(config)), provider, model)
 
 def get_embedding_model(config: Optional[Config] = None):
     """Return an embedding model based on the provided config.
@@ -59,7 +81,7 @@ def load_faiss_dbs(config: Optional[Config] = None):
     cfg = config or Config()
     embedding_model = get_embedding_model(cfg)
 
-    base_dir = Path(__file__).resolve().parent.parent / "database" / "faiss"
+    base_dir = _configured_database_path(cfg) / "faiss"
 
     # Sanitize model name for directory usage
     model_dir_name = (cfg.embedding_model or "").replace("/", "_").replace(":", "_")
@@ -82,7 +104,7 @@ def load_faiss_dbs(config: Optional[Config] = None):
                 dbs[index] = FAISS.load_local(
                     str(index_path), embedding_model, allow_dangerous_deserialization=True
                 )
-            except Exception as e:
+            except (OSError, RuntimeError, ValueError) as e:
                 print(f"Failed to load index {index}: {e}")
         else:
             print(f"Warning: Index path does not exist: {index_path}")
@@ -90,9 +112,21 @@ def load_faiss_dbs(config: Optional[Config] = None):
     return dbs
 
 
-# Default DB cache (uses default Config()). If you change embedding settings at runtime,
-# call load_faiss_dbs(custom_config) and replace FAISS_DB_CACHE.
-FAISS_DB_CACHE = load_faiss_dbs()
+# The embedding model can be large and may require a network/cache lookup.
+# Defer it until a workflow actually performs retrieval; importing a service
+# that does not use RAG (for example preflight validation) must stay local and
+# deterministic.
+def _ensure_faiss_dbs_loaded(config: Optional[Config] = None) -> Dict[str, Any]:
+    """Load and return the index set matching ``config`` exactly once."""
+    cfg = config or Config()
+    cache_key = _faiss_cache_key(cfg)
+    with _FAISS_DB_CACHE_LOCK:
+        # An empty mapping is also a cached result: repeatedly attempting to
+        # load a missing index set is expensive and obscures the original
+        # configuration error.
+        if cache_key not in FAISS_DB_CACHE:
+            FAISS_DB_CACHE[cache_key] = load_faiss_dbs(cfg)
+        return FAISS_DB_CACHE[cache_key]
 
 class FoamfilePydantic(BaseModel):
     file_name: str = Field(description="Name of the OpenFOAM input file")
@@ -147,7 +181,7 @@ class _CodexResponsesWrapper:
         # We default to a modern tokenizer; adjust if you need model-specific counting.
         try:
             self._enc = tiktoken.get_encoding("o200k_base")
-        except Exception:
+        except (KeyError, ValueError):
             self._enc = tiktoken.get_encoding("cl100k_base")
 
     def get_num_tokens(self, text: str) -> int:
@@ -271,8 +305,7 @@ class _CodexResponsesWrapper:
                 break
             yield data
 
-    def invoke(self, messages):
-        url = f"{self._base_url}/responses"
+    def _response_headers(self) -> dict[str, str]:
         headers = {
             "Authorization": f"Bearer {self._token}",
             "Content-Type": "application/json",
@@ -281,66 +314,65 @@ class _CodexResponsesWrapper:
         }
         if self._account_id:
             headers["ChatGPT-Account-Id"] = self._account_id
+        return headers
 
+    def _post_responses_request(self, messages) -> requests.Response:
+        """Send one Responses request and preserve useful HTTP failure detail."""
+        url = f"{self._base_url}/responses"
         payload = self._build_payload(messages)
-
-        # ChatGPT Codex backend can take 60-180s on complex prompts when
-        # reasoning.summary=auto is enabled — the model spends time on the
-        # reasoning trace before emitting tokens. The previous hardcoded 60s
-        # was too tight: prompts with non-trivial BC topology (e.g. a 2-inlet
-        # elbow channel) deterministically exceeded it on gpt-5.5, raising
-        # `HTTPSConnectionPool ... Read timed out. (read timeout=60)` and
-        # failing the workflow. Allow operator override via env var.
         timeout = int(os.environ.get("FOAMAGENT_HTTP_TIMEOUT", "300"))
-        r = requests.post(url, headers=headers, json=payload, timeout=timeout, stream=bool(self._stream))
-
-        # If we get an error, surface the response body to aid debugging.
-        if not r.ok:
+        response = requests.post(
+            url,
+            headers=self._response_headers(),
+            json=payload,
+            timeout=timeout,
+            stream=bool(self._stream),
+        )
+        if not response.ok:
             try:
-                detail = r.text[:2000]
-            except Exception:
+                detail = response.text[:2000]
+            except requests.RequestException:
                 detail = ""
             raise requests.HTTPError(
-                f"HTTP {r.status_code} for {url}. Body: {detail}", response=r
+                f"HTTP {response.status_code} for {url}. Body: {detail}",
+                response=response,
             )
+        return response
 
-        if not self._stream:
-            data = r.json()
-            return self._Resp(self._extract_output_text(data))
-
-        # Streaming: accumulate text deltas.
+    def _stream_output_text(self, response: requests.Response) -> str:
+        """Accumulate supported Responses SSE text events with a safe fallback."""
         import json
 
         chunks: list[str] = []
-        for s in self._iter_sse_text(r):
+        for text in self._iter_sse_text(response):
             try:
-                j = json.loads(s)
-            except Exception:
+                event = json.loads(text)
+            except json.JSONDecodeError:
                 continue
-
-            # Codex backend streams OpenAI Responses-style events.
-            if isinstance(j, dict):
-                t = j.get("type")
-                if t == "response.output_text.delta" and isinstance(j.get("delta"), str):
-                    chunks.append(j["delta"])
+            if isinstance(event, dict):
+                event_type = event.get("type")
+                if event_type == "response.output_text.delta" and isinstance(event.get("delta"), str):
+                    chunks.append(event["delta"])
                     continue
-                if t == "response.output_text.done" and isinstance(j.get("text"), str):
-                    # Some clients rely on done; we already collected deltas but keep as fallback.
+                if event_type == "response.output_text.done" and isinstance(event.get("text"), str):
                     if not chunks:
-                        chunks.append(j["text"])
+                        chunks.append(event["text"])
                     continue
+            fallback = self._extract_output_text(event)
+            if fallback:
+                chunks.append(fallback)
+        return "".join(chunks).strip()
 
-            # Fallback: try generic extraction.
-            t2 = self._extract_output_text(j)
-            if t2:
-                chunks.append(t2)
-
-        return self._Resp("".join(chunks).strip())
+    def invoke(self, messages):
+        response = self._post_responses_request(messages)
+        if self._stream:
+            return self._Resp(self._stream_output_text(response))
+        return self._Resp(self._extract_output_text(response.json()))
 
 
 class LLMService:
     @staticmethod
-    def _load_codex_access_token_from_auth_json(auth_json_path: Path) -> str:
+    def _load_codex_oauth_from_auth_json(auth_json_path: Path) -> tuple[str, Optional[str]]:
         import json
 
         data = json.loads(auth_json_path.read_text(encoding="utf-8"))
@@ -349,9 +381,11 @@ class LLMService:
         # Common patterns we try:
         #   {"access_token": "..."}
         #   {"token": "..."}
+        #   {"tokens": {"access_token": "...", "account_id": "..."}}
         #   {"auth": {"access_token": "..."}}
         #   {"credentials": {"access_token": "..."}}
         candidates = []
+        account_id = None
 
         def maybe_add(v):
             if isinstance(v, str) and v.strip():
@@ -367,14 +401,21 @@ class LLMService:
                     maybe_add(v.get("access_token"))
                     maybe_add(v.get("token"))
 
+            tokens = data.get("tokens")
+            if isinstance(tokens, dict):
+                maybe_add(tokens.get("access_token"))
+                maybe_add(tokens.get("token"))
+                if isinstance(tokens.get("account_id"), str) and tokens["account_id"].strip():
+                    account_id = tokens["account_id"].strip()
+
         if not candidates:
             raise ValueError(
                 f"Could not find an access token in {auth_json_path}. "
-                "Expected keys like access_token/token/id_token."
+                "Expected keys like access_token/token or tokens.access_token."
             )
 
         # Prefer access_token-like strings first (we already appended in that order)
-        return candidates[0]
+        return candidates[0], account_id
 
     @staticmethod
     def _load_codex_oauth_from_clawdbot_auth_profiles(auth_profiles_path: Path) -> tuple[str, Optional[str]]:
@@ -451,18 +492,21 @@ class LLMService:
 
             # Codex CLI cache
             if p.name == "auth.json":
-                return self._load_codex_access_token_from_auth_json(p), None
+                return self._load_codex_oauth_from_auth_json(p)
 
             # Clawdbot cache
             if p.name == "auth-profiles.json":
                 return self._load_codex_oauth_from_clawdbot_auth_profiles(p)
 
         raise FileNotFoundError(
-            "Could not find a Codex/ChatGPT OAuth cache. Looked for: "
+            "model_provider='openai-codex' requires a Codex/ChatGPT OAuth cache. "
+            "Looked for: "
             + ", ".join(str(x) for x in candidates)
             + ". "
             "If you used the Codex CLI, run `codex login` and ensure file-based credential storage. "
-            "If you used Clawdbot, make sure you completed OpenAI Codex OAuth in onboarding."
+            "If you used Clawdbot, make sure you completed OpenAI Codex OAuth in onboarding. "
+            "To use an OpenAI Platform API key instead, set "
+            "FOAMAGENT_MODEL_PROVIDER=openai along with OPENAI_API_KEY."
         )
 
     def __init__(self, config: object):
@@ -510,7 +554,7 @@ class LLMService:
             instructions_path = Path(__file__).resolve().parent / "codex_instructions_default.txt"
             try:
                 instructions = instructions_path.read_text(encoding="utf-8")
-            except Exception:
+            except OSError:
                 instructions = "You are Codex, based on GPT-5. You are running as a coding agent in the Codex CLI on a user's computer."
 
             self.llm = _CodexResponsesWrapper(
@@ -524,7 +568,7 @@ class LLMService:
             )
         elif self.model_provider.lower() == "ollama":
             try:
-                response = requests.get("http://localhost:11434/api/version", timeout=2)
+                requests.get("http://localhost:11434/api/version", timeout=2)
                 # If request successful, service is running
             except requests.exceptions.RequestException:
                 print("Ollama is not running, starting it...")
@@ -618,6 +662,166 @@ class LLMService:
         
         return retry_count
 
+    @staticmethod
+    def _is_retryable_transport_error(error: Exception) -> bool:
+        """Recognise short-lived network failures from an LLM provider.
+
+        Only connection, timeout, TLS and proxy transport errors are retried.
+        HTTP response errors (for example authentication or invalid-request
+        errors) are deliberately left to the caller because retrying them
+        cannot make a malformed request valid.
+        """
+        return isinstance(
+            error,
+            (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.SSLError,
+            ),
+        )
+
+    def _handle_transport_retry(
+        self,
+        error: Exception,
+        retry_count: int,
+        max_retries: int,
+    ) -> Optional[int]:
+        """Retry a transient LLM transport error with bounded backoff."""
+        retry_count += 1
+        self.retry_count += 1
+        if retry_count > max_retries:
+            print(f"Maximum transport retries ({max_retries}) exceeded: {error}")
+            return None
+
+        delay = min(8.0, 1.0 * (2 ** (retry_count - 1)))
+        print(
+            "Transient LLM transport error; retrying in "
+            f"{delay:.1f} seconds (attempt {retry_count}/{max_retries}): {error}"
+        )
+        time.sleep(delay)
+        return retry_count
+
+    @staticmethod
+    def _is_retryable_structured_response_error(error: Exception) -> bool:
+        """Recognise transient empty/truncated structured-output responses.
+
+        This deliberately does not retry arbitrary Pydantic validation errors:
+        those usually indicate that the prompt or schema needs a real repair.
+        It covers only the two failures emitted by the local structured-output
+        wrapper before any JSON has been received.
+        """
+        message = str(error).casefold()
+        return (
+            "empty response; expected json" in message
+            or "could not find a json object in response" in message
+        )
+
+    def _handle_structured_response_retry(
+        self,
+        error: Exception,
+        retry_count: int,
+        max_retries: int,
+    ) -> Optional[int]:
+        """Retry a transient empty structured response with bounded backoff."""
+        retry_count += 1
+        self.retry_count += 1
+        if retry_count > max_retries:
+            print(
+                "Maximum structured-response retries "
+                f"({max_retries}) exceeded: {error}"
+            )
+            return None
+
+        delay = min(4.0, 0.5 * (2 ** (retry_count - 1)))
+        print(
+            "Structured LLM response was empty or truncated; retrying in "
+            f"{delay:.1f} seconds (attempt {retry_count}/{max_retries})."
+        )
+        time.sleep(delay)
+        return retry_count
+
+    @staticmethod
+    def _messages_for_request(user_prompt: str, system_prompt: Optional[str]) -> list[dict[str, str]]:
+        messages: list[dict[str, str]] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_prompt})
+        return messages
+
+    def _invoke_deepseek_structured(
+        self,
+        messages: list[dict[str, str]],
+        schema: Type[BaseModel],
+    ) -> BaseModel:
+        """Use the JSON prompt fallback required by DeepSeek thinking mode."""
+        json_instruction = (
+            "Return ONLY valid JSON (no markdown, no extra text) matching this schema:\n"
+            + str(schema.model_json_schema())
+        )
+        raw_response = self.llm.invoke(
+            [*messages, {"role": "user", "content": json_instruction}]
+        )
+        text = raw_response.content.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", text)
+            text = re.sub(r"\n?```\s*$", "", text).strip()
+        return schema.model_validate_json(text)
+
+    def _invoke_model(
+        self,
+        messages: list[dict[str, str]],
+        pydantic_obj: Optional[Type[BaseModel]],
+    ) -> Any:
+        """Call the configured provider, including its structured-output variant."""
+        if pydantic_obj is None:
+            return self.llm.invoke(messages).content
+        if self.model_provider.lower() == "deepseek":
+            return self._invoke_deepseek_structured(messages, pydantic_obj)
+        return self.llm.with_structured_output(pydantic_obj).invoke(messages)
+
+    def _record_successful_response(self, response: Any, prompt_tokens: int) -> None:
+        completion_tokens = self.llm.get_num_tokens(str(response))
+        self.total_prompt_tokens += prompt_tokens
+        self.total_completion_tokens += completion_tokens
+        self.total_tokens += prompt_tokens + completion_tokens
+
+    def _retry_counts_after_error(
+        self,
+        error: Exception,
+        *,
+        retry_count: int,
+        transport_retry_count: int,
+        structured_retry_count: int,
+        max_retries: int,
+        has_structured_output: bool,
+    ) -> tuple[int, int, int]:
+        """Sleep and return updated counters for retryable failures, else raise."""
+        if self._is_throttling_error(error):
+            updated = self._handle_throttling_retry(error, retry_count, max_retries)
+            if updated is not None:
+                return updated, transport_retry_count, structured_retry_count
+            self.failed_calls += 1
+            raise RuntimeError(
+                f"Maximum retries ({max_retries}) exceeded for throttling error: {error}"
+            ) from error
+        if self._is_retryable_transport_error(error):
+            updated = self._handle_transport_retry(error, transport_retry_count, 3)
+            if updated is not None:
+                return retry_count, updated, structured_retry_count
+            self.failed_calls += 1
+            raise error
+        if has_structured_output and self._is_retryable_structured_response_error(error):
+            updated = self._handle_structured_response_retry(error, structured_retry_count, 3)
+            if updated is not None:
+                return retry_count, transport_retry_count, updated
+            self.failed_calls += 1
+            raise error
+        print(f"Non-throttling error occurred: {error}.")
+        if isinstance(error, ClientError):
+            print(error.response)
+        self.failed_calls += 1
+        raise error
+
     def invoke(self,
               user_prompt: str, 
               system_prompt: Optional[str] = None, 
@@ -637,76 +841,27 @@ class LLMService:
         """
         self.total_calls += 1
         
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": user_prompt})
-        
-        # Calculate prompt tokens
-        prompt_tokens = 0
-        for message in messages:
-            prompt_tokens += self.llm.get_num_tokens(message["content"])
-        
+        messages = self._messages_for_request(user_prompt, system_prompt)
+        prompt_tokens = sum(self.llm.get_num_tokens(message["content"]) for message in messages)
         retry_count = 0
+        transport_retry_count = 0
+        structured_response_retry_count = 0
         while True:
             try:
-                if pydantic_obj:
-                    if self.model_provider.lower() == "deepseek":
-                        # DeepSeek thinking mode does not support response_format,
-                        # so with_structured_output fails. Use JSON prompt fallback.
-                        schema = pydantic_obj.model_json_schema()
-                        json_instruction = (
-                            "Return ONLY valid JSON (no markdown, no extra text) matching this schema:\n"
-                            + str(schema)
-                        )
-                        json_messages = list(messages)
-                        json_messages.append({"role": "user", "content": json_instruction})
-                        raw_response = self.llm.invoke(json_messages)
-                        raw_text = raw_response.content
-                        # Strip markdown fences if present
-                        t = raw_text.strip()
-                        if t.startswith("```"):
-                            t = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", t)
-                            t = re.sub(r"\n?```\s*$", "", t).strip()
-                        response = pydantic_obj.model_validate_json(t)
-                    else:
-                        structured_llm = self.llm.with_structured_output(pydantic_obj)
-                        response = structured_llm.invoke(messages)
-                else:
-                    response = self.llm.invoke(messages)
-                    response = response.content
-
-                # Calculate completion tokens
-                response_content = str(response)
-                completion_tokens = self.llm.get_num_tokens(response_content)
-                total_tokens = prompt_tokens + completion_tokens
-                
-                # Update statistics
-                self.total_prompt_tokens += prompt_tokens
-                self.total_completion_tokens += completion_tokens
-                self.total_tokens += total_tokens
-                
+                response = self._invoke_model(messages, pydantic_obj)
+                self._record_successful_response(response, prompt_tokens)
                 return response
-                
-            except Exception as e:
-                if self._is_throttling_error(e):
-                    print(f"ThrottlingException occurred: {str(e)}.")
-                    print(f"Retrying: {retry_count + 1}/{max_retries}")
-                    retry_count = self._handle_throttling_retry(e, retry_count, max_retries)
-                    if retry_count is None:
-                        # Max retries exceeded
-                        self.failed_calls += 1
-                        raise Exception(f"Maximum retries ({max_retries}) exceeded for throttling error: {str(e)}")
-                    continue  # Retry the request
-                else:
-                    print(f"Non-throttling error occurred: {str(e)}.")
-
-                    # Non-throttling error: log and raise
-                    print(f"Error occurred in LLM service: {str(e)}")
-                    if isinstance(e, ClientError):
-                        print(e.response)
-                    self.failed_calls += 1
-                    raise e
+            except Exception as error:  # noqa: BLE001 - provider exceptions have no common base class
+                retry_count, transport_retry_count, structured_response_retry_count = (
+                    self._retry_counts_after_error(
+                        error,
+                        retry_count=retry_count,
+                        transport_retry_count=transport_retry_count,
+                        structured_retry_count=structured_response_retry_count,
+                        max_retries=max_retries,
+                        has_structured_output=pydantic_obj is not None,
+                    )
+                )
     
     def get_statistics(self) -> dict:
         """
@@ -790,6 +945,20 @@ class GraphState(TypedDict):
     cluster_info: Optional[dict]
     slurm_script_path: Optional[str]
     termination_reason: Optional[str]
+    # Existing-case import branch.  These fields keep the imported source and
+    # its controlled retry history separate from generated-case dictionaries.
+    workflow_mode: str
+    execution_policy: str
+    repair_policy: str
+    case_import_path: Optional[str]
+    case_import_subdir: Optional[str]
+    case_import_manifest: Optional[Any]
+    case_import_original_dir: Optional[str]
+    case_import_report_dir: Optional[str]
+    case_import_attempts: Optional[List[dict]]
+    case_import_overrides: Optional[Dict[str, bytes]]
+    case_import_error_fingerprints: Optional[List[str]]
+    case_import_status: Optional[str]
 
 def tokenize(text: str) -> str:
     # Replace underscores with spaces
@@ -843,7 +1012,7 @@ def remove_numeric_folders(case_dir: str) -> None:
                 try:
                     shutil.rmtree(item_path)
                     print(f"Removed numeric folder: {item_path}")
-                except Exception as e:
+                except OSError as e:
                     print(f"Error removing folder {item_path}: {str(e)}")
             except ValueError:
                 # Not a numeric value, so we keep this folder
@@ -942,14 +1111,28 @@ def read_case_foamfiles(case_dir: str, dir_structure: Optional[Dict[str, List[st
                 ))
             except UnicodeDecodeError:
                 print(f"Warning: Skipping file due to encoding error: {file_path}")
-            except Exception as e:
+            except OSError as e:
                 print(f"Warning: Error reading file {file_path}: {e}")
     
     return FoamPydantic(list_foamfile=foamfile_list)
 
-def run_command(script_path: str, out_file: str, err_file: str, working_dir: str, max_time_limit: int) -> None:
+def run_command(
+    script_path: str,
+    out_file: str,
+    err_file: str,
+    working_dir: str,
+    max_time_limit: int,
+) -> Dict[str, Any]:
+    """Run an OpenFOAM shell script and return its process outcome.
+
+    Existing callers may continue to ignore the return value.  Callers which
+    need reliable execution status can inspect ``returncode`` and
+    ``timed_out`` instead of inferring success solely from log contents.
+    """
     print(f"Executing script {script_path} in {working_dir}")
-    os.chmod(script_path, 0o777)
+    script = Path(script_path).expanduser().resolve()
+    if not script.is_file():
+        raise FileNotFoundError(f"OpenFOAM script does not exist: {script}")
     openfoam_dir = os.getenv("WM_PROJECT_DIR")
     if not openfoam_dir:
         raise RuntimeError(
@@ -957,42 +1140,102 @@ def run_command(script_path: str, out_file: str, err_file: str, working_dir: str
             "(e.g., source env/common.sh and env/foamagent.sh)."
         )
 
-    bashrc_path = os.path.join(openfoam_dir, "etc", "bashrc")
-    if not os.path.exists(bashrc_path):
+    bashrc_path = Path(openfoam_dir).expanduser() / "etc" / "bashrc"
+    if not bashrc_path.is_file():
         raise RuntimeError(f"OpenFOAM bashrc not found at: {bashrc_path}")
 
-    command = f"source {bashrc_path} && bash {os.path.abspath(script_path)}"
+    # Never interpolate paths into shell source.  Script and bashrc paths can
+    # legitimately contain spaces and, for imported cases, originate outside
+    # Foam-Agent.  Passing them as positional parameters prevents shell
+    # metacharacters from being interpreted as code.
+    shell_command = 'source "$1" && exec bash "$2"'
+
+    timed_out = False
 
     with open(out_file, 'w') as out, open(err_file, 'w') as err:
         process = subprocess.Popen(
-            ['bash', "-c", command],
+            ["bash", "-c", shell_command, "foamagent-runner", str(bashrc_path), str(script)],
             cwd=working_dir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            # Stream child output directly to disk.  ``communicate()`` buffers
+            # all solver output in memory and can OOM on a legitimate long CFD
+            # run with verbose residual logs.
+            stdout=out,
+            stderr=err,
             stdin=subprocess.DEVNULL,
-            text=True,
             start_new_session=True,
         )
 
         try:
-            stdout, stderr = process.communicate(timeout=max_time_limit)
-            out.write(stdout)
-            err.write(stderr)
+            process.wait(timeout=max_time_limit)
         except subprocess.TimeoutExpired:
-            os.killpg(os.getpgid(process.pid), signal.SIGKILL) 
-            
-            stdout, stderr = process.communicate()
+            timed_out = True
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                # The process can exit between ``wait`` timing out and the
+                # group lookup; its return code is still collected below.
+                pass
+            process.wait()
             timeout_message = (
-                "OpenFOAM execution took too long. "
-                "This case, if set up right, does not require such large execution times.\n"
+                f"OpenFOAM execution exceeded the {max_time_limit} second timeout.\n"
             )
-            out.write(timeout_message + stdout)
-            err.write(timeout_message + stderr)
+            out.write(timeout_message)
+            err.write(timeout_message)
             print(f"Execution timed out: {script_path}")
 
-    
-
     print(f"Executed script {script_path}")
+    return {
+        "returncode": process.returncode,
+        "timed_out": timed_out,
+    }
+
+_EXPLICIT_FOAM_ERROR_RE = re.compile(r"ERROR:(.*)", re.DOTALL)
+_SEMANTIC_FOAM_FAILURES = (
+    (
+        re.compile(r"Failed\s+\d+\s+mesh\s+checks?", re.IGNORECASE),
+        "checkMesh reported failed mesh checks",
+    ),
+)
+_FOAM_END_RE = re.compile(r"^\s*End\s*$", re.MULTILINE)
+
+
+def _read_foam_log(directory: str, file_name: str) -> tuple[str | None, dict | None]:
+    filepath = os.path.join(directory, file_name)
+    try:
+        with open(filepath, encoding="utf-8") as log_file:
+            return log_file.read(), None
+    except OSError:
+        return None, {"file": file_name, "error_content": f"Could not read log file: {filepath}"}
+
+
+def _foam_log_failure(file_name: str, content: str) -> dict | None:
+    """Return an explicit or semantic OpenFOAM error found in one log."""
+    for pattern, reason in _SEMANTIC_FOAM_FAILURES:
+        match = pattern.search(content)
+        if match:
+            line = content[match.start() :].splitlines()[0].strip()
+            return {
+                "file": file_name,
+                "error_content": f"Semantic simulation failure: {reason}. OpenFOAM reported: {line}",
+            }
+    match = _EXPLICIT_FOAM_ERROR_RE.search(content)
+    if match:
+        return {"file": file_name, "error_content": match.group(0).strip()}
+    return None
+
+
+def _unfinished_foam_log(file_name: str, content: str) -> dict | None:
+    if _FOAM_END_RE.search(content):
+        return None
+    last_lines = "\n".join(content.strip().split("\n")[-30:])
+    return {
+        "file": file_name,
+        "error_content": (
+            "Solver did not complete (no 'End' marker found). "
+            f"Last 30 lines:\n{last_lines}"
+        ),
+    }
+
 
 def check_foam_errors(directory: str) -> list:
     """Check OpenFOAM log files for errors.
@@ -1003,49 +1246,28 @@ def check_foam_errors(directory: str) -> list:
     completion.  Any log missing ``End`` is reported with the last 30 lines
     as error context so the caller can diagnose the crash.
     """
-    error_logs = []
-    log_contents = {}  # filename -> content
-
-    # DOTALL mode allows '.' to match newline characters
-    pattern = re.compile(r"ERROR:(.*)", re.DOTALL)
-
-    for file in os.listdir(directory):
-        if file.startswith("log"):
-            filepath = os.path.join(directory, file)
-            try:
-                with open(filepath, 'r') as f:
-                    content = f.read()
-            except (IOError, OSError):
-                error_logs.append({"file": file, "error_content": f"Could not read log file: {filepath}"})
-                continue
-
-            log_contents[file] = content
-
-            match = pattern.search(content)
-            if match:
-                error_content = match.group(0).strip()
-                error_logs.append({"file": file, "error_content": error_content})
-            elif "error" in content.lower():
-                print(f"Warning: file {file} contains 'error' but does not match expected format.")
-
-    # Safety-net: if no explicit ERROR was found, check for missing 'End' marker
-    # Check EACH log individually – a successful blockMesh should not mask a
-    # crashed solver (e.g. pimpleFoam).
-    if not error_logs and log_contents:
-        end_pattern = re.compile(r"^\s*End\s*$", re.MULTILINE)
-
-        for file, content in log_contents.items():
-            if not end_pattern.search(content):
-                last_lines = "\n".join(content.strip().split("\n")[-30:])
-                error_logs.append({
-                    "file": file,
-                    "error_content": (
-                        f"Solver did not complete (no 'End' marker found). "
-                        f"Last 30 lines:\n{last_lines}"
-                    ),
-                })
-
-    return error_logs
+    error_logs: list[dict] = []
+    log_contents: dict[str, str] = {}
+    for file_name in os.listdir(directory):
+        if not file_name.startswith("log"):
+            continue
+        content, read_error = _read_foam_log(directory, file_name)
+        if read_error:
+            error_logs.append(read_error)
+            continue
+        if content is None:
+            continue
+        log_contents[file_name] = content
+        failure = _foam_log_failure(file_name, content)
+        if failure:
+            error_logs.append(failure)
+    if error_logs or not log_contents:
+        return error_logs
+    return [
+        failure
+        for file_name, content in log_contents.items()
+        if (failure := _unfinished_foam_log(file_name, content)) is not None
+    ]
 
 def extract_commands_from_allrun_out(out_file: str) -> list:
     commands = []
@@ -1115,23 +1337,35 @@ def find_input_file(case_dir: str, command: str) -> str:
                 return os.path.join(root, file)
     return ""
 
-def retrieve_faiss(database_name: str, query: str, topk: int = 1) -> dict:
+def retrieve_faiss(
+    database_name: str,
+    query: str,
+    topk: int = 1,
+    *,
+    config: Optional[Config] = None,
+) -> dict:
     """
-    Retrieve a similar case from a FAISS database.
+    Retrieve a similar case from a FAISS database selected by ``config``.
+
+    Omitting ``config`` retains the environment/default-backed behaviour used
+    by legacy callers.  Supplying it is required when one process serves
+    multiple configured workflows, because each embedding model needs its own
+    compatible FAISS index and query vector.
     """
 
-    if database_name not in FAISS_DB_CACHE:
+    dbs = _ensure_faiss_dbs_loaded(config)
+    if database_name not in dbs:
         raise ValueError(f"Database '{database_name}' is not loaded.")
 
     # Tokenize the query
     query = tokenize(query)
 
-    vectordb = FAISS_DB_CACHE[database_name]
+    vectordb = dbs[database_name]
     try:
         docs_and_scores = vectordb.similarity_search_with_score(query, k=topk)
         docs = [d for d, _ in docs_and_scores]
         scores = [s for _, s in docs_and_scores]
-    except Exception:
+    except (AttributeError, NotImplementedError):
         docs = vectordb.similarity_search(query, k=topk)
         scores = [None] * len(docs)
 

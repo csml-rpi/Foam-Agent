@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, Dict
+from typing import Any, Optional, Tuple, Dict
 import os
 import json
 import subprocess
@@ -8,7 +8,12 @@ from utils import check_foam_errors, save_file
 from . import global_llm_service
 
 
-def create_slurm_script(case_dir: str, cluster_info: dict) -> str:
+def create_slurm_script(
+    case_dir: str,
+    cluster_info: dict,
+    *,
+    llm_service: Optional[Any] = None,
+) -> str:
     """
     Create a SLURM script for OpenFOAM simulation using LLM.
     
@@ -49,7 +54,8 @@ def create_slurm_script(case_dir: str, cluster_info: dict) -> str:
         f"Generate a complete SLURM script that will run the OpenFOAM simulation using the Allrun script."
     )
     
-    response = global_llm_service.invoke(user_prompt, system_prompt)
+    llm_client = llm_service if llm_service is not None else global_llm_service
+    response = llm_client.invoke(user_prompt, system_prompt)
     
     # Clean up the response to extract just the script content
     script_content = response.strip()
@@ -70,7 +76,14 @@ def create_slurm_script(case_dir: str, cluster_info: dict) -> str:
     return script_path
 
 
-def create_slurm_script_with_error_context(case_dir: str, cluster_info: dict, error_message: str = "", previous_script_content: str = "") -> str:
+def create_slurm_script_with_error_context(
+    case_dir: str,
+    cluster_info: dict,
+    error_message: str = "",
+    previous_script_content: str = "",
+    *,
+    llm_service: Optional[Any] = None,
+) -> str:
     """
     Create a SLURM script for OpenFOAM simulation using LLM, with error context for retries.
     
@@ -131,7 +144,8 @@ def create_slurm_script_with_error_context(case_dir: str, cluster_info: dict, er
     
     user_prompt += f"\nGenerate a complete SLURM script that will run the OpenFOAM simulation using the Allrun script. Return ONLY the complete SLURM script content. Do not include any explanations or markdown formatting."
     
-    response = global_llm_service.invoke(user_prompt, system_prompt)
+    llm_client = llm_service if llm_service is not None else global_llm_service
+    response = llm_client.invoke(user_prompt, system_prompt)
     
     # Clean up the response to extract just the script content
     script_content = response.strip()
@@ -197,7 +211,12 @@ def check_job(inp: JobStatusIn) -> JobStatusOut:
     return JobStatusOut(status=status if ok else f"error: {err}")
 
 
-def extract_cluster_info_from_requirement(user_requirement: str, case_dir: str) -> Dict:
+def extract_cluster_info_from_requirement(
+    user_requirement: str,
+    case_dir: str,
+    *,
+    llm_service: Optional[Any] = None,
+) -> Dict:
     """
     Extract cluster information from user requirement using LLM.
     
@@ -257,7 +276,8 @@ def extract_cluster_info_from_requirement(user_requirement: str, case_dir: str) 
     
     user_prompt += "Extract cluster information and return as JSON object."
     
-    response = global_llm_service.invoke(user_prompt, system_prompt)
+    llm_client = llm_service if llm_service is not None else global_llm_service
+    response = llm_client.invoke(user_prompt, system_prompt)
     
     # Try to parse the JSON response
     try:
@@ -335,5 +355,4 @@ def wait_for_job(job_id: str, max_wait_time: int = 3600, wait_interval: int = 30
         time.sleep(wait_interval)
         elapsed += wait_interval
     return last_status or "TIMEOUT", True, ""
-
 

@@ -31,6 +31,7 @@ def review_error_logs(
     user_requirement: str,
     similar_case_advice: Optional[Any] = None,
     history_text: Optional[List[str]] = None,
+    llm_service: Optional[Any] = None,
 ) -> Tuple[str, List[str]]:
     """Stateless reviewer: returns (review_analysis, updated_history)."""
     advice_text = ""
@@ -65,7 +66,8 @@ def review_error_logs(
             "Please review the error logs and provide guidance on how to resolve the reported errors. Make sure your suggestions adhere to user requirements and do not contradict it."
         )
 
-    review_response = global_llm_service.invoke(reviewer_user_prompt, REVIEWER_SYSTEM_PROMPT)
+    llm_client = llm_service if llm_service is not None else global_llm_service
+    review_response = llm_client.invoke(reviewer_user_prompt, REVIEWER_SYSTEM_PROMPT)
     review_content = review_response
 
     updated_history = list(history_text) if history_text else []
@@ -73,7 +75,7 @@ def review_error_logs(
         f"<Attempt {len(updated_history)//4 + 1}>\n",
         f"<Error_Logs>\n{error_logs}\n</Error_Logs>",
         f"<Review_Analysis>\n{review_content}\n</Review_Analysis>",
-        f"</Attempt>\n",
+        "</Attempt>\n",
     ]
     updated_history.extend(current_attempt)
     return review_content, updated_history
@@ -84,6 +86,7 @@ def generate_rewrite_plan(
     error_logs: List[str],
     review_analysis: str,
     user_requirement: str,
+    llm_service: Optional[Any] = None,
 ) -> dict:
     """Generate a minimal, explicit rewrite plan for downstream rewrite step."""
     planner_system_prompt = (
@@ -107,10 +110,10 @@ def generate_rewrite_plan(
         "Return strict JSON now with key target_files only."
     )
 
-    response = global_llm_service.invoke(
+    llm_client = llm_service if llm_service is not None else global_llm_service
+    response = llm_client.invoke(
         planner_user_prompt,
         planner_system_prompt,
         pydantic_obj=RewritePlan,
     )
     return response.model_dump()
-

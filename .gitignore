@@ -183,3 +183,12 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+
+# Local CFD cases and generated results
+/output-*/
+/bubble_case/
+/cavity_test/
+/openfoam_experiments/
+/foamagent-full-p10.pid
+/user_requirement_p10_smoke*.txt

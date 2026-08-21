@@ -13,6 +13,7 @@ class Config:
     database_path: str = Path(__file__).resolve().parent.parent / "database"
     run_directory: str = Path(__file__).resolve().parent.parent / "runs"
     case_dir: str = ""
+    overwrite_case_dir: bool = False
     max_time_limit: int = 3600  # Max time limit after which the openfoam run will be terminated, in seconds
     recursion_limit: int = 100  # LangGraph recursion limit
     # Input writer generation mode:
@@ -32,11 +33,11 @@ class Config:
     model_provider: str = "openai-codex"  # [openai, openai-codex, ollama, bedrock, anthropic, deepseek]
     # model_version examples:
     # - OpenAI: "gpt-5-mini"
-    # - OpenAI Codex subscription: "gpt-5.3-codex" (or whichever Codex model you have access to)
+    # - OpenAI Codex subscription: "gpt-5.6-terra" (or whichever Codex model you have access to)
     # - Ollama: "qwen2.5:32b-instruct"
     # - Bedrock: application inference profile ARN
     # - Anthropic: claude-3-5-sonnet-latest
-    model_version: str = "gpt-5.3-codex"
+    model_version: str = "gpt-5.6-terra"
     temperature: float = 1
     openfoam_fork: str = "foundation"  # Default to Foundation v10
     

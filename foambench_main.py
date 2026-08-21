@@ -22,12 +22,25 @@ def parse_args():
         default=os.path.join(base_dir, "output"),
         help="Base output directory for benchmark results (default: <dir_of_foambench_main.py>/output)"
     )
-    parser.add_argument(
+    input_group = parser.add_mutually_exclusive_group()
+    input_group.add_argument(
         '--prompt_path',
         type=str,
         required=False,
-        default=os.path.join(base_dir, "user_requirement.txt"),
+        default=None,
         help="User requirement file path for the benchmark (default: <dir_of_foambench_main.py>/user_requirement.txt)"
+    )
+    input_group.add_argument(
+        '--case_path',
+        type=str,
+        default=None,
+        help="Existing Foundation OpenFOAM v10 case directory or ZIP archive."
+    )
+    parser.add_argument(
+        '--case_subdir',
+        type=str,
+        default=None,
+        help="Relative case directory inside --case_path when multiple cases are present."
     )
     parser.add_argument(
         '--custom_mesh_path',
@@ -35,30 +48,63 @@ def parse_args():
         default=None,
         help="Path to custom mesh file (e.g., .msh, .stl, .obj). If not provided, no custom mesh will be used."
     )
-    return parser.parse_args()
+    parser.add_argument(
+        '--overwrite_output',
+        action='store_true',
+        help="Explicitly allow replacing an existing non-empty output directory."
+    )
+    parser.add_argument(
+        '--visualize',
+        action='store_true',
+        help="Generate a PyVista visualization after a successful imported case run."
+    )
+    args = parser.parse_args()
+    if args.case_subdir and not args.case_path:
+        parser.error("--case_subdir requires --case_path.")
+    if args.case_path and args.custom_mesh_path:
+        parser.error("--custom_mesh_path is not available with --case_path.")
+    if args.visualize and not args.case_path:
+        parser.error("--visualize requires --case_path.")
+    return args
 
-def run_command(command_str):
+def run_command(command, *, env=None, openfoam_bashrc=None):
     """
     Execute a command string using the current terminal's input/output,
     with the working directory set to the directory of the current file.
     
     Parameters:
-        command_str (str): The command to execute, e.g. "python main.py --output_dir xxxx" 
-                           or "bash xxxxx.sh".
+        command: A command string or an argument sequence, e.g.
+                 ``["python", "main.py", "--output_dir", "xxxx"]``.
+        env: Optional environment overrides for the child workflow process.
+        openfoam_bashrc: Optional OpenFOAM bashrc to source before starting
+            the workflow. This makes preprocessing tools such as gmshToFoam
+            available to the Python child, not just its later Allrun script.
     """
-    # Split the command string into a list of arguments
-    args = shlex.split(command_str)
+    # Preserve argument boundaries for paths containing spaces.  Accepting a
+    # string retains compatibility with callers outside this entry point.
+    command_args = shlex.split(command) if isinstance(command, str) else list(command)
     # Set the working directory to the directory of the current file
     cwd = os.path.dirname(os.path.abspath(__file__))
     
+    if openfoam_bashrc:
+        command_args = [
+            "bash",
+            "-c",
+            'source "$1" && shift && exec "$@"',
+            "foamagent-benchmark",
+            openfoam_bashrc,
+            *command_args,
+        ]
+
     try:
         result = subprocess.run(
-            args,
+            command_args,
             cwd=cwd,
             check=True,
             stdout=sys.stdout,
             stderr=sys.stderr,
-            stdin=sys.stdin
+            stdin=sys.stdin,
+            env=env,
         )
         print(f"Finished command: Return Code {result.returncode}")
     except subprocess.CalledProcessError as e:
@@ -68,19 +114,49 @@ def run_command(command_str):
 def main():
     args = parse_args()
     print(args)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
 
-    # Create the output folder
-    os.makedirs(args.output, exist_ok=True)
+    child_env = os.environ.copy()
+    openfoam_bashrc = None
+    if args.openfoam_path:
+        openfoam_root = os.path.abspath(os.path.expanduser(args.openfoam_path))
+        openfoam_bashrc = os.path.join(openfoam_root, "etc", "bashrc")
+        if not os.path.isfile(openfoam_bashrc):
+            raise ValueError(
+                "--openfoam_path must point to a Foundation OpenFOAM installation "
+                f"containing etc/bashrc: {openfoam_root}"
+            )
+        child_env["WM_PROJECT_DIR"] = openfoam_root
+        print(f"Using OpenFOAM installation: {openfoam_root}")
 
-    # Build main workflow command with optional custom mesh path
-    main_cmd = f"python src/main.py --prompt_path='{args.prompt_path}' --output_dir='{args.output}'"
+    # Output creation and any overwrite decision are owned by the workflow's
+    # ownership checks before the workflow gets a chance to validate it.
+
+    # Build the workflow invocation as argument tokens, not shell text.
+    main_cmd = [sys.executable, "src/main.py", "--output_dir", args.output]
+    if args.case_path:
+        main_cmd.extend(["--case_path", args.case_path])
+        if args.case_subdir:
+            main_cmd.extend(["--case_subdir", args.case_subdir])
+        if args.visualize:
+            main_cmd.append("--visualize")
+    else:
+        prompt_path = args.prompt_path or os.path.join(base_dir, "user_requirement.txt")
+        main_cmd.extend(["--prompt_path", prompt_path])
     if args.custom_mesh_path:
-        main_cmd += f" --custom_mesh_path='{args.custom_mesh_path}'"
+        main_cmd.extend(["--custom_mesh_path", args.custom_mesh_path])
+    if args.overwrite_output:
+        main_cmd.append("--overwrite_output")
     
-    print(f"Main workflow command: {main_cmd}")
+    print(f"Main workflow command: {shlex.join(main_cmd)}")
     
     print("Starting workflow...")
-    run_command(main_cmd)
+    if args.openfoam_path:
+        run_command(main_cmd, env=child_env, openfoam_bashrc=openfoam_bashrc)
+    else:
+        # Preserve the original call shape for wrappers which replace
+        # ``run_command`` and do not need an environment override.
+        run_command(main_cmd)
     print("Workflow command finished.")
 
 if __name__ == "__main__":
@@ -88,4 +164,6 @@ if __name__ == "__main__":
     #   python foambench_main.py
     #   python foambench_main.py --output output --prompt_path user_requirement.txt
     #   python foambench_main.py --output output --prompt_path user_requirement.txt --custom_mesh_path my_mesh.msh
+    #   python foambench_main.py --output imported --case_path ./existing_case
+    #   python foambench_main.py --output imported --case_path ./existing_case --visualize
     main()

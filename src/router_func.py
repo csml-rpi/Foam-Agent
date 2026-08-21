@@ -1,8 +1,15 @@
-from typing import TypedDict, List, Optional
-from config import Config
-from utils import LLMService, GraphState
-from langgraph.graph import StateGraph, START, END
-from langgraph.types import Command
+from langgraph.graph import END
+
+from utils import GraphState
+
+
+def route_workflow_entry(state: GraphState):
+    """Choose the prompt-generation or protected existing-case branch."""
+    if state.get("workflow_mode") == "imported_case":
+        print("<router>Existing case requested. Routing to case_import node.</router>")
+        return "case_import"
+    print("<router>Prompt workflow requested. Routing to planner node.</router>")
+    return "planner"
 
 
 def llm_requires_custom_mesh(state: GraphState) -> int:
@@ -121,6 +128,14 @@ def route_after_planner(state: GraphState):
         return "input_writer"
 
 
+def route_after_meshing(state: GraphState):
+    """Continue only when a requested mesh was prepared successfully."""
+    if state.get("error_logs"):
+        print("<router>Mesh preparation failed. Ending workflow.</router>")
+        return END
+    return "input_writer"
+
+
 def route_after_input_writer(state: GraphState):
     """
     Route after input_writer node based on whether user wants to run on HPC.
@@ -151,12 +166,27 @@ def route_after_runner(state: GraphState):
         return "visualization"
     return END
 
+def route_after_case_import(state: GraphState):
+    """Merge a validated imported case into the common local-runner path."""
+    return "local_runner" if state.get("case_import_status") == "ready" else END
+
+
 def route_after_reviewer(state: GraphState):
+    """Retry through the common runner, subject to the source repair policy."""
+    repair_policy = state.get("repair_policy", "llm_rewrite")
+    if repair_policy == "numeric_invariant_only":
+        return (
+            "local_runner"
+            if state.get("case_import_status") == "ready"
+            else END
+        )
+    if repair_policy != "llm_rewrite":
+        return END
+
     loop_count = state.get("loop_count", 0)
     max_loop = state["config"].max_loop
     if loop_count >= max_loop:
         print(f"<router>Maximum loop count ({max_loop}) reached. Ending workflow.</router>")
-        state["termination_reason"] = "max_review_loop_reached"
         requires_visualization = state.get("requires_visualization")
         if requires_visualization is None:
             requires_visualization = llm_requires_visualization(state)
