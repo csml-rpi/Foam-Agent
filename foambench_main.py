@@ -67,7 +67,7 @@ def parse_args():
         parser.error("--visualize requires --case_path.")
     return args
 
-def run_command(command, *, env=None):
+def run_command(command, *, env=None, openfoam_bashrc=None):
     """
     Execute a command string using the current terminal's input/output,
     with the working directory set to the directory of the current file.
@@ -76,6 +76,9 @@ def run_command(command, *, env=None):
         command: A command string or an argument sequence, e.g.
                  ``["python", "main.py", "--output_dir", "xxxx"]``.
         env: Optional environment overrides for the child workflow process.
+        openfoam_bashrc: Optional OpenFOAM bashrc to source before starting
+            the workflow. This makes preprocessing tools such as gmshToFoam
+            available to the Python child, not just its later Allrun script.
     """
     # Preserve argument boundaries for paths containing spaces.  Accepting a
     # string retains compatibility with callers outside this entry point.
@@ -83,6 +86,16 @@ def run_command(command, *, env=None):
     # Set the working directory to the directory of the current file
     cwd = os.path.dirname(os.path.abspath(__file__))
     
+    if openfoam_bashrc:
+        command_args = [
+            "bash",
+            "-c",
+            'source "$1" && shift && exec "$@"',
+            "foamagent-benchmark",
+            openfoam_bashrc,
+            *command_args,
+        ]
+
     try:
         result = subprocess.run(
             command_args,
@@ -104,10 +117,11 @@ def main():
     base_dir = os.path.dirname(os.path.abspath(__file__))
 
     child_env = os.environ.copy()
+    openfoam_bashrc = None
     if args.openfoam_path:
         openfoam_root = os.path.abspath(os.path.expanduser(args.openfoam_path))
-        bashrc_path = os.path.join(openfoam_root, "etc", "bashrc")
-        if not os.path.isfile(bashrc_path):
+        openfoam_bashrc = os.path.join(openfoam_root, "etc", "bashrc")
+        if not os.path.isfile(openfoam_bashrc):
             raise ValueError(
                 "--openfoam_path must point to a Foundation OpenFOAM installation "
                 f"containing etc/bashrc: {openfoam_root}"
@@ -138,7 +152,7 @@ def main():
     
     print("Starting workflow...")
     if args.openfoam_path:
-        run_command(main_cmd, env=child_env)
+        run_command(main_cmd, env=child_env, openfoam_bashrc=openfoam_bashrc)
     else:
         # Preserve the original call shape for wrappers which replace
         # ``run_command`` and do not need an environment override.

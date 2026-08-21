@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -93,7 +94,7 @@ def test_case_wrapper_forwards_case_arguments_without_creating_output(
     ]
 
 
-def test_openfoam_path_is_forwarded_as_wm_project_dir(
+def test_openfoam_path_sources_the_environment_for_the_child_workflow(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -111,9 +112,41 @@ def test_openfoam_path_is_forwarded_as_wm_project_dir(
     monkeypatch.setattr(
         cli,
         "run_command",
-        lambda command, *, env=None: captured.update(command=command, env=env),
+        lambda command, *, env=None, openfoam_bashrc=None: captured.update(
+            command=command,
+            env=env,
+            openfoam_bashrc=openfoam_bashrc,
+        ),
     )
 
     cli.main()
 
     assert captured["env"]["WM_PROJECT_DIR"] == str(openfoam_root)
+    assert captured["openfoam_bashrc"] == str(openfoam_root / "etc" / "bashrc")
+
+
+def test_run_command_sources_bashrc_before_executing_the_workflow(monkeypatch) -> None:
+    cli = _load_cli_module()
+    captured: dict[str, object] = {}
+
+    def fake_run(command, **kwargs):
+        captured.update(command=command, kwargs=kwargs)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    cli.run_command(
+        ["python", "src/main.py"],
+        env={"WM_PROJECT_DIR": "/opt/openfoam10"},
+        openfoam_bashrc="/opt/openfoam10/etc/bashrc",
+    )
+
+    assert captured["command"] == [
+        "bash",
+        "-c",
+        'source "$1" && shift && exec "$@"',
+        "foamagent-benchmark",
+        "/opt/openfoam10/etc/bashrc",
+        "python",
+        "src/main.py",
+    ]
+    assert captured["kwargs"]["env"] == {"WM_PROJECT_DIR": "/opt/openfoam10"}

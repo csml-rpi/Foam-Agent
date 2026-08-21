@@ -20,6 +20,7 @@ from router_func import (  # noqa: E402
     route_after_runner,
 )
 from services.output_safety import validate_output_path  # noqa: E402
+from main import workflow_exit_code  # noqa: E402
 
 
 def test_reviewer_persists_max_loop_termination_reason(monkeypatch) -> None:
@@ -104,6 +105,11 @@ def test_meshing_route_ends_after_a_mesh_failure() -> None:
         {"error_logs": [{"file": "mesh", "error_content": "gmshToFoam failed"}]}
     ) == "__end__"
     assert route_after_meshing({"error_logs": []}) == "input_writer"
+
+
+def test_mesh_generation_failure_returns_a_nonzero_cli_exit_code() -> None:
+    assert workflow_exit_code({"termination_reason": "mesh_generation_failed"}) == 2
+    assert workflow_exit_code({"termination_reason": None}) == 0
 
 
 def test_reviewer_route_ends_at_the_retry_limit_without_visualization() -> None:
