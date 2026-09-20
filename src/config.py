@@ -3,16 +3,18 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from openfoam_target import normalise_openfoam_target
+
 
 @dataclass
 class Config:
     max_loop: int = 25
-    batchsize: int = 10
     searchdocs: int = 10 # max(10, searchdocs)
     run_times: int = 1   # current run number (for directory naming)
     database_path: str = Path(__file__).resolve().parent.parent / "database"
     run_directory: str = Path(__file__).resolve().parent.parent / "runs"
     case_dir: str = ""
+    overwrite_case_dir: bool = False
     max_time_limit: int = 3600  # Max time limit after which the openfoam run will be terminated, in seconds
     recursion_limit: int = 100  # LangGraph recursion limit
     # Input writer generation mode:
@@ -39,6 +41,9 @@ class Config:
     model_version: str = "gpt-5.3-codex"
     temperature: float = 1
     openfoam_fork: str = "foundation"  # Default to Foundation v10
+    # An explicit target is additive.  Leaving it empty keeps the existing
+    # Foundation/generic-ESI routing exactly as it was before v2006 support.
+    openfoam_target: str = ""
     
     # Embedding Configuration
     embedding_provider: str = "huggingface"  # [openai, huggingface, ollama]
@@ -119,3 +124,24 @@ class Config:
                 print(f"<config>openfoam_fork={self.openfoam_fork} (default; invalid env:{fork_key}={fork_env!r})</config>")
         else:
             print(f"<config>openfoam_fork={self.openfoam_fork} (default)</config>")
+
+        # Explicit version target.  This is intentionally separate from
+        # FOAMAGENT_OPENFOAM_FORK so old ``esi`` configurations retain their
+        # post-generation translation behaviour.
+        target_key = "FOAMAGENT_OPENFOAM_TARGET"
+        target_env = _env_nonempty(target_key)
+        if target_env is not None:
+            # Unlike the historical fork switch, this is an explicit native
+            # platform contract.  Silently falling back to Foundation after a
+            # spelling error could run a v2006 case against the wrong solver.
+            self.openfoam_target = normalise_openfoam_target(target_env)
+            print(
+                f"<config>openfoam_target={self.openfoam_target} "
+                f"(env:{target_key})</config>"
+            )
+        else:
+            # Validate programmatic construction too, while preserving the
+            # historical empty value as the legacy path.
+            self.openfoam_target = normalise_openfoam_target(self.openfoam_target)
+            label = self.openfoam_target or "legacy"
+            print(f"<config>openfoam_target={label} (default)</config>")

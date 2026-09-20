@@ -1,14 +1,20 @@
-from typing import Optional, Tuple, Dict
+from typing import Any, Optional, Tuple, Dict
 import os
 import json
 import subprocess
 import re
-from models import HPCScriptIn, HPCScriptOut, RunIn, RunOut, JobStatusIn, JobStatusOut
+from models import RunOut
 from utils import check_foam_errors, save_file
 from . import global_llm_service
 
 
-def create_slurm_script(case_dir: str, cluster_info: dict) -> str:
+def create_slurm_script(
+    case_dir: str,
+    cluster_info: dict,
+    *,
+    llm_service: Optional[Any] = None,
+    openfoam_target: str = "",
+) -> str:
     """
     Create a SLURM script for OpenFOAM simulation using LLM.
     
@@ -29,8 +35,13 @@ def create_slurm_script(case_dir: str, cluster_info: dict) -> str:
         "4. Directory navigation and execution of the Allrun script"
         "5. Error handling and status reporting"
         "6. Any cluster-specific optimizations or requirements"
-        "7. Use your understanding of the documentation of the cluster and figure out the syntax of their jobscript."
-        ""
+        "7. Use your understanding of the documentation of the cluster and figure out the syntax of their jobscript. "
+    ) + (
+        "8. The already-loaded OpenFOAM environment must be ESI/OpenCFD v2006. "
+        "Do not substitute Foundation OpenFOAM commands or dictionaries."
+        if openfoam_target == "esi-v2006"
+        else ""
+    ) + (
         "Return ONLY the complete SLURM script content. Do not include any explanations or markdown formatting."
         "Make sure the script is executable and follows best practices for the specified cluster."
     )
@@ -49,7 +60,8 @@ def create_slurm_script(case_dir: str, cluster_info: dict) -> str:
         f"Generate a complete SLURM script that will run the OpenFOAM simulation using the Allrun script."
     )
     
-    response = global_llm_service.invoke(user_prompt, system_prompt)
+    llm_client = llm_service if llm_service is not None else global_llm_service
+    response = llm_client.invoke(user_prompt, system_prompt)
     
     # Clean up the response to extract just the script content
     script_content = response.strip()
@@ -65,12 +77,24 @@ def create_slurm_script(case_dir: str, cluster_info: dict) -> str:
     if not script_content.startswith('#!/bin/bash'):
         script_content = '#!/bin/bash\n' + script_content
     
+    script_content = _add_openfoam_runtime_guard(
+        script_content,
+        openfoam_target,
+    )
     script_path = os.path.join(case_dir, "submit_job.slurm")
     save_file(script_path, script_content)
     return script_path
 
 
-def create_slurm_script_with_error_context(case_dir: str, cluster_info: dict, error_message: str = "", previous_script_content: str = "") -> str:
+def create_slurm_script_with_error_context(
+    case_dir: str,
+    cluster_info: dict,
+    error_message: str = "",
+    previous_script_content: str = "",
+    *,
+    llm_service: Optional[Any] = None,
+    openfoam_target: str = "",
+) -> str:
     """
     Create a SLURM script for OpenFOAM simulation using LLM, with error context for retries.
     
@@ -93,8 +117,13 @@ def create_slurm_script_with_error_context(case_dir: str, cluster_info: dict, er
         "4. Directory navigation and execution of the Allrun script"
         "5. Error handling and status reporting"
         "6. Any cluster-specific optimizations or requirements"
-        "7. Use your understanding of the documentation of the cluster and figure out the syntax of their jobscript."
-        ""
+        "7. Use your understanding of the documentation of the cluster and figure out the syntax of their jobscript. "
+    ) + (
+        "8. The already-loaded OpenFOAM environment must be ESI/OpenCFD v2006. "
+        "Do not substitute Foundation OpenFOAM commands or dictionaries."
+        if openfoam_target == "esi-v2006"
+        else ""
+    ) + (
         "If a previous script and error message are provided, analyze the error and the script "
         "to identify what went wrong and fix it. Common issues to consider:"
         "- Invalid account numbers or partitions"
@@ -131,7 +160,8 @@ def create_slurm_script_with_error_context(case_dir: str, cluster_info: dict, er
     
     user_prompt += f"\nGenerate a complete SLURM script that will run the OpenFOAM simulation using the Allrun script. Return ONLY the complete SLURM script content. Do not include any explanations or markdown formatting."
     
-    response = global_llm_service.invoke(user_prompt, system_prompt)
+    llm_client = llm_service if llm_service is not None else global_llm_service
+    response = llm_client.invoke(user_prompt, system_prompt)
     
     # Clean up the response to extract just the script content
     script_content = response.strip()
@@ -147,6 +177,10 @@ def create_slurm_script_with_error_context(case_dir: str, cluster_info: dict, er
     if not script_content.startswith('#!/bin/bash'):
         script_content = '#!/bin/bash\n' + script_content
     
+    script_content = _add_openfoam_runtime_guard(
+        script_content,
+        openfoam_target,
+    )
     script_path = os.path.join(case_dir, "submit_job.slurm")
     save_file(script_path, script_content)
     return script_path
@@ -154,7 +188,19 @@ def create_slurm_script_with_error_context(case_dir: str, cluster_info: dict, er
 
 def submit_slurm_job(script_path: str) -> Tuple[Optional[str], bool, str]:
     try:
-        result = subprocess.run(["sbatch", script_path], capture_output=True, text=True, check=True)
+        # The script's runtime guard checks $WM_PROJECT_VERSION before any module-load
+        # step (the generated script is told not to source OpenFOAM itself), so it
+        # relies on the submitting shell's environment reaching the job. sbatch's
+        # inherited-environment default isn't guaranteed on every site (some default
+        # to --export=NONE); pass --export=ALL explicitly so Foam-Agent's own already-
+        # sourced OpenFOAM environment (required just to run this process) is what the
+        # guard sees, instead of failing closed on every explicit-target HPC run.
+        result = subprocess.run(
+            ["sbatch", "--export=ALL", script_path],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
         output = result.stdout.strip()
         job_id_match = re.search(r'Submitted batch job (\d+)', output)
         if job_id_match:
@@ -179,25 +225,18 @@ def check_job_status(job_id: str) -> Tuple[Optional[str], bool, str]:
         return None, False, f"Unexpected error: {str(e)}"
 
 
-def generate_hpc_script(inp: HPCScriptIn, case_dir: str) -> HPCScriptOut:
-    script_path = create_slurm_script(case_dir, inp.hpc_config)
-    with open(script_path, "r") as f:
-        content = f.read()
-    return HPCScriptOut(script_content=content, script_path=script_path)
-
-
 def run_simulation_hpc(script_path: str) -> RunOut:
     job_id, ok, err = submit_slurm_job(script_path)
     status = "submitted" if ok else f"failed: {err}"
     return RunOut(job_id=job_id, status=status)
 
 
-def check_job(inp: JobStatusIn) -> JobStatusOut:
-    status, ok, err = check_job_status(inp.job_id)
-    return JobStatusOut(status=status if ok else f"error: {err}")
-
-
-def extract_cluster_info_from_requirement(user_requirement: str, case_dir: str) -> Dict:
+def extract_cluster_info_from_requirement(
+    user_requirement: str,
+    case_dir: str,
+    *,
+    llm_service: Optional[Any] = None,
+) -> Dict:
     """
     Extract cluster information from user requirement using LLM.
     
@@ -257,7 +296,8 @@ def extract_cluster_info_from_requirement(user_requirement: str, case_dir: str) 
     
     user_prompt += "Extract cluster information and return as JSON object."
     
-    response = global_llm_service.invoke(user_prompt, system_prompt)
+    llm_client = llm_service if llm_service is not None else global_llm_service
+    response = llm_client.invoke(user_prompt, system_prompt)
     
     # Try to parse the JSON response
     try:
@@ -337,3 +377,30 @@ def wait_for_job(job_id: str, max_wait_time: int = 3600, wait_interval: int = 30
     return last_status or "TIMEOUT", True, ""
 
 
+def _add_openfoam_runtime_guard(
+    script_content: str,
+    openfoam_target: str,
+) -> str:
+    """Make an explicit native-target job fail on a mismatched runtime."""
+    if openfoam_target not in {"foundation-v10", "esi-v2006"}:
+        return script_content
+    expected = "v2006|2006" if openfoam_target == "esi-v2006" else "10"
+    guard = (
+        f'case "{openfoam_target}:${{WM_PROJECT_VERSION:-}}" in\n'
+        + (
+            "    esi-v2006:v2006|esi-v2006:2006) ;;\n"
+            if openfoam_target == "esi-v2006"
+            else "    foundation-v10:10) ;;\n"
+        )
+        + f'    *) echo "Foam-Agent requires {openfoam_target} ({expected}) on this cluster." >&2; exit 64 ;;\n'
+        + "esac\n"
+    )
+    lines = script_content.splitlines()
+    # Keep the leading comments and #SBATCH directives before executable code.
+    insert_at = 0
+    while insert_at < len(lines):
+        line = lines[insert_at].strip()
+        if line and not line.startswith("#"):
+            break
+        insert_at += 1
+    return "\n".join([*lines[:insert_at], guard.rstrip("\n"), *lines[insert_at:]]) + "\n"

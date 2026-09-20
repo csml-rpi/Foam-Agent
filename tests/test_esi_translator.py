@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import shutil
 import sys
 from pathlib import Path
 
@@ -193,8 +192,8 @@ class TestFindDictBlock:
 
 @pytest.mark.integration
 def test_extract_and_translate_cavity_from_database(tmp_path: Path, rules_path: Path) -> None:
-    """Requires database/raw/openfoam_tutorials_details.txt."""
-    db = ROOT / "database" / "raw" / "openfoam_tutorials_details.txt"
+    """Requires database/foundation-v10/raw/openfoam_tutorials_details.txt."""
+    db = ROOT / "database" / "foundation-v10" / "raw" / "openfoam_tutorials_details.txt"
     if not db.is_file():
         pytest.skip("RAG database not available")
 

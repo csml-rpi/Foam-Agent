@@ -9,6 +9,7 @@ import os
 import re
 from pathlib import Path
 from typing import Any
+from openfoam_target import ESI_V2006, configured_openfoam_target
 
 _DEFAULT_RULES_PATH = (
     Path(__file__).resolve().parent / "esi_translation_rules.json"
@@ -228,8 +229,7 @@ FoamFile
             span = _find_dict_block(content, entry)
             if span is None:
                 continue
-            start, end = span
-            block = content[start:end]
+            _, end = span
             return content[:end] + pfinal + content[end:]
 
         return content
@@ -386,7 +386,14 @@ def _find_dict_block(content: str, entry_name: str) -> tuple[int, int] | None:
 
 
 def convert_case_to_esi_if_needed(case_dir: str | Path, config: Any) -> None:
-    """Run ESI translation when config.openfoam_fork == 'esi'."""
+    """Run the legacy ESI translation path when explicitly using generic ESI.
+
+    ``esi-v2006`` is a native target.  It deliberately bypasses this
+    Foundation-v10-to-ESI compatibility middleware even if a caller also has
+    the historical ``openfoam_fork=esi`` setting in its environment.
+    """
+    if configured_openfoam_target(config) == ESI_V2006:
+        return
     fork = getattr(config, "openfoam_fork", "foundation")
     if fork != "esi":
         return

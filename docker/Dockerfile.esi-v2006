@@ -1,0 +1,161 @@
+# Native ESI/OpenCFD v2006 Foam-Agent image.
+# Build from the project root:
+# docker build -f docker/Dockerfile.esi-v2006 -t foamagent:esi-v2006 .
+
+FROM ubuntu:20.04 AS openfoam-builder
+
+ARG OPENFOAM_VERSION=v2006
+ARG OPENFOAM_MD5=1226d48e74a4c78f12396cb586c331d8
+ARG THIRD_PARTY_MD5=6b598b6faa6ddeb25235c5dded0ca275
+ARG OPENFOAM_BUILD_JOBS=4
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN for attempt in 1 2 3; do \
+        apt-get -o Acquire::Retries=5 update && \
+        DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y \
+            build-essential bison flex cmake curl file gawk git libboost-system-dev \
+            libopenmpi-dev openmpi-bin mpi-default-bin perl python3 python3-dev \
+            tcsh zlib1g-dev && break; \
+        if [ "$attempt" = 3 ]; then exit 1; fi; \
+        sleep 5; \
+    done && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/OpenFOAM
+RUN download() { \
+        url="$1"; file="$2"; \
+        for attempt in 1 2 3 4 5; do \
+            curl --fail --location --connect-timeout 30 --speed-limit 1024 --speed-time 60 \
+                --continue-at - --output "$file" "$url" && return 0; \
+            if [ "$attempt" = 5 ]; then return 1; fi; \
+            sleep 5; \
+        done; \
+    }; \
+    download 'https://sourceforge.net/projects/openfoam/files/v2006/OpenFOAM-v2006.tgz/download?use_mirror=netix' OpenFOAM-v2006.tgz && \
+    echo "${OPENFOAM_MD5}  OpenFOAM-v2006.tgz" | md5sum --check - && \
+    download 'https://sourceforge.net/projects/openfoam/files/v2006/ThirdParty-v2006.tgz/download?use_mirror=netix' ThirdParty-v2006.tgz && \
+    echo "${THIRD_PARTY_MD5}  ThirdParty-v2006.tgz" | md5sum --check - && \
+    tar -xzf OpenFOAM-v2006.tgz && tar -xzf ThirdParty-v2006.tgz && \
+    rm OpenFOAM-v2006.tgz ThirdParty-v2006.tgz
+RUN source /opt/OpenFOAM/OpenFOAM-v2006/etc/bashrc && \
+    /opt/OpenFOAM/OpenFOAM-v2006/Allwmake -j"${OPENFOAM_BUILD_JOBS}"
+
+# --- Stage 1: Builder ---
+FROM ubuntu:20.04 AS builder
+USER root
+COPY --from=openfoam-builder /opt/OpenFOAM /opt/OpenFOAM
+
+# Install base utilities (including ca-certificates for SSL)
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        build-essential \
+        wget \
+        python3 \
+        python3-pip \
+        libboost-all-dev \
+        libopenmpi-dev \
+        openmpi-bin \
+        xvfb \
+        libgl1 \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Download and install Miniconda directly
+ENV CONDA_DIR=/opt/conda
+ENV PATH=$CONDA_DIR/bin:$PATH
+RUN wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/Miniconda3-latest-Linux-x86_64.sh \
+    && bash /tmp/Miniconda3-latest-Linux-x86_64.sh -b -p "$CONDA_DIR" \
+    && rm -f /tmp/Miniconda3-latest-Linux-x86_64.sh \
+    && ln -s "$CONDA_DIR/bin/conda" /usr/bin/conda \
+    && conda --version
+
+# Copy Foam-Agent from local directory (build context)
+ENV FoamAgent_PATH="/home/openfoam/Foam-Agent"
+WORKDIR /home/openfoam
+# Copy the entire project directory (excluding .dockerignore patterns)
+# Note: Build context must be the project root directory
+COPY . Foam-Agent
+
+# A native image is only useful when its target corpus is present and Git LFS
+# objects have been hydrated in the build context.
+RUN python3 /home/openfoam/Foam-Agent/scripts/verify_target_corpus.py \
+    --target esi-v2006
+
+# Switch to bash to source OpenFOAM environment
+SHELL ["/bin/bash", "-c"]
+
+# Create the Foam-Agent environment
+WORKDIR $FoamAgent_PATH
+RUN conda config --add channels conda-forge && \
+    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main && \
+    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r && \
+    conda env create --file environment.yml --yes
+
+# Gmsh is required by the custom and generated mesh workflow.  Keep it in the
+# FoamAgent environment rather than relying on a host-level Python package.
+RUN conda run -n FoamAgent pip install --no-cache-dir gmsh
+
+# Initialize conda for bash (automatic setup)
+RUN conda init bash && \
+    echo "conda activate FoamAgent" >> ~/.bashrc
+
+RUN conda clean --all --yes && \
+    rm -rf "$CONDA_DIR/pkgs" && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# --- Stage 2: Runtime ---
+FROM ubuntu:20.04
+USER root
+COPY --from=openfoam-builder /opt/OpenFOAM /opt/OpenFOAM
+
+# Install runtime dependencies
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        libboost-all-dev \
+        libopenmpi-dev \
+        openmpi-bin \
+        ca-certificates \
+        git \
+        git-lfs \
+        xvfb \
+        libgl1 \
+    && git lfs install \
+    && rm -rf /var/lib/apt/lists/*
+
+# Environment variables in a FoamAgent container
+ENV CONDA_DIR="/opt/conda"
+ENV PATH=$CONDA_DIR/bin:$PATH
+ENV FoamAgent_PATH="/home/openfoam/Foam-Agent"
+
+# Copy Conda runtime and Foam-Agent from builder
+COPY --from=builder --chown=root:root $CONDA_DIR $CONDA_DIR
+COPY --from=builder --chown=root:root $FoamAgent_PATH $FoamAgent_PATH
+COPY --from=builder --chown=root:root /root/.bashrc /root/.bashrc
+
+ENV FOAMAGENT_IMAGE_OPENFOAM_TARGET=esi-v2006
+ENV FOAMAGENT_OPENFOAM_TARGET=esi-v2006
+
+# Ensure conda is properly initialized in .bashrc for interactive shells
+RUN echo '' >> /root/.bashrc && \
+    echo '# Auto-activate FoamAgent environment' >> /root/.bashrc && \
+    echo 'if [ -f "$CONDA_DIR/etc/profile.d/conda.sh" ]; then' >> /root/.bashrc && \
+    echo '    source "$CONDA_DIR/etc/profile.d/conda.sh"' >> /root/.bashrc && \
+    echo '    conda activate FoamAgent 2>/dev/null || true' >> /root/.bashrc && \
+    echo 'fi' >> /root/.bashrc && \
+    echo '' >> /root/.bashrc && \
+    echo '# Auto-change to Foam-Agent directory' >> /root/.bashrc && \
+    echo 'cd "$FoamAgent_PATH" 2>/dev/null || true' >> /root/.bashrc
+
+# Copy entrypoint script from docker directory
+# Note: Build context should be the project root directory
+# Build command: docker build -f docker/Dockerfile.esi-v2006 .
+COPY docker/foamagent-entrypoint-esi-v2006.sh /usr/local/bin/foamagent-entrypoint.sh
+RUN chmod +x /usr/local/bin/foamagent-entrypoint.sh
+
+# Set default working directory
+WORKDIR /home/openfoam/
+
+# Use the custom entrypoint script
+ENTRYPOINT ["/usr/local/bin/foamagent-entrypoint.sh"]
+CMD ["/bin/bash"]

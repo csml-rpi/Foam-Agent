@@ -29,12 +29,6 @@ from translation.esi_translator import ESITranslator  # noqa: E402
 from extract_v10_case import _PRESETS, extract_case  # noqa: E402
 
 
-class _EsiConfig:
-  """Minimal config object for ESITranslator."""
-
-  openfoam_fork = "esi"
-
-
 def _read_application(case_dir: Path) -> str:
   control = case_dir / "system" / "controlDict"
   if not control.is_file():
@@ -80,7 +74,7 @@ def main() -> int:
   parser.add_argument("--solver", help="Custom extract: solver filter")
   parser.add_argument("--domain", help="Custom extract: domain filter")
   parser.add_argument("--category", help="Custom extract: category filter")
-  parser.add_argument("--db", type=Path, default=ROOT / "database" / "raw" / "openfoam_tutorials_details.txt")
+  parser.add_argument("--db", type=Path, default=ROOT / "database" / "foundation-v10" / "raw" / "openfoam_tutorials_details.txt")
   parser.add_argument("--overwrite", action="store_true")
   parser.add_argument(
     "--extract-only",

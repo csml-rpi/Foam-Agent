@@ -110,7 +110,7 @@ def find_cases(root_dir):
     FOAM_TUTORIALS = os.environ.get("FOAM_TUTORIALS", "/home/somasn/Documents/LLM/OpenFOAM-10/tutorials")
     blockmesh_resource_dir = os.path.join(FOAM_TUTORIALS, "resources", "blockMesh")
 
-    for root, dirs, files in os.walk(root_dir):
+    for root, dirs, _ in os.walk(root_dir):
         stats["directories_scanned"] += 1  # Scanning this directory
 
         # Check if the current directory contains a 'system' folder
@@ -375,16 +375,23 @@ def fetch_command_helps(commands, directory_path):
         return dict(zip(commands, executor.map(lambda cmd: get_command_help(cmd, directory_path), commands)))
 
 if __name__ == "__main__":
-    # python ./database/script/tutorial_parser.py --output_dir=./database/raw --wm_project_dir=$WM_PROJECT_DIR
+    # python ./database/script/tutorial_parser.py --output_dir=./database/foundation-v10/raw --wm_project_dir=$WM_PROJECT_DIR
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--wm_project_dir", required=True, help="Path to WM_PROJECT_DIR")
-    parser.add_argument("--output_dir", default='./database', help="Directory to save output files")
+    parser.add_argument("--output_dir", default='./database/foundation-v10/raw', help="Directory to save output files")
+    parser.add_argument(
+        "--tutorials_dir",
+        default="",
+        help="Optional tutorials root; defaults to <wm_project_dir>/tutorials.",
+    )
     args = parser.parse_args()
     
     print(args)
 
-    tutorial_path = os.path.join(args.wm_project_dir, "tutorials")
+    tutorial_path = args.tutorials_dir or os.path.join(args.wm_project_dir, "tutorials")
+    if not os.path.isdir(tutorial_path):
+        raise FileNotFoundError(f"OpenFOAM tutorials directory does not exist: {tutorial_path}")
     cases_info, case_stats = find_cases(tutorial_path)
     print(f"Statistics: {case_stats}")
     print(f"Found {len(cases_info)} cases in {tutorial_path}")
