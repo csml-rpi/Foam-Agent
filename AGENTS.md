@@ -1,5 +1,15 @@
 # AGENTS.md
 
+## 本项目的 feature 开发规则
+
+- 采用满足当前需求的最小代码和功能实现。
+- 仅修改与本次 feature 直接相关的代码，不附带无关重构或功能扩展。
+- 不额外增加安全测试、边界条件检查或限制，不扩展现有检查规则。
+- 每个 feature 只使用一个核心测试，可以在同一个测试函数中参数化相关场景。
+- 实现过程中出现具体问题时，可以增加临时诊断测试，并修复对应实现代码。
+- 问题修复并验证后，删除额外的临时诊断测试及其临时文件；仅保留该 feature 的核心测试，不删除原有测试。
+- 实现前先将已确定的开发规则写入本文件，再修改功能代码。
+
 > This file helps AI agents (Codex, Cursor, Claude Code, Copilot, etc.) understand and work with this codebase.
 
 ## What is Foam-Agent?
@@ -34,23 +44,59 @@ Requires a sourced OpenFOAM runtime (`$WM_PROJECT_DIR` must be set): Foundation 
 
 ### Workflow Pipeline (LangGraph StateGraph)
 
-Defined in `src/main.py`. Prompt-generated and imported cases share the same
-Planner, Input Writer, Meshing, Runner, Reviewer, and visualization nodes.
+Defined in `src/main.py`. Feature2 moves solver-file planning after the Meshing
+child graph and renames the outer node to `solver_planner`. First entry into
+`meshing_planner` prepares generated-case metadata, the output directory and
+references through shared preparation functions; imported cases reuse their
+existing context. Preparation is not a separate graph node and is not repeated
+on mesh repair. Input remains a single user requirement.
 
 ```
-START
-          |
-          +-- prompt -> PLANNER -> MESHING (if needed) -> INPUT_WRITER
-          |              -> LOCAL/HPC RUNNER -> REVIEWER -> retry INPUT_WRITER
-          |              -> VISUALIZATION (if requested) -> END
-          |
-          +-- existing case -> CASE_IMPORT -> PLANNER -> conditional routing
-                               -> INPUT_WRITER / MESHING / LOCAL/HPC RUNNER
-                               -> REVIEWER -> repair action -> END
+START -> [CASE_IMPORT for imported cases] -> MESHING -> SOLVER_PLANNER
+      -> INPUT_WRITER -> LOCAL/HPC RUNNER -> [VISUALIZATION] -> END
+
+MESHING child graph:
+START -> meshing_planner -> standard_meshing / gmsh_meshing / imported_meshing -> END
+
+Solver errors -> REVIEWER -> INPUT_WRITER for solver repairs
+                         -> MESHING for mesh repairs -> INPUT_WRITER
 ```
 
 Routing decisions are implemented in `src/router_func.py`. A complete imported
-case with `Allrun`, no detected issues, and no explicit prompt or custom mesh skips file planning and routes to Runner. LLM resources and routing decisions are still required. Other imported cases use LLM planning: missing files may be generated; missing physical information that cannot be inferred produces a planning failure. An explicit target conflict is recorded deterministically and routed to Reviewer for repair.
+case with `Allrun`, no detected physical issues, and no explicit prompt or custom
+mesh skips physical file planning. It still visits Meshing to plan mesh reuse and
+split its script; Input Writer preserves physical files when no edits are needed.
+Other imported cases use targeted physical planning; missing physical information
+that cannot be inferred produces a planning failure. Explicit target conflicts
+end with `case_target_mismatch`, preserving the existing behavior.
+
+`solver_planner` consumes the final mesh metadata and plans physical/solver files
+after successful Meshing. The `solver_planned` state flag records successful
+initial planning; subsequent mesh repairs return directly to Input Writer and
+preserve the Reviewer's pending file changes. Existing imported-target checks
+run before Meshing. CLI arguments and standalone planning-service calls retain
+their current behavior; no new safety or boundary-condition checks are added.
+
+`meshing_planner` selects a backend, plans mesh files and ordered commands, and
+extracts a solver-only remainder from an imported `Allrun` using the existing LLM
+approach. Standard mesh dictionaries, geometry, generation, conversion, checks,
+mesh modifications and repair run inside Meshing. Gmsh-specific checks stay in
+the Gmsh backend; external-mesh conversion/checking and case `polyMesh` reuse
+share `imported_meshing`. Existing `polyMesh` is a reuse condition, not a fourth
+backend. Case import copies the whole case into `original/` and `work/`; it does
+not split the case's directories by purpose.
+
+Mesh shell operations run through `Allmesh`; solver-only `Allrun` preserves solver
+arguments, physical field preparation and solver-parallel decomposition. Mesh
+repairs replan the backend and ordered commands from the Reviewer's feedback,
+including switching from mesh reuse to regeneration when no file edits are needed.
+The pending solver repair plan is preserved across these internal mesh retries.
+Mesh utilities can create a minimal bootstrap `controlDict` when missing; existing
+case solver settings are preserved. Mesh metadata contains the final `polyMesh`
+path and actual patch names/types/face counts for subsequent file generation.
+The physical boundary conditions in field files such as `0/U` remain the solver
+stage's responsibility. Shared file-writing/review helpers and metadata readers
+may be used by other nodes; mesh execution and mesh file repairs belong to Meshing.
 
 ### Directory Structure
 
@@ -63,9 +109,9 @@ src/
   router_func.py       # LLM-based routing decisions
   logger.py            # Structured XML-tagged logging
   nodes/               # LangGraph node functions (thin wrappers calling services)
-    planner_node.py
+    solver_planner_node.py
     input_writer_node.py
-    meshing_node.py
+    meshing_node.py     # Compiled child graph: planner and three backend nodes
     local_runner_node.py
     hpc_runner_node.py
     reviewer_node.py
@@ -74,7 +120,9 @@ src/
   services/            # Business logic (where the real work happens)
     plan.py            # Case planning and analysis
     input_writer.py    # OpenFOAM file generation via LLM + RAG
-    mesh.py            # Mesh generation (blockMesh / Gmsh conversion)
+    meshing.py         # Mesh planning, standard execution and internal repair
+    mesh.py            # Existing Gmsh/external-mesh backend implementations
+    mesh_context.py    # Mesh classification and final patch metadata
     run_local.py       # Local OpenFOAM execution
     run_hpc.py         # HPC job submission
     review.py          # Error diagnosis and fix planning
@@ -105,12 +153,31 @@ docker/                # Dockerfile for containerized deployment
 ### Design Patterns
 
 1. **Service-oriented**: Nodes in `src/nodes/` are thin orchestration wrappers. All logic lives in `src/services/`.
-2. **Error correction loop**: Runner detects errors -> Reviewer diagnoses via LLM -> Input Writer rewrites targeted files -> re-run (default `max_loop=25`, also bounded by the graph recursion limit). Meshing failures also reach Reviewer; repair returns to Meshing, with or without a targeted file rewrite. Repeated identical error/case/request fingerprints stop the repair loop.
+2. **Error correction loop**: Runner detects errors -> Reviewer diagnoses via LLM -> Input Writer rewrites solver files, or Meshing rewrites/regenerates mesh -> re-run. Meshing-stage errors use the same review service internally. Existing review limits and repeated-error fingerprints are retained; no new safety or boundary checks are added.
 3. **RAG retrieval**: FAISS indices built from OpenFOAM tutorials provide reference cases to the input writer.
 4. **Two generation modes** (`config.input_writer_generation_mode`):
    - `sequential_dependency` (default): Files generated in order with cross-file context.
    - `parallel_no_context`: All files generated independently (faster, relies on retry loop).
 5. **Target-scoped corpora**: Foundation v10 and native ESI v2006 use separate raw and FAISS data under `database/<target>/`.
+
+### Feature1 verification
+
+Keep one core parameterized test function in `tests/test_meshing_subgraph.py`.
+Run `python -m pytest tests/test_meshing_subgraph.py -q`. It runs the actual main
+graph, child graph, planning/file services and repair routes, with external LLM,
+retrieval, Gmsh subprocess and OpenFOAM execution mocked. It does not establish
+real CFD convergence or live LLM behavior. Existing routing tests are retained
+and updated for the mandatory Meshing/Input Writer handoff. Remove any additional
+temporary diagnostic tests and their files after correcting the corresponding code.
+
+### Feature2 verification
+
+Keep one core parameterized test function in `tests/test_solver_planner.py`.
+Verify mesh-before-solver planning, final patch context, one-time preparation,
+imported cases and preservation of repair plans across mesh retries. Run it with
+the Feature1 core regression; update existing tests affected by the node rename.
+External LLM, Gmsh and OpenFOAM calls are mocked. Remove any additional temporary
+diagnostic tests and files after fixing the corresponding implementation.
 
 ## Environment Variables
 

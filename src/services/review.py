@@ -1,4 +1,7 @@
 import hashlib
+from logger import log_review
+from openfoam_target import generation_convention
+from .mesh_context import is_mesh_file
 import json
 from pathlib import Path
 from .case_import import snapshot_files
@@ -33,6 +36,8 @@ def review_error_logs(
     history_text: Optional[List[str]] = None,
     llm_service: Optional[Any] = None,
     openfoam_target: str = "",
+    stage: str = "",
+    mesh_info: Optional[dict] = None,
 ) -> Tuple[str, List[str]]:
     """Stateless reviewer: returns (review_analysis, updated_history)."""
     advice_text = ""
@@ -68,6 +73,20 @@ def review_error_logs(
         )
 
     llm_client = llm_service if llm_service is not None else global_llm_service
+    reviewer_user_prompt += f"\n<actual_mesh>{mesh_info or {}}</actual_mesh>\n"
+    if stage == "solver":
+        reviewer_user_prompt += (
+            "Classify the required repair: end your answer with exactly "
+            "<repair_domain>mesh</repair_domain> for mesh regeneration, conversion "
+            "or mesh-file edits, or <repair_domain>solver</repair_domain> for "
+            "physical fields, solver settings or solver commands."
+        )
+    elif stage == "mesh":
+        reviewer_user_prompt += (
+            "Repair only mesh files, geometry, generation/conversion commands or Allmesh. "
+            "A missing bootstrap system/controlDict may be repaired for mesh utilities. "
+            "Physical field and solver changes belong to the later solver stage."
+        )
     review_response = llm_client.invoke(
         reviewer_user_prompt,
         _reviewer_system_prompt(openfoam_target),
@@ -159,8 +178,91 @@ def _is_runtime_artifact(relative: str) -> bool:
         top in {"postProcessing", "VTK", ".foamagent"}
         or top.startswith("processor") and top.removeprefix("processor").isdigit()
         or path.name.startswith("log")
-        or path.name in {"Allrun.out", "Allrun.err"}
+        or path.name in {"Allrun.out", "Allrun.err", "Allmesh.out", "Allmesh.err"}
     )
+
+
+def review_case(state, *, mesh=False):
+    """
+    Reviewer node: Reviews the error logs and provides analysis and suggestions
+    for fixing the errors. This node only focuses on analysis, not file modification.
+    """
+    if mesh:
+        state = {**state, "repairing_mesh": True}
+    print("<reviewer>")
+    if not state.get("error_logs"):
+        print("No error to review.")
+        print("</reviewer>")
+        return state
+
+    # Log error logs to review.log
+    log_review(str(state["error_logs"]), "error_logs")
+
+    fingerprint = error_fingerprint(state)
+    fingerprints = list(state.get("error_fingerprints") or [])
+    repeated = bool(fingerprints and fingerprint == fingerprints[-1])
+    fingerprints.append(fingerprint)
+    if repeated:
+        print("Repair made no progress: errors and case inputs are unchanged.")
+        print("</reviewer>")
+        return {
+            "error_fingerprints": fingerprints,
+            "workflow_status": "failed",
+            "termination_reason": "repair_made_no_progress",
+        }
+
+    # Stateless review via service
+    history_text = state.get("history_text") or []
+    review_content, updated_history = review_error_logs(
+        tutorial_reference=state.get('tutorial_reference') or '',
+        foamfiles=state.get('foamfiles'),
+        error_logs=state.get('error_logs'),
+        user_requirement=state.get('user_requirement', ''),
+        similar_case_advice=state.get('similar_case_advice'),
+        history_text=history_text,
+        llm_service=state.get("llm_service"),
+        openfoam_target=generation_convention(state["config"]),
+        stage="mesh" if mesh else "solver", mesh_info=state.get("mesh_info"),
+    )
+
+    log_review(review_content, "review_analysis")
+
+    if state.get("repairing_mesh"):
+        review_content = (
+            "Mesh preprocessing failed. After any file edits, the workflow will retry "
+            "meshing with this feedback before running the solver. "
+            "Return an empty target_files list if only mesh regeneration is needed.\n"
+            + review_content
+        )
+
+    rewrite_plan = generate_rewrite_plan(
+        foamfiles=state.get('foamfiles'),
+        error_logs=state.get('error_logs', []),
+        review_analysis=review_content,
+        llm_service=state.get("llm_service"),
+        openfoam_target=generation_convention(state["config"]),
+        user_requirement=state.get('user_requirement', ''),
+    )
+    log_review(str(rewrite_plan), "rewrite_plan")
+
+    print("</reviewer>")
+
+    next_loop_count = state.get("loop_count", 0) + 1
+    result = {
+        "error_fingerprints": fingerprints,
+        "history_text": updated_history,
+        "review_analysis": review_content,
+        "rewrite_plan": rewrite_plan,
+        "loop_count": next_loop_count,
+        "input_writer_mode": "rewrite",
+        "requires_input_writer": True,
+        "repairing_mesh": mesh or "<repair_domain>mesh</repair_domain>" in review_content
+        or any(is_mesh_file(t["file"]) for t in rewrite_plan.get("target_files", [])),
+    }
+    if next_loop_count >= state["config"].max_loop:
+        result["termination_reason"] = "max_review_loop_reached"
+        result["workflow_status"] = "failed"
+    return result
 
 
 def _reviewer_system_prompt(openfoam_target: str) -> str:

@@ -21,7 +21,7 @@ from models import ExistingCasePlan  # noqa: E402
 from nodes.input_writer_node import input_writer_node  # noqa: E402
 from nodes.local_runner_node import local_runner_node  # noqa: E402
 from router_func import (  # noqa: E402
-    route_after_planner,
+    route_after_solver_planner,
     route_after_input_writer,
     route_after_runner,
 )
@@ -136,7 +136,7 @@ def test_import_materialises_original_and_work_and_detects_target(tmp_path: Path
     assert (output / "report" / "case_context.json").is_file()
 
 
-def test_case_only_complete_case_goes_directly_to_runner_without_llm() -> None:
+def test_case_only_complete_case_skips_physical_planning_then_enters_writer() -> None:
     llm = _FakeLLM(response=AssertionError("LLM must not be called"))
     state = {
         "case_context": {
@@ -156,7 +156,7 @@ def test_case_only_complete_case_goes_directly_to_runner_without_llm() -> None:
     assert result["workflow_status"] == "running"
     assert not result["requires_input_writer"] and not result["requires_meshing"]
     assert llm.calls == []
-    assert route_after_planner({**state, **result, "case_origin": "imported"}) == "local_runner"
+    assert route_after_solver_planner({**state, **result, "case_origin": "imported"}) == "input_writer"
 
 
 @pytest.mark.parametrize("target", ["foundation-v10", "esi-v2006"])
@@ -399,7 +399,7 @@ def test_graph_routes_success_to_visualization_or_result() -> None:
     assert route_after_runner({**base, "requires_visualization": True}) == "visualization"
 
 
-def test_langgraph_case_only_path_skips_writer_and_returns_shared_result(monkeypatch) -> None:
+def test_langgraph_case_only_path_visits_meshing_and_writer_then_returns_shared_result(monkeypatch) -> None:
     writer_calls = []
 
     def fake_import(_state):
@@ -420,6 +420,7 @@ def test_langgraph_case_only_path_skips_writer_and_returns_shared_result(monkeyp
         return {'workflow_status': 'success', 'error_logs': []}
 
     monkeypatch.setattr(main, "case_import_node", fake_import)
+    monkeypatch.setattr(main, "meshing_node", lambda state: {"error_logs": []})
     monkeypatch.setattr(main, "local_runner_node", fake_runner)
     monkeypatch.setattr(
         main,
@@ -441,15 +442,16 @@ def test_langgraph_case_only_path_skips_writer_and_returns_shared_result(monkeyp
     )
 
     assert result["workflow_status"] == "success"
-    assert writer_calls == []
+    assert len(writer_calls) == 1
+    assert writer_calls[0]["requires_input_writer"] is False
 
 
 @pytest.mark.parametrize(
     ('mesh', 'writer', 'hpc', 'expected'),
     [
-        (False, False, False, ['local_runner']),
-        (False, True, False, ['input_writer', 'local_runner']),
-        (True, False, False, ['meshing', 'local_runner']),
+        (False, False, False, ['meshing', 'input_writer', 'local_runner']),
+        (False, True, False, ['meshing', 'input_writer', 'local_runner']),
+        (True, False, False, ['meshing', 'input_writer', 'local_runner']),
         (True, True, False, ['meshing', 'input_writer', 'local_runner']),
         (True, True, True, ['meshing', 'input_writer', 'hpc_runner']),
     ],
@@ -457,7 +459,7 @@ def test_langgraph_case_only_path_skips_writer_and_returns_shared_result(monkeyp
 def test_imported_graph_routes_without_action_bookkeeping(monkeypatch, mesh, writer, hpc, expected):
     visited = []
     monkeypatch.setattr(main, 'case_import_node', lambda state: {})
-    monkeypatch.setattr(main, 'planner_node', lambda state: {
+    monkeypatch.setattr(main, 'solver_planner_node', lambda state: {
         'workflow_status': 'running',
         'requires_meshing': mesh,
         'requires_input_writer': writer,
@@ -480,7 +482,7 @@ def test_imported_graph_routes_without_action_bookkeeping(monkeypatch, mesh, wri
 def test_imported_graph_repairs_then_runs_without_repeating_mesh(monkeypatch):
     visited = []
     monkeypatch.setattr(main, 'case_import_node', lambda state: {})
-    monkeypatch.setattr(main, 'planner_node', lambda state: {
+    monkeypatch.setattr(main, 'solver_planner_node', lambda state: {
         'workflow_status': 'running', 'requires_meshing': True,
         'requires_input_writer': False, 'requires_hpc': False,
     })
@@ -498,7 +500,7 @@ def test_imported_graph_repairs_then_runs_without_repeating_mesh(monkeypatch):
         'requires_visualization': False, 'error_logs': [],
         'config': SimpleNamespace(max_loop=3),
     })
-    assert visited == ['mesh', 'run', 'review', 'write', 'run']
+    assert visited == ['mesh', 'write', 'run', 'review', 'write', 'run']
 
 
 def test_runner_has_no_allrun_preflight_or_completion_marker_gate(

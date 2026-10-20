@@ -881,6 +881,7 @@ class GraphState(TypedDict):
     case_dir: str
     case_name: str
     subtasks: List[dict]
+    solver_planned: bool
     loop_count: int
     # Additional state fields that will be added during execution
     llm_service: Optional['LLMService']
@@ -888,6 +889,7 @@ class GraphState(TypedDict):
     tutorial_reference: Optional[str]
     case_path_reference: Optional[str]
     dir_structure_reference: Optional[str]
+    dir_counts_reference: Optional[str]
     case_info: Optional[str]
     allrun_reference: Optional[str]
     dir_structure: Optional[dict]
@@ -903,6 +905,8 @@ class GraphState(TypedDict):
     mesh_commands: Optional[List[str]]
     custom_mesh_used: Optional[bool]
     mesh_type: Optional[str]
+    mesh_subtasks: Optional[List[dict]]
+    solver_allrun: Optional[str]
     repairing_mesh: bool
     mesh_resume_state: Optional[dict]
     custom_mesh_path: Optional[str]
@@ -919,7 +923,7 @@ class GraphState(TypedDict):
     cluster_info: Optional[dict]
     slurm_script_path: Optional[str]
     termination_reason: Optional[str]
-    # Existing cases participate in the same planner/writer/runner/reviewer graph.
+    # Existing cases share Meshing and the solver-planner/writer/runner/reviewer graph.
     workflow_mode: str
     case_origin: str
     user_requirement_explicit: bool
@@ -1299,10 +1303,10 @@ def run_openfoam_utility(
 _EXPLICIT_FOAM_ERROR_RE = re.compile(r"ERROR:(.*)", re.DOTALL)
 
 
-def check_foam_errors(directory: str) -> list:
+def check_foam_errors(directory: str, filenames=None) -> list:
     """Collect explicit OpenFOAM errors without imposing completion heuristics."""
     error_logs: list[dict] = []
-    for file_name in os.listdir(directory):
+    for file_name in (os.listdir(directory) if filenames is None else filenames):
         if not file_name.startswith("log"):
             continue
         filepath = os.path.join(directory, file_name)
@@ -1454,6 +1458,12 @@ def load_case_files(state: dict[str, Any]) -> dict[str, Any]:
         return {}
     directory = scan_case_directory(case_dir)
     input_directory = _case_input_directory(directory)
+    scripts = [name for name in ("Allrun", "Allmesh", "generate_mesh.py")
+               if (Path(case_dir) / name).is_file()]
+    if scripts:
+        input_directory[""] = scripts
+    if (Path(case_dir) / "constant/polyMesh/boundary").is_file():
+        input_directory["constant/polyMesh"] = ["boundary"]
     foamfiles = read_case_foamfiles(case_dir, input_directory)
     return {
         "dir_structure": directory,

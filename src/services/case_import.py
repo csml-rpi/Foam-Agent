@@ -11,6 +11,7 @@ from typing import Any, Optional
 import zipfile
 
 from models import CaseImportError, CaseManifest
+from .mesh_context import mesh_state as _mesh_state
 from openfoam_target import ESI_V2006, FOUNDATION_V10, normalise_openfoam_target
 from .output_safety import (
     OutputDirectorySafetyError,
@@ -229,15 +230,7 @@ def _application(case_root: Path) -> Optional[str]:
     return match.group(1) if match else None
 
 
-def _mesh_state(case_root: Path) -> str:
-    if (case_root / "constant" / "polyMesh").is_dir():
-        return "existing-polyMesh"
-    if (case_root / "system" / "blockMeshDict").is_file():
-        return "blockMesh"
-    return "missing"
-
-
-def _discovery_issues(case_root: Path) -> list[str]:
+def _discovery_issues(case_root: Path, *, inspect_mesh: bool = True) -> list[str]:
     """Describe incomplete or unreadable case inputs for Planner/Reviewer."""
     issues: list[str] = []
     required = [
@@ -259,7 +252,7 @@ def _discovery_issues(case_root: Path) -> list[str]:
         issues.append("system/controlDict does not declare an application solver.")
     if not (case_root / "Allrun").is_file():
         issues.append("Missing Allrun.")
-    if _mesh_state(case_root) == "missing":
+    if inspect_mesh and _mesh_state(case_root) == "missing":
         issues.append("No existing polyMesh or system/blockMeshDict was found.")
     if case_root.is_dir() and not any(
         path.is_dir() and _TIME_DIRECTORY_RE.fullmatch(path.name)
@@ -309,6 +302,7 @@ def build_case_context(
     case_dir: str | Path,
     *,
     manifest: Optional[CaseManifest] = None,
+    inspect_mesh: bool = True,
 ) -> dict[str, Any]:
     root = Path(case_dir)
     files = sorted(
@@ -332,14 +326,14 @@ def build_case_context(
         "files": files,
         "has_control_dict": (root / "system" / "controlDict").is_file(),
         "has_allrun": (root / "Allrun").is_file(),
-        "mesh_state": _mesh_state(root),
+        "mesh_state": _mesh_state(root) if inspect_mesh else "unprocessed",
         "time_directories": time_directories,
         "has_existing_results": any(name not in {"0", "0.0"} for name in time_directories)
         or (root / "postProcessing").exists(),
         "candidate_cases": list(manifest.candidate_cases) if manifest else [],
         "issues": [
             *(list(manifest.issues) if manifest else []),
-            *_discovery_issues(root),
+            *_discovery_issues(root, inspect_mesh=inspect_mesh),
         ],
     }
 
@@ -351,6 +345,7 @@ def import_case(
     case_subdir: Optional[str] = None,
     overwrite: bool = False,
     openfoam_target: str = "",
+    inspect_mesh: bool = True,
 ) -> CaseManifest:
     """Copy an existing case into immutable ``original`` and mutable ``work`` trees."""
     source_input = Path(case_path).expanduser()
@@ -404,7 +399,7 @@ def import_case(
         version=version,
         application=_application(original),
         allrun_provided=(original / "Allrun").is_file(),
-        mesh_state=_mesh_state(original),
+        mesh_state=_mesh_state(original) if inspect_mesh else "unprocessed",
         candidate_cases=[] if case_subdir else candidates,
         issues=[*selection_issues, *platform_issues],
         target_mismatch=any(
@@ -415,5 +410,5 @@ def import_case(
     _make_read_only(original)
     _make_writable(work)
     _write_json(report / "case_manifest.json", manifest.to_dict())
-    _write_json(report / "case_context.json", build_case_context(work, manifest=manifest))
+    _write_json(report / "case_context.json", build_case_context(work, manifest=manifest, inspect_mesh=inspect_mesh))
     return manifest

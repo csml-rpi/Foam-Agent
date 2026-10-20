@@ -8,7 +8,7 @@ from config import Config
 from openfoam_target import (
     normalise_openfoam_target,
 )
-from nodes.planner_node import planner_node
+from nodes.solver_planner_node import solver_planner_node
 from nodes.meshing_node import meshing_node
 from nodes.input_writer_node import input_writer_node
 from nodes.local_runner_node import local_runner_node
@@ -19,7 +19,7 @@ from nodes.imported_case_node import case_import_node
 from router_func import (
     route_after_case_import,
     route_after_meshing,
-    route_after_planner,
+    route_after_solver_planner,
     route_after_input_writer,
     route_after_runner,
     route_after_reviewer,
@@ -42,7 +42,7 @@ def create_foam_agent_graph() -> StateGraph:
     workflow = StateGraph(GraphState)
     
     # Add nodes
-    workflow.add_node("planner", planner_node)
+    workflow.add_node("solver_planner", solver_planner_node)
     workflow.add_node("meshing", meshing_node)
     workflow.add_node("input_writer", input_writer_node)
     workflow.add_node("local_runner", local_runner_node)
@@ -53,7 +53,7 @@ def create_foam_agent_graph() -> StateGraph:
     
     # Add edges
     workflow.add_conditional_edges(START, route_workflow_entry)
-    workflow.add_conditional_edges("planner", route_after_planner)
+    workflow.add_conditional_edges("solver_planner", route_after_solver_planner)
     workflow.add_conditional_edges("meshing", route_after_meshing)
     workflow.add_conditional_edges("input_writer", route_after_input_writer)
     workflow.add_conditional_edges("hpc_runner", route_after_runner)
@@ -87,12 +87,14 @@ def initialize_state(
         case_dir="",
         case_name="",
         subtasks=[],
+        solver_planned=False,
         loop_count=0,
         llm_service=llm_service,
         case_stats=case_stats,
         tutorial_reference=None,
         case_path_reference=None,
         dir_structure_reference=None,
+        dir_counts_reference=None,
         case_info=None,
         allrun_reference=None,
         dir_structure=None,

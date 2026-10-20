@@ -91,7 +91,7 @@ def copy_custom_mesh(
         if openfoam_target == "esi-v2006"
         else ""
     )
-    if not retry or not os.path.isfile(os.path.join(system_dir, "controlDict")):
+    if not os.path.isfile(os.path.join(system_dir, "controlDict")):
         controldict_content = llm_client.invoke(controldict_prompt, (
             "You are an expert in OpenFOAM simulation setup. "
             "Create a minimal controlDict for gmshToFoam."
@@ -539,7 +539,7 @@ def handle_gmsh_mesh(
             )
             if openfoam_target == "esi-v2006":
                 controldict_prompt += " Use only native ESI/OpenCFD v2006 controlDict conventions."
-            if not retry or not os.path.isfile(os.path.join(system_dir, "controlDict")):
+            if not os.path.isfile(os.path.join(system_dir, "controlDict")):
                 controldict_content = llm_client.invoke(controldict_prompt, CONTROLDICT_SYSTEM_PROMPT).strip()  # type: ignore
                 if controldict_content:
                     save_file(os.path.join(system_dir, "controlDict"), controldict_content)
