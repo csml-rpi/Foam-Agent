@@ -9,6 +9,7 @@ from openfoam_target import (
     normalise_openfoam_target,
 )
 from nodes.solver_planner_node import solver_planner_node
+from nodes.meshing_planner_node import meshing_planner_node
 from nodes.meshing_node import meshing_node
 from nodes.input_writer_node import input_writer_node
 from nodes.local_runner_node import local_runner_node
@@ -42,6 +43,7 @@ def create_foam_agent_graph() -> StateGraph:
     workflow = StateGraph(GraphState)
     
     # Add nodes
+    workflow.add_node("meshing_planner", meshing_planner_node)
     workflow.add_node("solver_planner", solver_planner_node)
     workflow.add_node("meshing", meshing_node)
     workflow.add_node("input_writer", input_writer_node)
@@ -53,6 +55,7 @@ def create_foam_agent_graph() -> StateGraph:
     
     # Add edges
     workflow.add_conditional_edges(START, route_workflow_entry)
+    workflow.add_edge("meshing_planner", "meshing")
     workflow.add_conditional_edges("solver_planner", route_after_solver_planner)
     workflow.add_conditional_edges("meshing", route_after_meshing)
     workflow.add_conditional_edges("input_writer", route_after_input_writer)

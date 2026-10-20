@@ -420,6 +420,7 @@ def test_langgraph_case_only_path_visits_meshing_and_writer_then_returns_shared_
         return {'workflow_status': 'success', 'error_logs': []}
 
     monkeypatch.setattr(main, "case_import_node", fake_import)
+    monkeypatch.setattr(main, "meshing_planner_node", lambda state: {})
     monkeypatch.setattr(main, "meshing_node", lambda state: {"error_logs": []})
     monkeypatch.setattr(main, "local_runner_node", fake_runner)
     monkeypatch.setattr(
@@ -449,11 +450,11 @@ def test_langgraph_case_only_path_visits_meshing_and_writer_then_returns_shared_
 @pytest.mark.parametrize(
     ('mesh', 'writer', 'hpc', 'expected'),
     [
-        (False, False, False, ['meshing', 'input_writer', 'local_runner']),
-        (False, True, False, ['meshing', 'input_writer', 'local_runner']),
-        (True, False, False, ['meshing', 'input_writer', 'local_runner']),
-        (True, True, False, ['meshing', 'input_writer', 'local_runner']),
-        (True, True, True, ['meshing', 'input_writer', 'hpc_runner']),
+        (False, False, False, ['meshing_planner', 'meshing', 'input_writer', 'local_runner']),
+        (False, True, False, ['meshing_planner', 'meshing', 'input_writer', 'local_runner']),
+        (True, False, False, ['meshing_planner', 'meshing', 'input_writer', 'local_runner']),
+        (True, True, False, ['meshing_planner', 'meshing', 'input_writer', 'local_runner']),
+        (True, True, True, ['meshing_planner', 'meshing', 'input_writer', 'hpc_runner']),
     ],
 )
 def test_imported_graph_routes_without_action_bookkeeping(monkeypatch, mesh, writer, hpc, expected):
@@ -470,7 +471,7 @@ def test_imported_graph_routes_without_action_bookkeeping(monkeypatch, mesh, wri
             visited.append(name)
             return {'error_logs': []}
         return execute
-    for name in ('meshing', 'input_writer', 'local_runner', 'hpc_runner'):
+    for name in ('meshing_planner', 'meshing', 'input_writer', 'local_runner', 'hpc_runner'):
         monkeypatch.setattr(main, name + '_node', node(name))
     main.create_foam_agent_graph().compile().invoke({
         'workflow_mode': 'imported_case', 'case_origin': 'imported',
@@ -482,6 +483,7 @@ def test_imported_graph_routes_without_action_bookkeeping(monkeypatch, mesh, wri
 def test_imported_graph_repairs_then_runs_without_repeating_mesh(monkeypatch):
     visited = []
     monkeypatch.setattr(main, 'case_import_node', lambda state: {})
+    monkeypatch.setattr(main, 'meshing_planner_node', lambda state: visited.append('mesh_plan') or {})
     monkeypatch.setattr(main, 'solver_planner_node', lambda state: {
         'workflow_status': 'running', 'requires_meshing': True,
         'requires_input_writer': False, 'requires_hpc': False,
@@ -500,7 +502,7 @@ def test_imported_graph_repairs_then_runs_without_repeating_mesh(monkeypatch):
         'requires_visualization': False, 'error_logs': [],
         'config': SimpleNamespace(max_loop=3),
     })
-    assert visited == ['mesh', 'write', 'run', 'review', 'write', 'run']
+    assert visited == ['mesh_plan', 'mesh', 'write', 'run', 'review', 'write', 'run']
 
 
 def test_runner_has_no_allrun_preflight_or_completion_marker_gate(

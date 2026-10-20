@@ -106,6 +106,8 @@ def test_mesh_before_solver_workflow(scenario, modules, monkeypatch, tmp_path):
              "// Website: https://openfoam.org\n// Version: 10\napplication icoFoam;\n")
         config = Config(case_dir=str(tmp_path / "output"), openfoam_target="esi-v2006")
         meshes = []
+        monkeypatch.setattr(m.main, "meshing_planner_node",
+                            lambda _: pytest.fail("A target mismatch must stop before mesh planning"))
         monkeypatch.setattr(m.main, "meshing_node", lambda state: meshes.append(state) or {})
         monkeypatch.setattr(m.imported_case_node, "load_agent_resources",
                             lambda _: pytest.fail("A target mismatch must stop before loading resources"))
@@ -280,18 +282,18 @@ def test_mesh_before_solver_workflow(scenario, modules, monkeypatch, tmp_path):
     )
     graph = m.main.create_foam_agent_graph().compile()
     visits, result = [], None
-    for namespace, mode, update in graph.stream(state, stream_mode=["updates", "values"], subgraphs=True):
+    for mode, update in graph.stream(state, stream_mode=["updates", "values"]):
         if mode == "updates":
             visits.extend(update)
-        elif not namespace:
+        else:
             result = update
     assert result["workflow_status"] == "success" and not result["error_logs"]
     assert result["mesh_info"]["patches"] == [
         {"name": "inlet", "type": "patch", "n_faces": 1},
         {"name": "wall", "type": "wall", "n_faces": 2},
     ]
-    branch = "gmsh_meshing" if scenario == "gmsh" else "imported_meshing" if uploaded or has_poly else "standard_meshing"
-    assert visits.index("meshing_planner") < visits.index(branch) < visits.index("solver_planner") < visits.index("input_writer") < visits.index("local_runner")
+    assert visits.index("meshing_planner") < visits.index("meshing") < visits.index("solver_planner") < visits.index("input_writer") < visits.index("local_runner")
+    assert visits.count("meshing_planner") == visits.count("meshing") == (2 if scenario == "solver_mixed_retry" else 1)
     assert result["solver_allrun"] is None
     assert len(gmsh_calls) == (1 if scenario == "gmsh" else 0)
     assert conversions == ([["gmshToFoam", "geometry.msh"], ["checkMesh"]] if scenario == "gmsh" else [["gmshToFoam", "geometry.msh"]] if uploaded else [])
@@ -313,7 +315,6 @@ def test_mesh_before_solver_workflow(scenario, modules, monkeypatch, tmp_path):
         assert (Path(result["case_dir"]) / "system/blockMeshDict").read_text() == "existing mesh dictionary\n"
     if scenario in {"solver_retry", "solver_mixed_retry"}:
         assert len(solver_runs) == 2 and visits.count("reviewer") == 1
-        assert visits.count("meshing_planner") == (2 if scenario == "solver_mixed_retry" else 1)
     if not imported:
         field_prompt = next(prompt for folder, name, prompt in write_calls if folder == "0" and name == "U")
         assert "inlet" in field_prompt and "n_faces" in field_prompt

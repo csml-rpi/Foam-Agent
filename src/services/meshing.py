@@ -1,4 +1,4 @@
-"""Mesh planning and execution behind the Meshing child graph."""
+"""Shared mesh planning, backend execution and internal repair services."""
 
 from pathlib import Path
 import shlex

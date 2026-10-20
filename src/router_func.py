@@ -8,8 +8,8 @@ def route_workflow_entry(state: GraphState):
     if state.get("workflow_mode") == "imported_case":
         print("<router>Existing case requested. Routing to case_import node.</router>")
         return "case_import"
-    print("<router>Prompt workflow requested. Routing to meshing node.</router>")
-    return "meshing"
+    print("<router>Prompt workflow requested. Routing to meshing_planner node.</router>")
+    return "meshing_planner"
 
 
 def llm_requires_hpc(state: GraphState) -> bool:
@@ -92,7 +92,7 @@ def route_after_input_writer(state: GraphState):
         return "reviewer"
 
     if state.get("repairing_mesh"):
-        return "meshing"
+        return "meshing_planner"
 
     return _route_runner(state)
 
@@ -125,10 +125,10 @@ def route_after_runner(state: GraphState):
     return END
 
 def route_after_case_import(state: GraphState):
-    """Successfully imported cases enter Meshing before solver planning."""
+    """Successfully imported cases enter mesh planning before execution."""
     if state.get("workflow_status") == "failed":
         return END
-    return "meshing"
+    return "meshing_planner"
 
 
 def route_after_reviewer(state: GraphState):
@@ -148,5 +148,5 @@ def route_after_reviewer(state: GraphState):
 
     print(f"<router>Loop {loop_count}: Continuing to fix errors.</router>")
     if state.get("repairing_mesh"):
-        return "meshing"
+        return "meshing_planner"
     return "input_writer"
