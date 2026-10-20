@@ -1,15 +1,5 @@
 # AGENTS.md
 
-## 本项目的 feature 开发规则
-
-- 采用满足当前需求的最小代码和功能实现。
-- 仅修改与本次 feature 直接相关的代码，不附带无关重构或功能扩展。
-- 不额外增加安全测试、边界条件检查或限制，不扩展现有检查规则。
-- 每个 feature 只使用一个核心测试，可以在同一个测试函数中参数化相关场景。
-- 实现过程中出现具体问题时，可以增加临时诊断测试，并修复对应实现代码。
-- 问题修复并验证后，删除额外的临时诊断测试及其临时文件；仅保留该 feature 的核心测试，不删除原有测试。
-- 实现前先将已确定的开发规则写入本文件，再修改功能代码。
-
 > This file helps AI agents (Codex, Cursor, Claude Code, Copilot, etc.) understand and work with this codebase.
 
 ## What is Foam-Agent?
