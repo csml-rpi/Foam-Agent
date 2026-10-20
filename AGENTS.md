@@ -160,24 +160,21 @@ docker/                # Dockerfile for containerized deployment
    - `parallel_no_context`: All files generated independently (faster, relies on retry loop).
 5. **Target-scoped corpora**: Foundation v10 and native ESI v2006 use separate raw and FAISS data under `database/<target>/`.
 
-### Feature1 verification
+### Meshing and solver-planning PR verification
 
-Keep one core parameterized test function in `tests/test_meshing_subgraph.py`.
-Run `python -m pytest tests/test_meshing_subgraph.py -q`. It runs the actual main
-graph, child graph, planning/file services and repair routes, with external LLM,
-retrieval, Gmsh subprocess and OpenFOAM execution mocked. It does not establish
-real CFD convergence or live LLM behavior. Existing routing tests are retained
-and updated for the mandatory Meshing/Input Writer handoff. Remove any additional
-temporary diagnostic tests and their files after correcting the corresponding code.
-
-### Feature2 verification
-
-Keep one core parameterized test function in `tests/test_solver_planner.py`.
-Verify mesh-before-solver planning, final patch context, one-time preparation,
-imported cases and preservation of repair plans across mesh retries. Run it with
-the Feature1 core regression; update existing tests affected by the node rename.
-External LLM, Gmsh and OpenFOAM calls are mocked. Remove any additional temporary
-diagnostic tests and files after fixing the corresponding implementation.
+Treat Feature1 and Feature2 as one PR with one core parameterized test function,
+`test_mesh_before_solver_workflow` in `tests/test_meshing_subgraph.py`.
+Keep nine scenarios: standard mesh, Gmsh, uploaded mesh, imported polyMesh reuse,
+mesh-file repair, reuse-to-regeneration repair, solver-only repair, mixed
+mesh/solver repair, and the existing target-mismatch behavior.
+Check mesh-before-solver ordering, final patch context, one-time preparation,
+Allmesh/Allrun separation, imported-file preservation and pending solver repairs.
+Run `python -m pytest tests/test_meshing_subgraph.py -q`. The test runs the actual
+main graph, child graph and services, with external LLM, retrieval, Gmsh subprocess
+and OpenFOAM execution mocked. It does not establish real CFD convergence or live
+LLM behavior. Consolidate the added `tests/test_solver_planner.py` into this test;
+retain pre-existing repository tests. Remove temporary diagnostic tests and files
+after fixing the corresponding implementation.
 
 ## Environment Variables
 

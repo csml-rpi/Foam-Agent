@@ -70,18 +70,58 @@ def modules(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("scenario", [
-    "standard", "gmsh", "custom", "case_poly", "case_dict", "case_missing",
-    "case_custom", "case_gmsh", "case_regenerate", "mesh_retry", "solver_retry", "solver_mesh_retry", "solver_mixed_retry",
+    "standard", "gmsh", "custom", "case_poly", "mesh_retry",
+    "case_regenerate", "solver_retry", "solver_mixed_retry", "target_mismatch",
 ])
-def test_meshing_subgraph_handoff_and_repair(scenario, modules, monkeypatch, tmp_path):
-    _exercise_meshing_scenario(scenario, modules, monkeypatch, tmp_path)
-
-
-def _exercise_meshing_scenario(scenario, modules, monkeypatch, tmp_path):
+def test_mesh_before_solver_workflow(scenario, modules, monkeypatch, tmp_path):
     m = modules
-    imported = scenario.startswith("case_") or scenario in {"solver_retry", "solver_mesh_retry", "solver_mixed_retry"}
-    uploaded = scenario in {"custom", "case_custom"}
-    has_poly = scenario in {"case_poly", "case_custom", "case_gmsh", "case_regenerate", "solver_retry", "solver_mesh_retry", "solver_mixed_retry"}
+    planned, prepared, materialized = [], [], []
+    original_planner = m.main.solver_planner_node
+    original_prepare = m.plan.prepare_case_context
+    original_materialize = m.plan.prepare_output_directory
+
+    def observe_planning(state):
+        info = state["mesh_info"]
+        assert (Path(info["poly_mesh_path"]) / "boundary").is_file()
+        assert [patch["name"] for patch in info["patches"]] == ["inlet", "wall"]
+        planned.append(state)
+        return original_planner(state)
+
+    def observe_preparation(*args, **kwargs):
+        prepared.append(kwargs)
+        return original_prepare(*args, **kwargs)
+
+    def observe_materialization(*args, **kwargs):
+        materialized.append(args)
+        return original_materialize(*args, **kwargs)
+
+    monkeypatch.setattr(m.main, "solver_planner_node", observe_planning)
+    monkeypatch.setattr(m.plan, "prepare_case_context", observe_preparation)
+    monkeypatch.setattr(m.plan, "prepare_output_directory", observe_materialization)
+
+    if scenario == "target_mismatch":
+        from config import Config
+        source = tmp_path / "source"
+        _put(source, "system/controlDict",
+             "// Website: https://openfoam.org\n// Version: 10\napplication icoFoam;\n")
+        config = Config(case_dir=str(tmp_path / "output"), openfoam_target="esi-v2006")
+        meshes = []
+        monkeypatch.setattr(m.main, "meshing_node", lambda state: meshes.append(state) or {})
+        monkeypatch.setattr(m.imported_case_node, "load_agent_resources",
+                            lambda _: pytest.fail("A target mismatch must stop before loading resources"))
+        state = m.main.initialize_state(
+            "Run the imported case", config, workflow_mode="imported_case",
+            case_import_path=str(source), requires_visualization=False,
+        )
+        result = m.main.create_foam_agent_graph().compile().invoke(state)
+        assert result["workflow_status"] == "failed"
+        assert result["termination_reason"] == "case_target_mismatch"
+        assert not meshes and not planned and not prepared and not materialized
+        return
+
+    imported = scenario.startswith("case_") or scenario.startswith("solver_")
+    uploaded = scenario == "custom"
+    has_poly = imported
     solver_script = "#!/bin/sh\n. ${WM_PROJECT_DIR}/bin/tools/RunFunctions\nrestore0Dir\nrunApplication icoFoam -case .\n"
     original_script = solver_script.replace("restore0Dir", "runApplication blockMesh\nrunApplication checkMesh\nrestore0Dir")
     source = tmp_path / "source"
@@ -94,7 +134,7 @@ def _exercise_meshing_scenario(scenario, modules, monkeypatch, tmp_path):
         _put(source, "Allrun", original_script)
         if has_poly:
             _poly_mesh(source)
-        if scenario in {"case_dict", "case_regenerate"}:
+        if scenario == "case_regenerate":
             _put(source, "system/blockMeshDict", "existing mesh dictionary\n")
     custom_path = tmp_path / "uploaded.msh"
     if uploaded:
@@ -108,7 +148,7 @@ def _exercise_meshing_scenario(scenario, modules, monkeypatch, tmp_path):
             name = pydantic_obj.__name__ if pydantic_obj else ""
             if name == "MeshingPlan":
                 repair = "<repair_domain>mesh</repair_domain>" in user
-                kind = "gmsh_mesh" if scenario in {"gmsh", "case_gmsh"} else "custom_mesh" if uploaded or has_poly and not repair else "standard_mesh"
+                kind = "gmsh_mesh" if scenario == "gmsh" else "custom_mesh" if uploaded or has_poly and not repair else "standard_mesh"
                 tasks = []
                 case_root = tmp_path / "output" / ("work" if imported else "")
                 if kind == "standard_mesh" and not (case_root / "system/blockMeshDict").is_file():
@@ -151,7 +191,7 @@ def _exercise_meshing_scenario(scenario, modules, monkeypatch, tmp_path):
             if "underlying issues" in system:
                 if scenario == "case_regenerate":
                     return "Regenerate the mesh using the existing blockMeshDict. <repair_domain>mesh</repair_domain>"
-                domain = "mesh" if scenario in {"mesh_retry", "solver_mesh_retry", "solver_mixed_retry"} else "solver"
+                domain = "mesh" if scenario in {"mesh_retry", "solver_mixed_retry"} else "solver"
                 return f"Repair the reported {domain} failure. <repair_domain>{domain}</repair_domain>"
             if "hpc_run" in system:
                 return "local_run"
@@ -211,7 +251,7 @@ def _exercise_meshing_scenario(scenario, modules, monkeypatch, tmp_path):
             assert all(token not in content for token in ("blockMesh", "checkMesh", "gmshToFoam", "Allmesh"))
             assert (case / "constant/polyMesh/boundary").is_file()
             assert "restore0Dir" in content and "icoFoam -case ." in content
-            if scenario in {"solver_retry", "solver_mesh_retry", "solver_mixed_retry"} and len(solver_runs) == 1:
+            if scenario in {"solver_retry", "solver_mixed_retry"} and len(solver_runs) == 1:
                 Path(stderr).write_text("solver detected an input error", encoding="utf-8")
                 return {"returncode": 1}
         return {"returncode": 0}
@@ -235,7 +275,7 @@ def _exercise_meshing_scenario(scenario, modules, monkeypatch, tmp_path):
         "Run the case", config, str(custom_path) if uploaded else None,
         workflow_mode="imported_case" if imported else "prompt",
         case_import_path=str(source) if imported else None,
-        user_requirement_explicit=uploaded or scenario == "case_gmsh" if imported else True,
+        user_requirement_explicit=not imported,
         requires_visualization=False,
     )
     graph = m.main.create_foam_agent_graph().compile()
@@ -250,16 +290,16 @@ def _exercise_meshing_scenario(scenario, modules, monkeypatch, tmp_path):
         {"name": "inlet", "type": "patch", "n_faces": 1},
         {"name": "wall", "type": "wall", "n_faces": 2},
     ]
-    branch = "gmsh_meshing" if scenario in {"gmsh", "case_gmsh"} else "imported_meshing" if uploaded or has_poly else "standard_meshing"
+    branch = "gmsh_meshing" if scenario == "gmsh" else "imported_meshing" if uploaded or has_poly else "standard_meshing"
     assert visits.index("meshing_planner") < visits.index(branch) < visits.index("solver_planner") < visits.index("input_writer") < visits.index("local_runner")
     assert result["solver_allrun"] is None
-    assert len(gmsh_calls) == (1 if scenario in {"gmsh", "case_gmsh"} else 0)
-    assert conversions == ([["gmshToFoam", "geometry.msh"], ["checkMesh"]] if scenario in {"gmsh", "case_gmsh"} else [["gmshToFoam", "geometry.msh"]] if uploaded else [])
+    assert len(gmsh_calls) == (1 if scenario == "gmsh" else 0)
+    assert conversions == ([["gmshToFoam", "geometry.msh"], ["checkMesh"]] if scenario == "gmsh" else [["gmshToFoam", "geometry.msh"]] if uploaded else [])
     if imported:
         assert (source / "Allrun").read_text(encoding="utf-8") == original_script
         assert (tmp_path / "output/original/Allrun").read_text(encoding="utf-8") == original_script
         assert result["case_context"]["mesh_state"] == "existing-polyMesh"
-        assert result["case_import_manifest"].mesh_state == ("existing-polyMesh" if has_poly else "blockMesh" if scenario == "case_dict" else "missing")
+        assert result["case_import_manifest"].mesh_state == "existing-polyMesh"
         assert (Path(result["case_dir"]) / "0/U").read_text(encoding="utf-8") == ("fixed physical field\n" if scenario in {"solver_retry", "solver_mixed_retry"} else "original physical field\n")
         assert (Path(result["case_dir"]) / "system/controlDict").read_text(encoding="utf-8") == (source / "system/controlDict").read_text(encoding="utf-8")
     if uploaded:
@@ -271,11 +311,24 @@ def _exercise_meshing_scenario(scenario, modules, monkeypatch, tmp_path):
         assert "blockMesh" not in mesh_runs[0] and "blockMesh" in mesh_runs[1]
         assert sum(model is not None and model.__name__ == "MeshingPlan" for _, _, model in calls) == 2
         assert (Path(result["case_dir"]) / "system/blockMeshDict").read_text() == "existing mesh dictionary\n"
-    if scenario in {"solver_retry", "solver_mesh_retry", "solver_mixed_retry"}:
+    if scenario in {"solver_retry", "solver_mixed_retry"}:
         assert len(solver_runs) == 2 and visits.count("reviewer") == 1
-        assert visits.count("meshing_planner") == (2 if scenario in {"solver_mesh_retry", "solver_mixed_retry"} else 1)
+        assert visits.count("meshing_planner") == (2 if scenario == "solver_mixed_retry" else 1)
     if not imported:
         field_prompt = next(prompt for folder, name, prompt in write_calls if folder == "0" and name == "U")
         assert "inlet" in field_prompt and "n_faces" in field_prompt
-    return SimpleNamespace(result=result, visits=visits, calls=calls, mesh_runs=mesh_runs,
-                           solver_runs=solver_runs, write_calls=write_calls)
+    assert result["solver_planned"] is True
+    assert visits.count("solver_planner") == len(planned) == 1
+    assert len(prepared) == len(materialized) == (0 if imported else 1)
+    planning_prompts = [
+        user for user, _, model in calls
+        if model and model.__name__ in {"OpenFOAMPlanModel", "ExistingCasePlan"}
+    ]
+    if not imported:
+        assert len(planning_prompts) == 1
+    for prompt in planning_prompts:
+        assert "<actual_mesh>" in prompt and "inlet" in prompt and "n_faces" in prompt
+    if scenario == "solver_mixed_retry":
+        assert result["rewrite_plan"]["target_files"] == [
+            {"file": "0/U", "changes": "Apply the field correction"},
+        ]
