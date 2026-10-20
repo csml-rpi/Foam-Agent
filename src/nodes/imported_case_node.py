@@ -23,7 +23,6 @@ def case_import_node(state: dict[str, Any]) -> dict[str, Any]:
             case_subdir=state.get("case_import_subdir"),
             overwrite=config.overwrite_case_dir,
             openfoam_target=getattr(config, "openfoam_target", ""),
-            inspect_mesh=False,
         )
     except (CaseImportError, OSError) as exc:
         print(f"<case_import_error>{exc}</case_import_error>")
@@ -44,7 +43,7 @@ def case_import_node(state: dict[str, Any]) -> dict[str, Any]:
     work = output_root / "work"
     report = output_root / "report"
     setup_logging(str(report / "logs"))
-    context = build_case_context(work, manifest=manifest, inspect_mesh=False)
+    context = build_case_context(work, manifest=manifest)
 
     failure = imported_case_target_failure({
         **state, "case_context": context, "case_import_manifest": manifest,

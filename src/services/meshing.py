@@ -77,11 +77,6 @@ def plan_meshing(state):
     elif (status == "existing-polyMesh" and not state.get("user_requirement_explicit", True)
           and not state.get("repairing_mesh")):
         plan.mesh_type, plan.reuse_mesh = "custom_mesh", True
-    manifest = state.get("case_import_manifest")
-    if manifest and manifest.mesh_state == "unprocessed":
-        manifest.mesh_state = status
-        from .case_import import _write_json
-        _write_json(Path(state["case_import_report_dir"]) / "case_manifest.json", manifest.to_dict())
     return {
         **preparation,
         "mesh_type": plan.mesh_type,

@@ -84,6 +84,9 @@ the Gmsh backend; external-mesh conversion/checking and case `polyMesh` reuse
 share `imported_meshing`. Existing `polyMesh` is a reuse condition, not a fourth
 backend. Case import copies the whole case into `original/` and `work/`; it does
 not split the case's directories by purpose.
+Keep the original mesh-state inspection during case import; do not add an
+`inspect_mesh` switch or an `unprocessed` intermediate mesh state. Meshing
+planning reads the current mesh state again when needed.
 
 The ordinary Meshing node selects a backend service with `if`/`elif` and calls
 the shared execution service. Internal mesh retries stay in that service loop,
