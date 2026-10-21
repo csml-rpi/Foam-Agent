@@ -11,7 +11,6 @@ from typing import Any, Optional
 import zipfile
 
 from models import CaseImportError, CaseManifest
-from .mesh_context import mesh_state as _mesh_state
 from openfoam_target import ESI_V2006, FOUNDATION_V10, normalise_openfoam_target
 from .output_safety import (
     OutputDirectorySafetyError,
@@ -252,8 +251,6 @@ def _discovery_issues(case_root: Path) -> list[str]:
         issues.append("system/controlDict does not declare an application solver.")
     if not (case_root / "Allrun").is_file():
         issues.append("Missing Allrun.")
-    if _mesh_state(case_root) == "missing":
-        issues.append("No existing polyMesh or system/blockMeshDict was found.")
     if case_root.is_dir() and not any(
         path.is_dir() and _TIME_DIRECTORY_RE.fullmatch(path.name)
         for path in case_root.iterdir()
@@ -325,7 +322,6 @@ def build_case_context(
         "files": files,
         "has_control_dict": (root / "system" / "controlDict").is_file(),
         "has_allrun": (root / "Allrun").is_file(),
-        "mesh_state": _mesh_state(root),
         "time_directories": time_directories,
         "has_existing_results": any(name not in {"0", "0.0"} for name in time_directories)
         or (root / "postProcessing").exists(),
@@ -397,7 +393,6 @@ def import_case(
         version=version,
         application=_application(original),
         allrun_provided=(original / "Allrun").is_file(),
-        mesh_state=_mesh_state(original),
         candidate_cases=[] if case_subdir else candidates,
         issues=[*selection_issues, *platform_issues],
         target_mismatch=any(

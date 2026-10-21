@@ -1,11 +1,10 @@
 import hashlib
 from logger import log_review
 from openfoam_target import generation_convention
-from .mesh_context import is_mesh_file
 import json
 from pathlib import Path
 from .case_import import snapshot_files
-from typing import List, Optional, Tuple, Any
+from typing import List, Optional, Tuple, Any, Literal
 from pydantic import BaseModel, Field
 from models import PlannedFileChange
 from . import global_llm_service
@@ -13,6 +12,14 @@ from . import global_llm_service
 
 class RewritePlan(BaseModel):
     target_files: List[PlannedFileChange] = Field(description="Files to modify and required changes")
+
+
+class WorkflowRepairPlan(RewritePlan):
+    repair_domain: Literal["mesh", "solver"]
+
+
+class MeshRepairPlan(WorkflowRepairPlan):
+    action: Literal["continue", "stop"]
 
 
 REVIEWER_SYSTEM_PROMPT = (
@@ -36,8 +43,6 @@ def review_error_logs(
     history_text: Optional[List[str]] = None,
     llm_service: Optional[Any] = None,
     openfoam_target: str = "",
-    stage: str = "",
-    mesh_info: Optional[dict] = None,
 ) -> Tuple[str, List[str]]:
     """Stateless reviewer: returns (review_analysis, updated_history)."""
     advice_text = ""
@@ -73,20 +78,6 @@ def review_error_logs(
         )
 
     llm_client = llm_service if llm_service is not None else global_llm_service
-    reviewer_user_prompt += f"\n<actual_mesh>{mesh_info or {}}</actual_mesh>\n"
-    if stage == "solver":
-        reviewer_user_prompt += (
-            "Classify the required repair: end your answer with exactly "
-            "<repair_domain>mesh</repair_domain> for mesh regeneration, conversion "
-            "or mesh-file edits, or <repair_domain>solver</repair_domain> for "
-            "physical fields, solver settings or solver commands."
-        )
-    elif stage == "mesh":
-        reviewer_user_prompt += (
-            "Repair only mesh files, geometry, generation/conversion commands or Allmesh. "
-            "A missing bootstrap system/controlDict may be repaired for mesh utilities. "
-            "Physical field and solver changes belong to the later solver stage."
-        )
     review_response = llm_client.invoke(
         reviewer_user_prompt,
         _reviewer_system_prompt(openfoam_target),
@@ -111,19 +102,21 @@ def generate_rewrite_plan(
     user_requirement: str,
     llm_service: Optional[Any] = None,
     openfoam_target: str = "",
+    stage: str = "",
 ) -> dict:
     """Generate a minimal, explicit rewrite plan for downstream rewrite step."""
     planner_system_prompt = (
         "You are an OpenFOAM debugging planner. "
         "Given current foam files, error logs and reviewer analysis, create a minimal rewrite plan. "
         "Output MUST be strict JSON only, with this exact schema: "
-        "{\"target_files\": [{\"file\": \"relative/path\", \"changes\": \"change1; change2\"}]}. "
+        "{\"target_files\": [{\"file\": \"relative/path\", \"changes\": \"change1; change2\", \"stage\": \"solver\"}]}. "
         "Rules: "
         "1) Do not use markdown, backticks, or comments. "
         "2) Use double quotes for all strings. "
         "3) In changes, use short plain text actions separated by semicolons. "
         "4) Do not include parentheses, backticks, or quote characters inside changes text. "
-        "5) Do not include run steps; only file edits."
+        "5) Do not include run steps; only file edits. "
+        "6) Set stage to mesh or solver; solver includes execution scripts."
     )
     if openfoam_target == "esi-v2006":
         planner_system_prompt += (
@@ -139,11 +132,26 @@ def generate_rewrite_plan(
         "Return strict JSON now with key target_files only."
     )
 
+    if stage:
+        planner_system_prompt = (
+            "Convert the diagnosis into the supplied structured repair schema. Declare each "
+            "file's stage (mesh or solver, including execution scripts in solver), and concrete changes from its use, "
+            "not its name. Include all required stages without dropping pending physical repairs. "
+            "Set repair_domain to mesh when mesh operations are needed, even with no file edits. "
+            f"Preserve explicit user requirements and target {openfoam_target}."
+        )
+        if stage == "mesh":
+            planner_system_prompt += " Set action to stop if no justified next repair remains, otherwise continue."
+        planner_user_prompt = planner_user_prompt.replace(
+            "Return strict JSON now with key target_files only.",
+            f"Current execution stage: {stage}. Return the full repair schema.",
+        )
+
     llm_client = llm_service if llm_service is not None else global_llm_service
     response = llm_client.invoke(
         planner_user_prompt,
         planner_system_prompt,
-        pydantic_obj=RewritePlan,
+        pydantic_obj=MeshRepairPlan if stage == "mesh" else WorkflowRepairPlan if stage else RewritePlan,
     )
     return response.model_dump()
 
@@ -182,13 +190,12 @@ def _is_runtime_artifact(relative: str) -> bool:
     )
 
 
-def review_case(state, *, mesh=False):
+def review_case(state):
     """
     Reviewer node: Reviews the error logs and provides analysis and suggestions
     for fixing the errors. This node only focuses on analysis, not file modification.
     """
-    if mesh:
-        state = {**state, "repairing_mesh": True}
+    mesh = bool(state.get("repairing_mesh"))
     print("<reviewer>")
     if not state.get("error_logs"):
         print("No error to review.")
@@ -202,7 +209,7 @@ def review_case(state, *, mesh=False):
     fingerprints = list(state.get("error_fingerprints") or [])
     repeated = bool(fingerprints and fingerprint == fingerprints[-1])
     fingerprints.append(fingerprint)
-    if repeated:
+    if repeated and not mesh:
         print("Repair made no progress: errors and case inputs are unchanged.")
         print("</reviewer>")
         return {
@@ -211,18 +218,34 @@ def review_case(state, *, mesh=False):
             "termination_reason": "repair_made_no_progress",
         }
 
+    if mesh and state.get("loop_count", 0) >= state["config"].max_loop:
+        return {"workflow_status": "failed", "termination_reason": "max_review_loop_reached"}
+
     # Stateless review via service
     history_text = state.get("history_text") or []
+    requirement = (
+        state.get("user_requirement", "")
+        + f"\n<actual_mesh>{state.get('mesh_info') or {}}</actual_mesh>\n"
+        + f"<repeated_failure>{repeated}</repeated_failure>\n"
+        + f"<existing_physics>{state.get('case_info')}</existing_physics>\n"
+        + f"<pending_repairs>{state.get('rewrite_plan')}</pending_repairs>\n"
+        + f"<execution>{state.get('mesh_execution')}</execution>\n"
+        + f"Current execution stage: {'mesh' if mesh else 'solver'}. "
+        "Explain which operations and files need repair, their stage, and whether "
+        "the changes affect the existing physical plan. Use actual file contents "
+        "and native errors, not filenames, to determine the stage. Mesh operations "
+        "run before pending physical repairs. Decide whether there is a justified "
+        "next repair or the workflow should stop; consider repeated failures."
+    )
     review_content, updated_history = review_error_logs(
         tutorial_reference=state.get('tutorial_reference') or '',
         foamfiles=state.get('foamfiles'),
         error_logs=state.get('error_logs'),
-        user_requirement=state.get('user_requirement', ''),
+        user_requirement=requirement,
         similar_case_advice=state.get('similar_case_advice'),
         history_text=history_text,
         llm_service=state.get("llm_service"),
         openfoam_target=generation_convention(state["config"]),
-        stage="mesh" if mesh else "solver", mesh_info=state.get("mesh_info"),
     )
 
     log_review(review_content, "review_analysis")
@@ -242,6 +265,7 @@ def review_case(state, *, mesh=False):
         llm_service=state.get("llm_service"),
         openfoam_target=generation_convention(state["config"]),
         user_requirement=state.get('user_requirement', ''),
+        stage="mesh" if mesh else "solver",
     )
     log_review(str(rewrite_plan), "rewrite_plan")
 
@@ -252,13 +276,15 @@ def review_case(state, *, mesh=False):
         "error_fingerprints": fingerprints,
         "history_text": updated_history,
         "review_analysis": review_content,
-        "rewrite_plan": rewrite_plan,
+        "rewrite_plan": {"target_files": rewrite_plan["target_files"]},
         "loop_count": next_loop_count,
         "input_writer_mode": "rewrite",
         "requires_input_writer": True,
-        "repairing_mesh": mesh or "<repair_domain>mesh</repair_domain>" in review_content
-        or any(is_mesh_file(t["file"]) for t in rewrite_plan.get("target_files", [])),
+        "repairing_mesh": mesh or rewrite_plan["repair_domain"] == "mesh"
+        or any(t["stage"] == "mesh" for t in rewrite_plan["target_files"]),
     }
+    if mesh and rewrite_plan["action"] == "stop":
+        result.update(workflow_status="failed", termination_reason="mesh_review_stopped")
     if next_loop_count >= state["config"].max_loop:
         result["termination_reason"] = "max_review_loop_reached"
         result["workflow_status"] = "failed"

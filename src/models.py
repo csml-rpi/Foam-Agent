@@ -25,7 +25,6 @@ class CaseManifest:
     version: Optional[str]
     application: Optional[str]
     allrun_provided: bool
-    mesh_state: str
     candidate_cases: list[str] = field(default_factory=list)
     issues: list[str] = field(default_factory=list)
     target_mismatch: bool = False
@@ -48,6 +47,7 @@ class PlannedFileChange(BaseModel):
 
     file: str = Field(description="Relative file path, e.g. system/fvSchemes or 0/U")
     changes: str = Field(description="Semicolon-separated concrete changes for this file")
+    stage: Literal["mesh", "solver"]
 
 
 class ExistingCasePlan(BaseModel):
@@ -58,3 +58,4 @@ class ExistingCasePlan(BaseModel):
     requires_input_writer: bool = False
     target_files: List[PlannedFileChange] = Field(default_factory=list)
     reason: str = ""
+    solver_allrun: str = ""

@@ -34,65 +34,54 @@ Requires a sourced OpenFOAM runtime (`$WM_PROJECT_DIR` must be set): Foundation 
 
 ### Workflow Pipeline (LangGraph StateGraph)
 
-Defined in `src/main.py`. Split the original Planner into two main-graph nodes,
-`meshing_planner` and `solver_planner`, with an ordinary `meshing` node between
-them. Do not create a Meshing child graph or register mesh backends as nodes.
-Node adapters remain thin wrappers around service functions. First entry into
-`meshing_planner` prepares generated-case metadata, the output directory and
-references through shared preparation functions; imported cases reuse their
-existing context. Preparation is not a separate graph node and is not repeated
-on mesh repair. Input remains a single user requirement.
+Defined in `src/main.py`. All non-CAD inputs enter `preparation`, followed by
+`meshing_planner`, an ordinary `meshing` node, and `solver_planner`. Node adapters
+remain thin service wrappers; mesh backends are not graph nodes or child graphs.
 
 ```
-START -> [CASE_IMPORT for imported cases] -> MESHING_PLANNER -> MESHING
-      -> SOLVER_PLANNER -> INPUT_WRITER -> LOCAL/HPC RUNNER -> [VISUALIZATION] -> END
+START -> PREPARATION -> MESHING_PLANNER -> MESHING -> SOLVER_PLANNER
+      -> INPUT_WRITER -> LOCAL/HPC RUNNER -> [VISUALIZATION] -> END
 
 Solver errors -> REVIEWER -> INPUT_WRITER for solver repairs
-                         -> MESHING_PLANNER -> MESHING for mesh repairs -> INPUT_WRITER
+                         -> MESHING_PLANNER -> MESHING for mesh repairs -> SOLVER_PLANNER or INPUT_WRITER
 ```
 
-Routing decisions are implemented in `src/router_func.py`. A complete imported
-case with `Allrun`, no detected physical issues, and no explicit prompt or custom
-mesh skips physical file planning. It still visits Meshing Planner to plan mesh reuse and
-split its script; Input Writer preserves physical files when no edits are needed.
-Other imported cases use targeted physical planning; missing physical information
-that cannot be inferred produces a planning failure. Explicit target conflicts
-end with `case_target_mismatch`, preserving the existing behavior.
+Preparation installs working copies of prompt, external material and imported
+case inputs and records actual file facts. It does not select a simulation
+solver, retrieve solver cases, or force mesh reuse/regeneration. Existing case
+import services retain target detection, original/work/report copies and target
+mismatch failures. Imported cases enter through Preparation; the old imported-case
+node adapter has been removed.
 
-`solver_planner` consumes the final mesh metadata and plans physical/solver files
-after successful Meshing. The `solver_planned` state flag records successful
-initial planning; subsequent mesh repairs return directly to Input Writer and
-preserve the Reviewer's pending file changes. Existing imported-target checks
-run before Meshing. CLI arguments and standalone planning-service calls retain
-their current behavior; no new safety or boundary-condition checks are added.
+Meshing Planner selects a backend, source material, files and ordered commands
+from the requirement and available files. No uploaded path or polyMesh directory
+forces a backend or reuse policy. Standard OpenFOAM utilities, generated Gmsh,
+uploaded Gmsh .msh files and meshes inside imported cases use the same graph.
+External .geo scripts and standalone polyMesh directories are outside this update;
+SpaceClaim/Fluent input is deferred. Planners use prepared input paths, case file
+listings and contents; mesh handoff includes actual patches and boundary text.
 
-`meshing_planner` selects a backend, plans mesh files and ordered commands, and
-extracts a solver-only remainder from an imported `Allrun` using the existing LLM
-approach. Standard mesh dictionaries, geometry, generation, conversion, checks,
-mesh modifications and repair run inside Meshing. Gmsh-specific checks stay in
-the Gmsh backend; external-mesh conversion/checking and case `polyMesh` reuse
-share `imported_meshing`. Existing `polyMesh` is a reuse condition, not a fourth
-backend. Case import copies the whole case into `original/` and `work/`; it does
-not split the case's directories by purpose.
-Keep the original mesh-state inspection during case import; do not add an
-`inspect_mesh` switch or an `unprocessed` intermediate mesh state. Meshing
-planning reads the current mesh state again when needed.
+Meshing generates/edits mesh inputs, executes Allmesh or converter tools and
+reads final patches. Mesh failures return to the main-graph Reviewer, then
+Meshing Planner and Meshing, using the existing shared repair budget. Meshing Planner
+decides which utility startup dictionaries to create or modify through normal file tasks;
+execution does not inject defaults. Converter staging files stay separate from simulation settings.
 
-The ordinary Meshing node selects a backend service with `if`/`elif` and calls
-the shared execution service. Internal mesh retries stay in that service loop,
-which reuses `plan_meshing()` directly without re-entering a graph node.
+Solver selection and solver-reference retrieval happen in Solver Planner after
+mesh handoff. It selects physical/solver file changes and extracts a solver-only
+Allrun from an imported script, preserving field preparation and solver-parallel
+setup. Allmesh owns mesh operations. The actual mesh path, patches
+and available conversion/check evidence are passed to the solver
+planner, writer and reviewer; unknown values are not filled by name heuristics.
 
-Mesh shell operations run through `Allmesh`; solver-only `Allrun` preserves solver
-arguments, physical field preparation and solver-parallel decomposition. Mesh
-repairs replan the backend and ordered commands from the Reviewer's feedback,
-including switching from mesh reuse to regeneration when no file edits are needed.
-The pending solver repair plan is preserved across these internal mesh retries.
-Mesh utilities can create a minimal bootstrap `controlDict` when missing; existing
-case solver settings are preserved. Mesh metadata contains the final `polyMesh`
-path and actual patch names/types/face counts for subsequent file generation.
-The physical boundary conditions in field files such as `0/U` remain the solver
-stage's responsibility. Shared file-writing/review helpers and metadata readers
-may be used by other nodes; mesh execution and mesh file repairs belong to Meshing.
+Planner and Reviewer declare file stages and create/modify instructions. Filename
+heuristics no longer classify or silently discard tasks. After mesh repair, the mesh
+planner assesses actual results and decides whether to revisit Solver Planner or
+continue to Writer; pending physical tasks survive either route.
+Retain the three supported input modes and the standalone MCP planning service.
+Imported-case planning only runs after Preparation and Meshing; target checks belong
+to Preparation, with no legacy all-stage planning branch.
+No new safety or boundary-condition policies or quality thresholds are added.
 
 ### Directory Structure
 
@@ -113,13 +102,13 @@ src/
     hpc_runner_node.py
     reviewer_node.py
     visualization_node.py
-    imported_case_node.py
+    preparation_node.py
   services/            # Business logic (where the real work happens)
-    plan.py            # Case planning and analysis
+    preparation.py     # Shared input preparation and imported-case materialisation
+    plan.py            # Solver metadata, references and file planning
     input_writer.py    # OpenFOAM file generation via LLM + RAG
-    meshing.py         # Mesh planning, standard execution and internal repair
-    mesh.py            # Existing Gmsh/external-mesh backend implementations
-    mesh_context.py    # Mesh classification and final patch metadata
+    meshing.py         # Mesh planning and single-pass standard execution
+    mesh.py            # Gmsh generation and uploaded mesh conversion backends
     run_local.py       # Local OpenFOAM execution
     run_hpc.py         # HPC job submission
     review.py          # Error diagnosis and fix planning
@@ -150,28 +139,12 @@ docker/                # Dockerfile for containerized deployment
 ### Design Patterns
 
 1. **Service-oriented**: Nodes in `src/nodes/` are thin orchestration wrappers. All logic lives in `src/services/`.
-2. **Error correction loop**: Runner detects errors -> Reviewer diagnoses via LLM -> Input Writer rewrites solver files, or Meshing rewrites/regenerates mesh -> re-run. Meshing-stage errors use the same review service internally. Existing review limits and repeated-error fingerprints are retained; no new safety or boundary checks are added.
+2. **Error correction loop**: Runner detects errors -> Reviewer diagnoses via LLM -> Input Writer rewrites solver files, or Meshing rewrites/regenerates mesh -> re-run. Meshing-stage errors return to the main-graph Reviewer and then Meshing Planner. Existing review limits are retained. Solver-review repeated-error stopping is unchanged; mesh review receives repetition evidence and decides whether to continue within the shared budget. No new safety or boundary checks are added.
 3. **RAG retrieval**: FAISS indices built from OpenFOAM tutorials provide reference cases to the input writer.
 4. **Two generation modes** (`config.input_writer_generation_mode`):
    - `sequential_dependency` (default): Files generated in order with cross-file context.
    - `parallel_no_context`: All files generated independently (faster, relies on retry loop).
 5. **Target-scoped corpora**: Foundation v10 and native ESI v2006 use separate raw and FAISS data under `database/<target>/`.
-
-### Meshing and solver-planning PR verification
-
-Treat Feature1 and Feature2 as one PR with one core parameterized test function,
-`test_mesh_before_solver_workflow` in `tests/test_meshing_workflow.py`.
-Keep nine scenarios: standard mesh, Gmsh, uploaded mesh, imported polyMesh reuse,
-mesh-file repair, reuse-to-regeneration repair, solver-only repair, mixed
-mesh/solver repair, and the existing target-mismatch behavior.
-Check mesh-before-solver ordering, final patch context, one-time preparation,
-Allmesh/Allrun separation, imported-file preservation and pending solver repairs.
-Run `python -m pytest tests/test_meshing_workflow.py -q`. The test runs the actual
-main graph and services, with external LLM, retrieval, Gmsh subprocess
-and OpenFOAM execution mocked. It does not establish real CFD convergence or live
-LLM behavior. Consolidate the added `tests/test_solver_planner.py` into this test;
-retain pre-existing repository tests. Remove temporary diagnostic tests and files
-after fixing the corresponding implementation.
 
 ## Environment Variables
 

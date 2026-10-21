@@ -882,6 +882,9 @@ class GraphState(TypedDict):
     case_name: str
     subtasks: List[dict]
     solver_planned: bool
+    replan_solver: bool
+    pending_solver_subtasks: Optional[List[dict]]
+    mesh_execution: Optional[dict]
     loop_count: int
     # Additional state fields that will be added during execution
     llm_service: Optional['LLMService']
@@ -889,7 +892,6 @@ class GraphState(TypedDict):
     tutorial_reference: Optional[str]
     case_path_reference: Optional[str]
     dir_structure_reference: Optional[str]
-    dir_counts_reference: Optional[str]
     case_info: Optional[str]
     allrun_reference: Optional[str]
     dir_structure: Optional[dict]
@@ -900,6 +902,7 @@ class GraphState(TypedDict):
     case_domain: Optional[str]
     case_category: Optional[str]
     case_solver: Optional[str]
+    mesh_source: Optional[str]
     # Mesh-related state fields
     mesh_info: Optional[dict]
     mesh_commands: Optional[List[str]]
@@ -1303,10 +1306,10 @@ def run_openfoam_utility(
 _EXPLICIT_FOAM_ERROR_RE = re.compile(r"ERROR:(.*)", re.DOTALL)
 
 
-def check_foam_errors(directory: str, filenames=None) -> list:
+def check_foam_errors(directory: str) -> list:
     """Collect explicit OpenFOAM errors without imposing completion heuristics."""
     error_logs: list[dict] = []
-    for file_name in (os.listdir(directory) if filenames is None else filenames):
+    for file_name in os.listdir(directory):
         if not file_name.startswith("log"):
             continue
         filepath = os.path.join(directory, file_name)

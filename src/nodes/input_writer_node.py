@@ -15,6 +15,13 @@ def input_writer_node(state):
     """
 
     state = dict(state)
+    state["user_requirement"] += (
+        f"\n<actual_mesh>{state.get('mesh_info') or {}}</actual_mesh>\n"
+        "Mesh operations belong to Allmesh and Meshing. When writing Allrun, "
+        "preserve its solver-only stage; do not add mesh generation, conversion, "
+        "checks, modifications or cleanup. Physical field preparation and "
+        "solver-parallel decomposition remain in Allrun."
+    )
     script = state.get("solver_allrun")
     if script:
         save_file(str(Path(state["case_dir"]) / "Allrun"), script)
@@ -27,11 +34,19 @@ def input_writer_node(state):
         out = _rewrite_mode(state) if (state.get("rewrite_plan") or {}).get("target_files") else {}
     else:
         out = _initial_write_mode(state)
+        if not out.get("error_logs"):
+            if state.get("pending_solver_subtasks"):
+                # Consume successful creates even if the following edits fail.
+                out.update(pending_solver_subtasks=[], subtasks=[], input_writer_mode="rewrite")
+            if (state.get("rewrite_plan") or {}).get("target_files"):
+                out.update(_rewrite_mode({**state, **out}))
     if out.get("error_logs"):
         return out
-    if script:
+    if script is not None:
         out["solver_allrun"] = None
-    if not (Path(state["case_dir"]) / "Allrun").is_file():
+    if (not (Path(state["case_dir"]) / "Allrun").is_file()
+            or (state.get("case_origin") == "imported" and script == ""
+                and not any(t["file"] == "Allrun" for t in (state.get("rewrite_plan") or {}).get("target_files", [])))):
         _build_solver_allrun({**state, **out})
     out.update(load_case_files({**state, **out}))
     return out
@@ -67,7 +82,6 @@ def _rewrite_mode(state):
         openfoam_fork=generation_convention(state["config"]),
         case_solver=state.get("case_solver", ""),
         llm_service=state.get("llm_service"),
-        mesh_info=state.get("mesh_info"),
     )
     print("</input_writer>")
     
@@ -99,14 +113,16 @@ def _initial_write_mode(state):
         reuse_generated_dir=getattr(config, "reuse_generated_dir", ""),
         llm_service=state.get("llm_service"),
         config=config,
-        mesh_info=state.get("mesh_info"),
     )
 
     dir_structure = write_out["dir_structure"]
     foamfiles = write_out["foamfiles"]
 
-    # Imported scripts have already been split by meshing_planner.
-    if not state.get("solver_allrun"):
+    # Imported scripts have already been split by solver_planner.
+    explicit_allrun = any(
+        str(Path(t["folder_name"]) / t["file_name"]) == "Allrun" for t in state["subtasks"]
+    ) or any(t["file"] == "Allrun" for t in (state.get("rewrite_plan") or {}).get("target_files", []))
+    if not state.get("solver_allrun") and not explicit_allrun:
         _build_solver_allrun({**state, **write_out})
 
     print("</input_writer>")

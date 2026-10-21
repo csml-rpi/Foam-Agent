@@ -1,19 +1,14 @@
 import os
 import re
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, Literal
 from pathlib import Path
 from pydantic import BaseModel, Field
 from utils import retrieve_faiss, parse_directory_structure, save_file
-from logger import setup_logging
 from config import Config
 from openfoam_target import generation_convention, configured_openfoam_target
 from models import ExistingCasePlan
 from . import global_llm_service
 from .case_paths import CasePathSafetyError, safe_case_relative_path
-from .mesh_context import is_mesh_file
-from .output_safety import (
-    OutputDirectorySafetyError, prepare_output_directory, validate_output_preparation,
-)
 
 
 class CaseSummaryModel(BaseModel):
@@ -26,6 +21,9 @@ class CaseSummaryModel(BaseModel):
 class SubtaskModel(BaseModel):
     file_name: str
     folder_name: str
+    stage: Literal["mesh", "solver"]
+    action: Literal["create", "modify"] = "create"
+    changes: str = ""
 
 
 class OpenFOAMPlanModel(BaseModel):
@@ -323,15 +321,13 @@ def decompose_to_subtasks(
     *,
     llm_service: Optional[Any] = None,
     openfoam_target: str = "",
-    phase: str = "all",
-    mesh_info: Optional[dict] = None,
 ) -> List[Dict]:
     decompose_system_prompt = (
         "You are an experienced Planner specializing in OpenFOAM projects. "
         "Your task is to break down the following user requirement into a series of smaller, manageable subtasks. "
         "For each subtask, identify the file name of the OpenFOAM input file (foamfile) and the corresponding folder name where it should be stored. "
-        "Your final output must strictly follow the JSON schema below and include no additional keys or information:\n\n"
-        "```\n{\n  \"subtasks\": [\n    {\n      \"file_name\": \"<string>\",\n      \"folder_name\": \"<string>\"\n    }\n    // ... more subtasks\n  ]\n}\n```\n\n"
+        "Use the supplied structured schema. For each task, declare stage as mesh or solver, "
+        "action as create or modify, and concrete changes where needed. Solver includes execution scripts. "
         "Make sure that your output is valid JSON and strictly adheres to the provided schema."
         "Make sure you generate all the necessary files for the user's requirements."
         + (
@@ -347,34 +343,15 @@ def decompose_to_subtasks(
         f"Reference Directory Structure (similar case): {dir_structure}\n\n{dir_counts_str}\n\n"
         "Make sure you generate all the necessary files for the user's requirements."
         "Do not include any gmsh files like .geo etc. in the subtasks."
-        "Only include blockMesh or snappyHexMesh if the user hasnt requested for gmsh mesh or user isnt using an external uploaded custom mesh"
         "Please generate the output as structured JSON."
     )
 
     llm_client = llm_service if llm_service is not None else global_llm_service
-    if phase == "solver":
-        decompose_system_prompt += (
-            " Plan only physical fields, physical models, solver settings and solver "
-            "files. Mesh dictionaries, geometry, mesh conversion and mesh scripts are "
-            "planned separately by meshing_planner. Do not list them or Allrun here."
-        )
-        decompose_user_prompt = (
-            f"User Requirement: {user_requirement}\n\n"
-            f"Reference Directory Structure (similar case): {dir_structure}\n{dir_counts_str}\n"
-            f"<actual_mesh>{mesh_info or {}}</actual_mesh>\n"
-            "The mesh is already prepared. Plan the physical and solver files using "
-            "its actual patch names and types. Return structured JSON."
-        )
     res = llm_client.invoke(decompose_user_prompt, decompose_system_prompt, pydantic_obj=OpenFOAMPlanModel)
-    return [
-        {"file_name": s.file_name, "folder_name": s.folder_name} for s in res.subtasks
-        if phase != "solver" or not (
-            is_mesh_file(str(Path(s.folder_name) / s.file_name)) or s.file_name == "Allrun"
-        )
-    ]
+    return [task.model_dump() for task in res.subtasks]
 
 
-def prepare_case_context(
+def generate_simulation_plan(
     user_requirement: str,
     case_stats: Dict[str, List[str]],
     case_dir: str = "",
@@ -384,7 +361,35 @@ def prepare_case_context(
     config: Optional[Config] = None,
     llm_service: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Resolve case metadata and references without planning or writing solver files."""
+    """
+    Generate a complete simulation plan by parsing requirements and creating subtasks.
+    
+    This function orchestrates the entire planning process:
+    1. Parse user requirements into structured case information
+    2. Resolve case directory
+    3. Retrieve similar case references from FAISS database
+    4. Decompose requirements into manageable subtasks
+    
+    Args:
+        user_requirement (str): Natural language description of simulation requirements
+        case_stats (Dict[str, List[str]]): Available case statistics
+        case_dir (str, optional): Custom case directory path
+        searchdocs (int, optional): Number of similar documents to retrieve
+    
+    Returns:
+        Dict[str, Any]: Complete plan containing:
+            - case_name, case_domain, case_category, case_solver
+            - case_dir: Resolved case directory
+            - tutorial_reference: FAISS detailed reference
+            - case_path_reference: Path to reference file
+            - dir_structure_reference: Directory structure
+            - allrun_reference: Allrun script references
+            - subtasks: List of subtasks with file and folder names
+    
+    Raises:
+        ValueError: If subtasks cannot be generated
+        RuntimeError: If any step in the planning process fails
+    """
     # Step 1: Parse user requirement to case info
     target_convention = generation_convention(config) if config is not None else ""
     case_info = parse_requirement_to_case_info(
@@ -422,6 +427,18 @@ def prepare_case_context(
         llm_service=llm_service,
     )
     
+    # Step 4: Decompose to subtasks.
+    subtasks = decompose_to_subtasks(
+        user_requirement,
+        dir_structure,
+        dir_counts_str,
+        llm_service=llm_service,
+        openfoam_target=target_convention,
+    )
+    
+    if len(subtasks) == 0:
+        raise ValueError("Failed to generate subtasks.")
+    
     # Prepare reference file path
     case_path_reference = os.path.join(resolved_case_dir, "similar_case.txt")
     
@@ -434,68 +451,42 @@ def prepare_case_context(
         "tutorial_reference": faiss_detailed,
         "case_path_reference": case_path_reference,
         "dir_structure_reference": dir_structure,
-        "dir_counts_reference": dir_counts_str,
         "allrun_reference": allrun_reference,
+        "subtasks": subtasks,
         "similar_case_advice": advice,
     }
 
 
-def generate_simulation_plan(
-    user_requirement: str,
-    case_stats: Dict[str, List[str]],
-    case_dir: str = "",
-    searchdocs: int = 2,
-    run_directory: str | Path | None = None,
-    run_times: int = 1,
-    config: Optional[Config] = None,
-    llm_service: Optional[Any] = None,
-    phase: str = "all",
-) -> Dict[str, Any]:
-    """Retain the standalone metadata/reference/subtask planning interface."""
-    plan = prepare_case_context(
-        user_requirement, case_stats, case_dir, searchdocs, run_directory,
-        run_times, config, llm_service,
-    )
-    subtasks = decompose_to_subtasks(
-        user_requirement, plan["dir_structure_reference"], plan.pop("dir_counts_reference"),
-        llm_service=llm_service,
-        openfoam_target=generation_convention(config) if config is not None else "",
-        phase=phase,
-    )
-    if not subtasks:
-        raise ValueError("Failed to generate subtasks.")
-    return {**plan, "subtasks": subtasks}
-
-
-def setup_generated_case(state):
-    """Run the original planner's directory and reference preparation once."""
+def prepare_solver_context(state):
+    """Choose solver metadata and retrieve solver references after mesh handoff."""
     config = state["config"]
-    requested = getattr(config, "case_dir", "")
-    try:
-        if requested:
-            validate_output_preparation(
-                requested, overwrite=getattr(config, "overwrite_case_dir", False),
-            )
-        plan = prepare_case_context(
-            user_requirement=state["user_requirement"], case_stats=state["case_stats"],
-            case_dir=requested, searchdocs=getattr(config, "searchdocs", 2),
-            run_directory=getattr(config, "run_directory", None),
-            run_times=getattr(config, "run_times", 1), config=config,
-            llm_service=state.get("llm_service"),
-        )
-        plan["case_dir"] = str(prepare_output_directory(
-            plan["case_dir"], overwrite=getattr(config, "overwrite_case_dir", False),
-        ))
-    except OutputDirectorySafetyError as exc:
-        raise ValueError(str(exc)) from exc
-    setup_logging(plan["case_dir"])
-    save_file(plan["case_path_reference"], f"{plan['tutorial_reference']}\n\n\n{plan['allrun_reference']}")
-    plan["case_info"] = (
-        f"case name: {plan['case_name']}\ncase domain: {plan['case_domain']}\n"
-        f"case category: {plan['case_category']}\ncase solver: {plan['case_solver']}"
+    requirement = (
+        state["user_requirement"]
+        + f"\n<actual_mesh>{state.get('mesh_info') or {}}</actual_mesh>"
+        + f"\n<existing_case>{state.get('foamfiles') or ''}</existing_case>"
+        + "\nChoose the solver for this physical problem. Preserve existing physics "
+          "unless changes are requested. The mesh has already been prepared."
     )
-    print(f"<case_preparation>{plan['case_info']}\ncase dir: {plan['case_dir']}</case_preparation>")
-    return plan
+    metadata = parse_requirement_to_case_info(
+        requirement, state["case_stats"], llm_service=state["llm_service"],
+        openfoam_target=generation_convention(config),
+    )
+    reference, structure, dir_counts_str, scripts, advice = retrieve_references(
+        **metadata, searchdocs=config.searchdocs,
+        user_requirement=state["user_requirement"], config=config,
+        llm_service=state["llm_service"],
+    )
+    reference_path = str(Path(state["case_dir"]) / "similar_case.txt")
+    save_file(reference_path, f"{reference}\n\n{scripts}")
+    return {
+        **metadata, "case_name": state["case_name"],
+        "case_info": "\n".join(f"{key}: {value}" for key, value in metadata.items()),
+        "tutorial_reference": reference, "dir_structure_reference": structure,
+        "dir_counts_str": dir_counts_str,
+        "case_path_reference": reference_path,
+        "allrun_reference": scripts,
+        "similar_case_advice": advice.model_dump() if hasattr(advice, "model_dump") else advice,
+    }
 
 
 DEFAULT_IMPORTED_REQUIREMENT = (
@@ -513,76 +504,14 @@ def _model_dump(value: Any) -> dict[str, Any]:
     raise TypeError(f"Expected a structured model response, got {type(value).__name__}")
 
 
-def imported_case_target_failure(state: dict[str, Any]) -> Optional[dict[str, Any]]:
-    """Share the existing platform checks between import and standalone planning."""
-    context = dict(state.get("case_context") or {})
-    issues = list(context.get("issues") or [])
-    target = configured_openfoam_target(state.get("config")) or context.get("platform")
-    if target not in {"foundation-v10", "esi-v2006"}:
-        return {
-            "workflow_status": "failed",
-            "requires_meshing": False,
-            "requires_input_writer": False,
-            "termination_reason": "Specify --openfoam_target foundation-v10 or esi-v2006.",
-        }
-
-    manifest = state.get("case_import_manifest")
-    if getattr(manifest, "target_mismatch", False):
-        mismatch_errors = [
-            issue for issue in issues
-            if issue.startswith("Configured target ") and "differs from detected" in issue
-        ]
-        if not mismatch_errors:
-            mismatch_errors = [
-                "Configured OpenFOAM target does not match the detected case platform."
-            ]
-        return {
-            "workflow_status": "failed",
-            "target_mismatch": True,
-            "requires_meshing": False,
-            "requires_input_writer": False,
-            "error_logs": [
-                {"file": "case_import", "error_content": issue}
-                for issue in mismatch_errors
-            ],
-            "termination_reason": "case_target_mismatch",
-        }
-    return None
-
-
-def plan_imported_case(state: dict[str, Any], *, phase: str = "all") -> dict[str, Any]:
-    """Choose file changes without regenerating an existing case."""
-    failure = imported_case_target_failure(state)
-    if failure:
-        return failure
-    context = dict(state.get("case_context") or {})
-    issues = list(context.get("issues") or [])
-    target = configured_openfoam_target(state.get("config")) or context.get("platform")
-
-    explicit_requirement = bool(state.get("user_requirement_explicit"))
-    if (
-        not explicit_requirement
-        and not state.get("loop_count")
-        and context.get("has_allrun")
-        and not issues
-    ):
-        return {
-            "workflow_status": "running",
-            "requires_meshing": False,
-            "requires_input_writer": False,
-            # A complete, untouched case with no explicit user requirement has
-            # nothing to infer from: keep the same conservative defaults
-            # llm_requires_hpc/llm_requires_visualization use when unsure, and
-            # skip the LLM calls entirely for this no-LLM-needed fast path.
-            "requires_hpc": False,
-            "requires_visualization": False,
-            "termination_reason": None,
-        }
+def plan_imported_case(state: dict[str, Any]) -> dict[str, Any]:
+    """Plan physical file changes and solver execution after mesh preparation."""
+    target = configured_openfoam_target(state.get("config")) or (state.get("case_context") or {}).get("platform")
 
     prompt = (
         "You are planning work on an existing OpenFOAM case. Return structured routing decisions. "
         "Set requires_input_writer only when files must be created or changed, and requires_meshing "
-        "only when an external or Gmsh mesh operation is needed. The graph prepares the mesh first, "
+        "when further mesh operations are needed. The graph prepares the mesh first, "
         "then modifies files if needed, then runs the case. A complete case with no requested changes "
         "must set both flags to false. Preserve existing physical conditions unless explicitly changed. "
         "If a required physical condition cannot be inferred, return failed and explain the missing information in reason. "
@@ -595,27 +524,35 @@ def plan_imported_case(state: dict[str, Any], *, phase: str = "all") -> dict[str
         f"<review_analysis>{state.get('review_analysis') or ''}</review_analysis>\n"
         f"<custom_mesh_path>{state.get('custom_mesh_path') or ''}</custom_mesh_path>\n"
         f"<openfoam_target>{target}</openfoam_target>"
+        f"\n<actual_mesh>{state.get('mesh_info') or {}}</actual_mesh>\n"
+        f"<selected_solver>{state.get('case_solver') or ''}</selected_solver>\n"
+        f"<reference>{state.get('tutorial_reference') or ''}</reference>\n"
+        "The mesh has already been prepared. Plan only physical fields and solver "
+        "file changes using the actual patches. Adapt existing mesh-tool startup dictionaries "
+        "to the requested physics with explicit modify tasks where needed. Meshing handles all mesh files, "
+        "geometry, mesh scripts and mesh commands. Declare each target file stage as "
+        "mesh or solver; solver includes execution scripts. If further mesh changes "
+        "are needed, set requires_meshing even when only commands on existing files are "
+        "needed, and explain those operations in reason. Include any file changes "
+        "explicitly with stage mesh for Meshing to handle. "
+        "Return solver_allrun as the "
+        "complete runnable solver-only remainder of the existing Allrun, when present. "
+        "Preserve shell setup, helper functions, solver arguments, necessary physical "
+        "field preparation and solver-parallel decomposition. Remove mesh generation, "
+        "conversion, checks, modifications and cleanup, including inside helper functions. "
+        "Use the selected solver, adapting controlDict and Allrun if required by the "
+        "requested physics. Return an empty solver_allrun if no Allrun exists."
     )
     llm = state.get("llm_service")
-    if phase == "solver":
-        prompt += (
-            f"\n<actual_mesh>{state.get('mesh_info') or {}}</actual_mesh>\n"
-            "The mesh has already been prepared. Plan only physical fields and solver "
-            "file changes using the actual patches. Meshing handles all mesh files, "
-            "geometry, mesh scripts and mesh commands. Do not include these in "
-            "target_files. Set requires_meshing to false."
-        )
     response = llm.invoke(
         prompt,
-        "Plan the minimum work required for this existing case.",
+        "Plan the minimum work required for this existing case. Declare each file stage "
+        "as mesh or solver, including execution scripts in solver.",
         pydantic_obj=ExistingCasePlan,
     )
     plan = _model_dump(response)
     status = plan.get("status", "failed")
     targets = plan.get("target_files") or []
-    if phase == "solver":
-        targets = [t for t in targets if not is_mesh_file(t["file"])]
-        plan["requires_input_writer"] = bool(targets)
     if status == "ready" and plan.get("requires_input_writer") and not targets:
         return {
             "workflow_status": "failed",
@@ -624,8 +561,11 @@ def plan_imported_case(state: dict[str, Any], *, phase: str = "all") -> dict[str
             "termination_reason": "Planner must specify target_files before requesting file changes.",
         }
     return {
+        "solver_allrun": plan.get("solver_allrun", ""),
         "workflow_status": "running" if status == "ready" else status,
-        "requires_meshing": phase != "solver" and bool(plan.get("requires_meshing")),
+        "requires_meshing": bool(plan.get("requires_meshing")) or (
+            any(t["stage"] == "mesh" for t in targets)
+        ),
         "requires_input_writer": bool(plan.get("requires_input_writer")),
         "input_writer_mode": "rewrite",
         "review_analysis": plan.get("reason") or "Apply the requested changes to the existing case.",

@@ -1,4 +1,4 @@
-"""Thin adapter for solver review and repair routing."""
+"""Thin adapter for mesh and solver review and repair routing."""
 
 from services.review import review_case
 

@@ -136,8 +136,9 @@ def test_import_materialises_original_and_work_and_detects_target(tmp_path: Path
     assert (output / "report" / "case_context.json").is_file()
 
 
-def test_case_only_complete_case_skips_physical_planning_then_enters_writer() -> None:
-    llm = _FakeLLM(response=AssertionError("LLM must not be called"))
+def test_case_only_complete_case_plans_solver_script_then_enters_writer() -> None:
+    solver_script = "#!/bin/sh\nicoFoam\n"
+    llm = _FakeLLM(ExistingCasePlan(status="ready", solver_allrun=solver_script))
     state = {
         "case_context": {
             "platform": "foundation-v10",
@@ -155,7 +156,9 @@ def test_case_only_complete_case_skips_physical_planning_then_enters_writer() ->
 
     assert result["workflow_status"] == "running"
     assert not result["requires_input_writer"] and not result["requires_meshing"]
-    assert llm.calls == []
+    assert len(llm.calls) == 1
+    assert "solver-only remainder" in llm.calls[0][0]
+    assert result["solver_allrun"] == solver_script
     assert route_after_solver_planner({**state, **result, "case_origin": "imported"}) == "input_writer"
 
 
@@ -163,7 +166,7 @@ def test_case_only_complete_case_skips_physical_planning_then_enters_writer() ->
 def test_import_node_loads_resources_for_the_detected_target_when_planning_is_needed(
     tmp_path: Path, monkeypatch, target: str
 ) -> None:
-    imported_module = importlib.import_module("nodes.imported_case_node")
+    imported_module = importlib.import_module("services.preparation")
     source = _make_case(tmp_path / "source", target)
     observed = []
     monkeypatch.setattr(imported_module, "setup_logging", lambda _path: None)
@@ -178,7 +181,7 @@ def test_import_node_loads_resources_for_the_detected_target_when_planning_is_ne
         openfoam_target="",
     )
 
-    result = imported_module.case_import_node(
+    result = imported_module.prepare_imported_case(
         {
             "config": config,
             "case_import_path": str(source),
@@ -196,7 +199,7 @@ def test_import_node_loads_resources_for_the_detected_target_when_planning_is_ne
 
 def test_explicit_change_creates_targeted_writer_then_run_plan() -> None:
     plan = ExistingCasePlan.model_validate(
-        {'status': 'ready', 'requires_meshing': False, 'requires_input_writer': True, 'target_files': [{'file': 'system/controlDict', 'changes': 'Set endTime to 5'}], 'reason': 'Change the requested end time.'}
+        {'status': 'ready', 'requires_meshing': False, 'requires_input_writer': True, 'target_files': [{'file': 'system/controlDict', 'changes': 'Set endTime to 5', 'stage': 'solver'}], 'reason': 'Change the requested end time.'}
     )
     llm = _FakeLLM(plan)
     state = {
@@ -217,7 +220,7 @@ def test_explicit_change_creates_targeted_writer_then_run_plan() -> None:
     assert result["requires_input_writer"] and not result["requires_meshing"]
     assert result["input_writer_mode"] == "rewrite"
     assert result["rewrite_plan"]["target_files"] == [
-        {"file": "system/controlDict", "changes": "Set endTime to 5"}
+        {"file": "system/controlDict", "changes": "Set endTime to 5", "stage": "solver"}
     ]
 
 
@@ -276,7 +279,7 @@ def test_modify_existing_applies_only_planned_target_files(tmp_path: Path) -> No
         review_analysis="Only update the requested end time.",
         rewrite_plan={
             "target_files": [
-                {"file": "system/controlDict", "changes": "Set endTime to 5"}
+                {"file": "system/controlDict", "changes": "Set endTime to 5", "stage": "solver"}
             ]
         },
         user_requirement="Set endTime to 5.",
@@ -310,7 +313,7 @@ def test_rewrite_uses_planned_files_and_records_actual_diffs(tmp_path: Path) -> 
         ]
     )
     directory = scan_case_directory(str(case))
-    state = {'case_origin': 'imported', 'case_dir': str(case), 'input_writer_mode': 'rewrite', 'review_analysis': 'Apply the planned changes to fix the reported setup error.', 'rewrite_plan': {'target_files': [{'file': 'system/controlDict', 'changes': 'Set endTime to 5'}, {'file': 'system/fvSolution', 'changes': 'Update solver settings'}]}, 'error_logs': [{'file': 'Allrun', 'error_content': 'setup error'}], 'user_requirement': DEFAULT_IMPORTED_REQUIREMENT, 'foamfiles': read_case_foamfiles(str(case), directory), 'dir_structure': directory, 'case_solver': 'icoFoam', 'config': SimpleNamespace(openfoam_target='foundation-v10'), 'llm_service': _FakeLLM(response), 'loop_count': 1}
+    state = {'case_origin': 'imported', 'case_dir': str(case), 'input_writer_mode': 'rewrite', 'review_analysis': 'Apply the planned changes to fix the reported setup error.', 'rewrite_plan': {'target_files': [{'file': 'system/controlDict', 'changes': 'Set endTime to 5', 'stage': 'solver'}, {'file': 'system/fvSolution', 'changes': 'Update solver settings'}]}, 'error_logs': [{'file': 'Allrun', 'error_content': 'setup error'}], 'user_requirement': DEFAULT_IMPORTED_REQUIREMENT, 'foamfiles': read_case_foamfiles(str(case), directory), 'dir_structure': directory, 'case_solver': 'icoFoam', 'config': SimpleNamespace(openfoam_target='foundation-v10'), 'llm_service': _FakeLLM(response), 'loop_count': 1}
 
     result = input_writer_node(state)
 
@@ -419,7 +422,8 @@ def test_langgraph_case_only_path_visits_meshing_and_writer_then_returns_shared_
     def fake_runner(state):
         return {'workflow_status': 'success', 'error_logs': []}
 
-    monkeypatch.setattr(main, "case_import_node", fake_import)
+    monkeypatch.setattr(main, "preparation_node", fake_import)
+    monkeypatch.setattr(main, "solver_planner_node", lambda state: {"workflow_status": "running", "requires_input_writer": False, "requires_hpc": False})
     monkeypatch.setattr(main, "meshing_planner_node", lambda state: {})
     monkeypatch.setattr(main, "meshing_node", lambda state: {"error_logs": []})
     monkeypatch.setattr(main, "local_runner_node", fake_runner)
@@ -459,7 +463,7 @@ def test_langgraph_case_only_path_visits_meshing_and_writer_then_returns_shared_
 )
 def test_imported_graph_routes_without_action_bookkeeping(monkeypatch, mesh, writer, hpc, expected):
     visited = []
-    monkeypatch.setattr(main, 'case_import_node', lambda state: {})
+    monkeypatch.setattr(main, 'preparation_node', lambda state: {})
     monkeypatch.setattr(main, 'solver_planner_node', lambda state: {
         'workflow_status': 'running',
         'requires_meshing': mesh,
@@ -482,7 +486,7 @@ def test_imported_graph_routes_without_action_bookkeeping(monkeypatch, mesh, wri
 
 def test_imported_graph_repairs_then_runs_without_repeating_mesh(monkeypatch):
     visited = []
-    monkeypatch.setattr(main, 'case_import_node', lambda state: {})
+    monkeypatch.setattr(main, 'preparation_node', lambda state: {})
     monkeypatch.setattr(main, 'meshing_planner_node', lambda state: visited.append('mesh_plan') or {})
     monkeypatch.setattr(main, 'solver_planner_node', lambda state: {
         'workflow_status': 'running', 'requires_meshing': True,
@@ -536,15 +540,13 @@ def test_custom_mesh_conversion_requires_polymesh_artifact(
 ) -> None:
     mesh_service = importlib.import_module("services.mesh")
     source = tmp_path / "uploaded.msh"
-    source.write_text("mesh", encoding="utf-8")
+    source.write_text("$MeshFormat\n2.2 0 8\n$EndMeshFormat\n", encoding="utf-8")
     case = tmp_path / "case"
     monkeypatch.setattr(mesh_service, "run_openfoam_utility", lambda *_args, **_kwargs: None)
 
     result = mesh_service.copy_custom_mesh(
         str(source),
-        "Use the uploaded mesh.",
         str(case),
-        llm_service=_FakeLLM("application customSolver;"),
     )
 
     assert result["error_logs"] == ["polyMesh directory not created"]

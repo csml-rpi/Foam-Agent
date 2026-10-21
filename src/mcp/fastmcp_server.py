@@ -594,7 +594,7 @@ class RunCaseRequest(BaseModel):
     )
     custom_mesh_path: Optional[str] = Field(
         default=None,
-        description="Optional external mesh used by the imported-case workflow",
+        description="Optional Gmsh .msh file (ASCII 2.2 format)",
     )
     openfoam_target: Optional[str] = Field(
         default=None,

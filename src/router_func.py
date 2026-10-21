@@ -3,15 +3,6 @@ from langgraph.graph import END
 from utils import GraphState
 
 
-def route_workflow_entry(state: GraphState):
-    """Choose new generation or existing-case import."""
-    if state.get("workflow_mode") == "imported_case":
-        print("<router>Existing case requested. Routing to case_import node.</router>")
-        return "case_import"
-    print("<router>Prompt workflow requested. Routing to meshing_planner node.</router>")
-    return "meshing_planner"
-
-
 def llm_requires_hpc(state: GraphState) -> bool:
     """
     Use LLM to determine if user requires HPC/cluster execution based on their requirement.
@@ -73,14 +64,18 @@ def llm_requires_visualization(state: GraphState) -> bool:
 
 def route_after_solver_planner(state: GraphState):
     """Successful solver planning hands physical files to the writer."""
-    return END if state.get("workflow_status") == "failed" else "input_writer"
+    if state.get("workflow_status") == "failed":
+        return END
+    return "meshing_planner" if state.get("repairing_mesh") else "input_writer"
 
 
 def route_after_meshing(state: GraphState):
     """Plan the solver after initial meshing; preserve pending repairs on retries."""
-    if state.get("error_logs") or state.get("termination_reason"):
+    if state.get("termination_reason"):
         return END
-    return "input_writer" if state.get("solver_planned") else "solver_planner"
+    if state.get("error_logs"):
+        return "reviewer"
+    return "solver_planner" if not state.get("solver_planned") or state.get("replan_solver") else "input_writer"
 
 
 def route_after_input_writer(state: GraphState):
@@ -124,8 +119,8 @@ def route_after_runner(state: GraphState):
         return "visualization"
     return END
 
-def route_after_case_import(state: GraphState):
-    """Successfully imported cases enter mesh planning before execution."""
+def route_after_preparation(state: GraphState):
+    """Prepared inputs enter mesh planning before solver selection."""
     if state.get("workflow_status") == "failed":
         return END
     return "meshing_planner"
@@ -133,7 +128,7 @@ def route_after_case_import(state: GraphState):
 
 def route_after_reviewer(state: GraphState):
     """Use the same file-rewrite loop for generated and imported cases."""
-    if state.get("termination_reason") == "repair_made_no_progress":
+    if state.get("termination_reason") in {"repair_made_no_progress", "mesh_review_stopped"}:
         return END
     loop_count = state.get("loop_count", 0)
     if loop_count >= state["config"].max_loop:

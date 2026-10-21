@@ -1,39 +1,31 @@
-"""Shared mesh planning, backend execution and internal repair services."""
+"""Shared mesh planning and single-pass backend execution services."""
 
 from pathlib import Path
-import shlex
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
 from openfoam_target import database_path_for_config, generation_convention, runtime_openfoam_target
-from utils import load_case_files, run_command, check_foam_errors
+from utils import load_case_files, run_command, _EXPLICIT_FOAM_ERROR_RE
 from .input_writer import initial_write, build_allrun, rewrite_files
 from .mesh import copy_custom_mesh, handle_gmsh_mesh
-from .mesh_context import mesh_state, mesh_info, is_mesh_file
-from .plan import SubtaskModel, setup_generated_case
-from .review import review_case
+from .plan import SubtaskModel
 
 
 class MeshingPlan(BaseModel):
     mesh_type: Literal["standard_mesh", "gmsh_mesh", "custom_mesh"]
-    reuse_mesh: bool = False
+    mesh_source: str = Field(default="", description="Selected Gmsh .msh file, relative to the case or absolute; empty on custom_mesh uses the case's current polyMesh")
     mesh_subtasks: list[SubtaskModel] = Field(default_factory=list)
     mesh_commands: list[str] = Field(default_factory=list)
-    solver_allrun: str = ""
 
 
 def plan_meshing(state):
-    preparation = setup_generated_case(state) if not state.get("case_dir") else {}
-    state = {**state, **preparation}
     case = Path(state["case_dir"])
     original = case / "Allrun"
     script = original.read_text(encoding="utf-8") if original.is_file() else ""
-    status = mesh_state(case)
     prompt = (
         f"<user_requirement>{state['user_requirement']}</user_requirement>\n"
         f"<custom_mesh_path>{state.get('custom_mesh_path') or ''}</custom_mesh_path>\n"
-        f"<mesh_state>{status}</mesh_state>\n"
         f"<case_origin>{state.get('case_origin')}</case_origin>\n"
         f"<explicit_requirement>{state.get('user_requirement_explicit', True)}</explicit_requirement>\n"
         f"<case_files>{state.get('dir_structure') or {}}</case_files>\n"
@@ -42,59 +34,76 @@ def plan_meshing(state):
         f"<allrun_reference>{state.get('allrun_reference') or ''}</allrun_reference>\n"
         f"<existing_allrun>{script}</existing_allrun>\n"
         f"<repair_analysis>{state.get('review_analysis') or ''}</repair_analysis>\n"
+        f"<error_logs>{state.get('error_logs') or []}</error_logs>\n"
         f"<repair_plan>{state.get('rewrite_plan') or {}}</repair_plan>\n"
         f"<openfoam_target>{generation_convention(state['config'])}</openfoam_target>"
     )
     plan = state["llm_service"].invoke(
         prompt,
-        "Plan only the mesh stage. Select standard_mesh for OpenFOAM mesh generation, "
-        "gmsh_mesh for Gmsh generation, or custom_mesh for an uploaded Gmsh ASCII 2.2 "
-        "mesh or an existing case polyMesh. An explicit custom_mesh_path selects custom_mesh. "
-        "Reuse existing polyMesh unless the user requests replacement or remeshing. "
-        "Do not regenerate it merely because the original Allrun contains mesh generation. "
-        "For standard_mesh list only mesh dictionaries, geometry files and ordered mesh "
-        "commands as utility invocations, including their arguments; shell wrappers "
-        "belong in Allmesh. Reuse existing dictionaries; list missing "
-        "files or files requiring changes, not physical solver files. "
-        "For gmsh_mesh the backend generates, converts and checks its mesh itself; "
-        "for uploaded custom_mesh the backend converts and checks its mesh itself. "
-        "List only additional requested mesh operations for those backends. "
-        "For reused polyMesh retain existing requested checks or mesh operations, but "
-        "omit generation and conversion commands. Do not add new checks. "
-        "When existing_allrun is present, return its solver-only remainder in solver_allrun. "
-        "Preserve its solver commands, arguments, setup, functions and necessary field "
-        "preparation. Remove all mesh operations and mesh cleanup, including operations "
-        "inside helper functions. Mesh-parallel preparation belongs to the mesh stage; "
-        "solver-parallel preparation stays in solver_allrun. Return complete runnable "
-        "shell code, without markdown. When no existing Allrun exists, use an empty string. "
-        "During repair, use the review and rewrite plan to select the backend and retry "
-        "commands, including regeneration if required. List only missing files in "
-        "mesh_subtasks; existing file changes are applied by the rewrite plan.",
+        "Plan only the mesh stage from the user requirement and actual supplied files. "
+        "Do not select a simulation solver or plan physical fields. Choose standard_mesh "
+        "for OpenFOAM utilities, gmsh_mesh for Gmsh generation, or custom_mesh for "
+        "working with the case's existing polyMesh or converting a Gmsh .msh file. The input "
+        "source does not force a backend or a reuse/regeneration decision. Select the "
+        "operations that meet this request. "
+        "Use mesh_source on custom_mesh to explicitly select an available Gmsh .msh "
+        "file. An empty source on custom_mesh means the current "
+        "case polyMesh. List the files to create or change and ordered native utility "
+        "invocations with arguments; Allmesh provides shell setup. Do not automatically "
+        "add blockMesh. Gmsh generates and converts its mesh; custom_mesh converts "
+        "Gmsh .msh files. These backends check the converted mesh themselves; list "
+        "only additional requested operations for them. Using the case's polyMesh "
+        "does not run checks; include any checks you decide are needed in mesh_commands. "
+        "For an existing mesh, decide checks and changes from the request and evidence. "
+        "Use existing Allrun as evidence of mesh operations, preserving mesh-parallel "
+        "setup as needed. Do not output the solver script; solver_planner owns it. "
+        "Keep physical field preparation and solver-parallel setup out of Allmesh. "
+        "Plan the startup dictionaries required by the selected utilities, including backend "
+        "gmshToFoam/checkMesh calls, as stage mesh file tasks before execution. Inspect existing "
+        "files and preserve them unless changes are needed. Create only missing dictionaries "
+        "the selected tools require, such as controlDict or tool-dependent fvSchemes/fvSolution; "
+        "the executor does not supply default dictionaries. Specify their required contents "
+        "in changes. These files remain for Solver Planner to adapt to the physical problem. "
+        "Requested scaling belongs in ordered mesh_commands. During repair, "
+        "use feedback to reconsider the backend and commands. In mesh_subtasks declare "
+        "each file's stage, action (create or modify), and concrete changes. "
+        "Include modifications to existing files even on the first plan. Mesh files and "
+        "Allmesh use stage mesh; any deferred physical or solver-script tasks use solver. "
+        "Do not infer stages from filenames. Backend checks are already "
+        "performed; additional commands are executed literally, including repetitions.",
         pydantic_obj=MeshingPlan,
     )
-    if state.get("custom_mesh_path"):
-        plan.mesh_type, plan.reuse_mesh = "custom_mesh", False
-    elif (status == "existing-polyMesh" and not state.get("user_requirement_explicit", True)
-          and not state.get("repairing_mesh")):
-        plan.mesh_type, plan.reuse_mesh = "custom_mesh", True
+    source = Path(plan.mesh_source).expanduser() if plan.mesh_source else None
+    if source is not None and not source.is_absolute():
+        source = case / source
+    changes = list((state.get("rewrite_plan") or {}).get("target_files", []))
+    creates = []
+    pending = list(state.get("pending_solver_subtasks") or [])
+    for task in plan.mesh_subtasks:
+        if task.action == "modify":
+            changes.append({"file": str(Path(task.folder_name) / task.file_name),
+                            "stage": task.stage,
+                            "changes": task.changes})
+        elif task.stage == "mesh":
+            creates.append(task.model_dump())
+        else:
+            pending.append(task.model_dump())
     return {
-        **preparation,
+        "rewrite_plan": {"target_files": changes} if changes else None,
+        "pending_solver_subtasks": pending,
+        "review_analysis": state.get("review_analysis") or
+                           "Apply the mesh planner's explicit file changes: " + str(changes),
         "mesh_type": plan.mesh_type,
-        "mesh_subtasks": [task.model_dump() for task in plan.mesh_subtasks],
+        "mesh_source": str(source) if source else None,
+        "mesh_subtasks": creates,
         "mesh_commands": plan.mesh_commands,
-        "requires_meshing": not plan.reuse_mesh,
-        "solver_allrun": state.get("solver_allrun") if state.get("repairing_mesh") else plan.solver_allrun or None,
-        "allrun_reference": state.get("allrun_reference") if state.get("repairing_mesh") else script or state.get("allrun_reference"),
-        "case_context": {**(state.get("case_context") or {}), "mesh_state": status},
+        "allrun_reference": script or state.get("allrun_reference"),
     }
 
 
 def _write_mesh_files(state):
     tasks = list(state.get("mesh_subtasks") or [])
     case = Path(state["case_dir"])
-    if not (case / "system" / "controlDict").is_file():
-        if not any(t["file_name"] == "controlDict" for t in tasks):
-            tasks.append({"folder_name": "system", "file_name": "controlDict"})
     if not tasks:
         return {}
     config = state["config"]
@@ -113,13 +122,12 @@ def _write_mesh_files(state):
 
 
 def _run_mesh_commands(state, commands):
-    if not commands:
-        return {"error_logs": []}
     config = state["config"]
     case = Path(state["case_dir"])
-    if (state.get("repairing_mesh") and (case / "Allmesh").is_file()
-            and any(t["file"] == "Allmesh" for t in (state.get("rewrite_plan") or {}).get("target_files", []))):
+    if any(t["file"] == "Allmesh" for t in (state.get("rewrite_plan") or {}).get("target_files", [])):
         script = {"allrun_path": str(case / "Allmesh")}
+    elif not commands:
+        return {"error_logs": []}
     else:
         script = build_allrun(
             case_dir=state["case_dir"],
@@ -131,27 +139,49 @@ def _run_mesh_commands(state, commands):
             user_requirement=state["user_requirement"], llm_service=state["llm_service"],
             config=config, openfoam_fork=generation_convention(config), phase="mesh",
         )
-    logs = [f"log.{shlex.split(command)[0]}" for command in commands]
-    for name in logs:
-        (case / name).unlink(missing_ok=True)
+    before, observations = _mesh_log_snapshot(case)
     result = run_command(
         script["allrun_path"], str(case / "Allmesh.out"), str(case / "Allmesh.err"),
         str(case), config.max_time_limit, openfoam_target=runtime_openfoam_target(config),
     )
-    errors = check_foam_errors(str(case), [name for name in logs if (case / name).is_file()])
+    after, failures = _mesh_log_snapshot(case)
+    observations.extend(failures)
+    names = {name for name, signature in after.items() if before.get(name) != signature}
+    names.update({"Allmesh.out", "Allmesh.err"})
+    output, errors = {}, []
+    for name in sorted(names):
+        try:
+            output[name] = (case / name).read_text(encoding="utf-8", errors="replace")
+        except OSError as error:
+            observations.append(f"Could not read {name}: {error}")
+            continue
+        match = _EXPLICIT_FOAM_ERROR_RE.search(output[name])
+        if match:
+            errors.append({"file": name, "error_content": match.group(1).strip()})
+    evidence = {"command_result": result, "logs": output, "observations": observations}
     if result.get("returncode") or result.get("timed_out"):
-        output = "\n".join(
-            (case / name).read_text(encoding="utf-8", errors="replace")
-            for name in ("Allmesh.out", "Allmesh.err") if (case / name).is_file()
-        )
-        errors.append({"file": "Allmesh", "error_content": output or str(result)})
-    return {"error_logs": errors}
+        errors.append({"file": "Allmesh", "error_content": str(evidence)})
+    return {"error_logs": errors, "mesh_execution": evidence}
+
+
+def _mesh_log_snapshot(case):
+    files, observations = {}, []
+    try:
+        for path in case.rglob("*"):
+            if path.name.startswith("log") or path.suffix.lower() in {".log", ".out", ".err"}:
+                try:
+                    if path.is_file():
+                        stat = path.stat()
+                        files[path.relative_to(case).as_posix()] = (stat.st_size, stat.st_mtime_ns)
+                except OSError as error:
+                    observations.append(f"Could not inspect {path}: {error}")
+    except OSError as error:
+        observations.append(f"Could not scan mesh logs: {error}")
+    return files, observations
 
 
 def standard_meshing(state):
-    if state.get("mesh_subtasks") or not state.get("repairing_mesh"):
-        state = {**state, **_write_mesh_files(state)}
-    return {**_run_mesh_commands(state, state.get("mesh_commands") or []), "mesh_subtasks": []}
+    return {**_run_mesh_commands(state, state.get("mesh_commands") or []), "mesh_info": None}
 
 
 def gmsh_meshing(state):
@@ -162,25 +192,30 @@ def gmsh_meshing(state):
         repair_feedback=state.get("review_analysis") or "",
         retry=bool(state.get("repairing_mesh")),
     )
+    commands = state.get("mesh_commands") or []
     if not result.get("error_logs"):
-        result.update(_run_mesh_commands(state, state.get("mesh_commands") or []))
+        result.update(_run_mesh_commands(state, commands))
+        if commands and result.get("mesh_info"):
+            result["mesh_info"]["check_mesh_passed"] = None
     result["mesh_commands"] = state.get("mesh_commands") or []
+    result["mesh_subtasks"] = []
     return result
 
 
 def imported_meshing(state):
-    if not state.get("custom_mesh_path") and mesh_state(state["case_dir"]) == "existing-polyMesh":
+    source = state.get("mesh_source")
+    if not source:
         return _run_mesh_commands(state, state.get("mesh_commands") or [])
     result = copy_custom_mesh(
-        state["custom_mesh_path"], state["user_requirement"], state["case_dir"],
-        llm_service=state["llm_service"],
+        source, state["case_dir"],
         openfoam_target=runtime_openfoam_target(state["config"]),
-        repair_feedback=state.get("review_analysis") or "",
         retry=bool(state.get("repairing_mesh")),
     )
     if not result.get("error_logs"):
-        commands = list(dict.fromkeys((result.get("mesh_commands") or []) + (state.get("mesh_commands") or [])))
+        commands = (result.get("mesh_commands") or []) + (state.get("mesh_commands") or [])
         result.update(_run_mesh_commands(state, commands))
+        if commands and result.get("mesh_info"):
+            result["mesh_info"]["check_mesh_passed"] = None
     result["mesh_commands"] = state.get("mesh_commands") or []
     return result
 
@@ -191,57 +226,93 @@ def _rewrite_mesh(state):
     return rewrite_files(
         case_dir=state["case_dir"], error_logs=state.get("error_logs") or [],
         review_analysis=state.get("review_analysis") or "", rewrite_plan=state["rewrite_plan"],
-        user_requirement=state["user_requirement"], foamfiles=state.get("foamfiles"),
+        user_requirement=state["user_requirement"]
+        + f"\n<actual_mesh>{state.get('mesh_info') or {}}</actual_mesh>",
+        foamfiles=state.get("foamfiles"),
         dir_structure=state.get("dir_structure") or {},
         openfoam_fork=generation_convention(state["config"]),
         case_solver=state.get("case_solver") or "", llm_service=state["llm_service"],
-        mesh_info=state.get("mesh_info"),
     )
+
+
+class MeshRepairImpact(BaseModel):
+    replan_solver: bool
+    reason: str
 
 
 def execute_meshing(state, backend):
     current = dict(state)
-    resume = {
+    result = {}
+    resume = state.get("mesh_resume_state") or {
         key: state.get(key) for key in
-        ("input_writer_mode", "rewrite_plan", "review_analysis", "requires_input_writer")
+        ("input_writer_mode", "review_analysis", "requires_input_writer")
     }
-    if current.get("repairing_mesh"):
-        targets = (current.get("rewrite_plan") or {}).get("target_files", [])
-        mesh_targets = [t for t in targets if is_mesh_file(t["file"]) or (
-            t["file"] == "system/controlDict"
-            and not (Path(current["case_dir"]) / t["file"]).is_file()
-        )]
-        solver_targets = [t for t in targets if t not in mesh_targets]
-        resume["rewrite_plan"] = {"target_files": solver_targets} if solver_targets else None
-        current["rewrite_plan"] = {"target_files": mesh_targets}
-        current.update(_rewrite_mesh(current))
-    while True:
-        try:
-            current.update(backend(current))
-        except Exception as error:
-            current["error_logs"] = [{"file": "Allmesh", "error_content": str(error)}]
-        current.update(load_case_files(current))
-        if not current.get("error_logs"):
-            current["mesh_info"] = mesh_info(current["case_dir"], current.get("mesh_info"))
-            current["case_context"] = {
-                **(current.get("case_context") or {}), "mesh_state": mesh_state(current["case_dir"]),
-                "issues": [i for i in (current.get("case_context") or {}).get("issues", [])
-                           if i != "No existing polyMesh or system/blockMeshDict was found."],
-            }
-            if current.get("case_import_report_dir"):
-                from .case_import import _write_json
-                _write_json(Path(current["case_import_report_dir"]) / "case_context.json", current["case_context"])
-            current.update(resume)
-            current.update(repairing_mesh=False, mesh_resume_state=None, error_logs=[])
-            return current
-        current["repairing_mesh"] = True
-        current.update(review_case(current, mesh=True))
-        if current.get("termination_reason"):
-            return current
-        current.update(plan_meshing(current))
-        backend = {
-            "standard_mesh": standard_meshing,
-            "gmsh_mesh": gmsh_meshing,
-            "custom_mesh": imported_meshing,
-        }[current["mesh_type"]]
-        current.update(_rewrite_mesh(current))
+    previous_mesh = resume.get("previous_mesh", state.get("mesh_info"))
+    pending = list(resume.get("pending", []))
+    targets = (current.get("rewrite_plan") or {}).get("target_files", [])
+    pending.extend(t for t in targets if t["stage"] != "mesh")
+    current["rewrite_plan"] = {"target_files": [t for t in targets if t["stage"] == "mesh"]}
+    try:
+        written = _write_mesh_files(current)
+        result.update(written)
+        current.update(written)
+        current["mesh_subtasks"] = []
+        result["mesh_subtasks"] = []
+        if not written.get("error_logs"):
+            rewritten = _rewrite_mesh(current)
+            result.update(rewritten)
+            current.update(rewritten)
+            if not rewritten.get("error_logs"):
+                result.update(backend(current))
+    except Exception as error:
+        native_output = [str(error), str(getattr(error, "stdout", "") or ""),
+                         str(getattr(error, "stderr", "") or "")]
+        result["error_logs"] = [{"file": "Allmesh", "error_content": "\n".join(native_output)}]
+    current.update(result)
+    result.update(load_case_files(current))
+    current.update(result)
+    if not current.get("error_logs"):
+        mesh_dir = Path(current["case_dir"]) / "constant/polyMesh"
+        boundary = mesh_dir / "boundary"
+        info = {
+            **(current.get("mesh_info") or {}),
+            "poly_mesh_path": str(mesh_dir),
+            "boundary_text": boundary.read_text(encoding="utf-8", errors="replace")
+            if boundary.is_file() else "",
+        }
+        result["mesh_info"] = info
+        impact_reason = ""
+        if current.get("solver_planned"):
+            impact = current["llm_service"].invoke(
+                f"<user_requirement>{current['user_requirement']}</user_requirement>\n"
+                f"<previous_mesh>{previous_mesh}</previous_mesh>\n"
+                f"<actual_mesh>{info}</actual_mesh>\n"
+                f"<files>{current.get('foamfiles')}</files>\n"
+                f"<execution>{current.get('mesh_execution')}</execution>\n"
+                f"<review_analysis>{current.get('review_analysis')}</review_analysis>\n"
+                f"<pending_repairs>{pending}</pending_repairs>",
+                "As the mesh planner, confirm the impact of the completed mesh work on the "
+                "existing physical plan. Decide whether Solver Planner must reconsider physics, "
+                "solver settings or boundary conditions. Base the decision on actual results "
+                "and the request, not filenames or a fixed change checklist. Pending physical "
+                "file repairs remain available in either route.",
+                pydantic_obj=MeshRepairImpact,
+            )
+            result["replan_solver"] = impact.replan_solver
+            impact_reason = impact.reason
+        result.update({key: resume.get(key) for key in
+                        ("input_writer_mode", "review_analysis", "requires_input_writer")})
+        if impact_reason:
+            result["review_analysis"] = (result.get("review_analysis") or "") + "\n" + impact_reason
+        if current.get("pending_solver_subtasks"):
+            result.update(subtasks=current["pending_solver_subtasks"],
+                           input_writer_mode="initial", requires_input_writer=True)
+        result.update(rewrite_plan={"target_files": pending} if pending else None,
+                       repairing_mesh=False, mesh_resume_state=None, error_logs=[])
+        return result
+    result.update(
+        repairing_mesh=True,
+        rewrite_plan={"target_files": pending + current["rewrite_plan"]["target_files"]},
+        mesh_resume_state={**resume, "pending": pending, "previous_mesh": previous_mesh},
+    )
+    return result

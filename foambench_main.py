@@ -49,7 +49,7 @@ def parse_args():
         '--custom_mesh_path',
         type=str,
         default=None,
-        help="Path to a Gmsh .msh file (ASCII 2.2 format). If not provided, no custom mesh will be used."
+        help="Path to a Gmsh .msh file (ASCII 2.2 format)."
     )
     parser.add_argument(
         '--overwrite_output',

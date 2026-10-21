@@ -45,7 +45,6 @@ def initial_write(
     openfoam_fork: str = "foundation",
     llm_service: Optional[Any] = None,
     config: Optional[Config] = None,
-    mesh_info: Optional[dict] = None,
 ) -> Dict[str, Any]:
     """
     Generate OpenFOAM files from scratch based on user requirements and subtasks.
@@ -179,7 +178,6 @@ def initial_write(
 
         code_user_prompt = (
             f"User requirement: {user_requirement}\n"
-            f"<actual_mesh>{mesh_info or {}}</actual_mesh>\n"
             f"{similar_ref_block}{advice_text}\n"
             "If the similar case is a weak match, do not copy it blindly. Use it only where it is consistent with the user requirement. "
             "The OpenFOAM compatibility contract in the system prompt takes precedence over incompatible syntax in a reference case. "
@@ -409,7 +407,7 @@ def build_allrun(
 
     # Handle mesh commands info
     mesh_commands_info = ""
-    if mesh_commands:
+    if mesh_type == "custom_mesh" and mesh_commands:
         mesh_commands_info = f"\nCustom mesh commands to include: {mesh_commands}"
         print(f"Including custom mesh commands: {mesh_commands}")
 
@@ -548,7 +546,6 @@ def rewrite_files(
     openfoam_fork: str = "foundation",
     case_solver: str = "",
     llm_service: Optional[Any] = None,
-    mesh_info: Optional[dict] = None,
 ) -> Dict[str, Any]:
     """
     Rewrite OpenFOAM files based on error analysis and reviewer suggestions.
@@ -641,7 +638,6 @@ def rewrite_files(
     )
 
     rewrite_user_prompt = (
-        f"<actual_mesh>{mesh_info or {}}</actual_mesh>\n"
         f"<foamfiles>{foamfiles}</foamfiles>\n"
         f"<error_logs>{error_logs}</error_logs>\n"
         f"<reviewer_analysis>{review_analysis}</reviewer_analysis>\n"
@@ -652,13 +648,6 @@ def rewrite_files(
         "Please update OpenFOAM files according to rewrite_plan only. "
         "Only include files from rewrite_plan.target_files in your output."
     )
-    if mesh_info:
-        rewrite_user_prompt += (
-            "\nMesh operations belong to Allmesh and Meshing. When editing Allrun, "
-            "preserve its solver-only stage; do not add mesh generation, conversion, "
-            "checks, modifications or cleanup. Physical field preparation and "
-            "solver-parallel decomposition remain in Allrun."
-        )
 
     allowed_files: set[str] = set()
     if isinstance(rewrite_plan, dict):
