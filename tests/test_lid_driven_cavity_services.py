@@ -19,7 +19,6 @@ from services.plan import (
     generate_simulation_plan
 )
 from services.input_writer import initial_write
-from services.mesh import prepare_standard_mesh
 from services.run_local import run_allrun_and_collect_errors
 from services.review import review_error_logs
 from services.visualization import visualize_case
@@ -130,11 +129,9 @@ def main():
         print(f"✅ Generated {file_count} files in {len(dir_structure)} directories")
         results['file_generation'] = True
         
-        # Step 4: Prepare mesh
-        print("\n🕸️ Step 4: Preparing mesh")
+        # Step 4: Inspect mesh directory; Allrun performs standard meshing.
+        print("\n🕸️ Step 4: Inspecting mesh directory")
         print("-" * 40)
-        
-        prepare_standard_mesh()
         
         mesh_dir = os.path.join(case_dir, 'constant', 'polyMesh')
         if os.path.exists(mesh_dir):

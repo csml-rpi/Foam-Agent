@@ -15,24 +15,20 @@ _MESH_COMMAND_TIMEOUT_SECONDS = 300
 
 def copy_custom_mesh(
     custom_mesh_path: str,
-    user_requirement: str,
     case_dir: str,
     *,
-    llm_service: Optional[Any] = None,
     openfoam_target: str = "",
-    repair_feedback: str = "",
     retry: bool = False,
 ) -> Dict[str, Any]:
     """
     Copy and process a custom mesh file for OpenFOAM simulation.
     
     This function copies a custom mesh file (typically .msh format) to the case directory,
-    creates necessary OpenFOAM directories, generates a basic controlDict, and converts
+    creates necessary OpenFOAM directories and converts
     the mesh to OpenFOAM format using gmshToFoam.
     
     Args:
         custom_mesh_path (str): Path to the custom mesh file (.msh format)
-        user_requirement (str): User requirements for generating controlDict
         case_dir (str): Directory path where the case files will be created
     
     Returns:
@@ -54,7 +50,6 @@ def copy_custom_mesh(
     Example:
         >>> result = copy_custom_mesh(
         ...     custom_mesh_path="/path/to/mesh.msh",
-        ...     user_requirement="Simple flow simulation",
         ...     case_dir="/path/to/case"
         ... )
         >>> print(f"Mesh processed: {result['mesh_info']['mesh_file_path']}")
@@ -76,29 +71,6 @@ def copy_custom_mesh(
     system_dir = os.path.join(case_dir, "system")
     os.makedirs(constant_dir, exist_ok=True)
     os.makedirs(system_dir, exist_ok=True)
-
-    controldict_prompt = (
-        f"<user_requirements>{user_requirement}</user_requirements>\n"
-        f"<repair_feedback>{repair_feedback}</repair_feedback>\n"
-        "Please create a basic controlDict file for mesh conversion. "
-        "The file should include only the essential settings needed for gmshToFoam to work. "
-        "IMPORTANT: Return ONLY the complete controlDict file content without any additional text."
-    )
-    llm_client = llm_service if llm_service is not None else global_llm_service
-    target_constraint = (
-        " The selected OpenFOAM runtime is native ESI/OpenCFD v2006. "
-        "Use only ESI v2006 controlDict conventions."
-        if openfoam_target == "esi-v2006"
-        else ""
-    )
-    if not retry or not os.path.isfile(os.path.join(system_dir, "controlDict")):
-        controldict_content = llm_client.invoke(controldict_prompt, (
-            "You are an expert in OpenFOAM simulation setup. "
-            "Create a minimal controlDict for gmshToFoam."
-            + target_constraint
-        )).strip()
-        if controldict_content:
-            save_file(os.path.join(system_dir, "controlDict"), controldict_content)
 
     # Convert mesh
     try:
@@ -132,36 +104,6 @@ def copy_custom_mesh(
         "custom_mesh_used": True,
         "error_logs": [],
     }
-
-
-def prepare_standard_mesh() -> Dict[str, Any]:
-    """
-    Prepare standard mesh configuration for OpenFOAM simulation.
-    
-    This function returns a standard mesh configuration that indicates
-    no custom mesh processing is required. It's used when the simulation
-    will use standard OpenFOAM mesh generation tools like blockMesh.
-    
-    Returns:
-        Dict[str, Any]: Contains:
-            - mesh_info (None): No custom mesh information
-            - mesh_commands (List[str]): Empty list of mesh commands
-            - mesh_file_destination (None): No mesh file destination
-            - custom_mesh_used (bool): False, indicating standard mesh
-            - error_logs (List[str]): Empty list of error messages
-    
-    Example:
-        >>> result = prepare_standard_mesh()
-        >>> print(f"Using standard mesh: {not result['custom_mesh_used']}")
-    """
-    return {
-        "mesh_info": None,
-        "mesh_commands": [],
-        "mesh_file_destination": None,
-        "custom_mesh_used": False,
-        "error_logs": [],
-    }
-
 
 
 # ====================== GMSH mesh generation ======================
@@ -531,19 +473,6 @@ def handle_gmsh_mesh(
             system_dir = os.path.join(case_dir, "system")
             os.makedirs(constant_dir, exist_ok=True)
             os.makedirs(system_dir, exist_ok=True)
-            controldict_prompt = (
-                f"<user_requirements>{user_requirement}</user_requirements>\n"
-                "Please create a basic controlDict file for mesh conversion. "
-                "The file should include only the essential settings needed for gmshToFoam to work. "
-                "IMPORTANT: Return ONLY the complete controlDict file content without any additional text."
-            )
-            if openfoam_target == "esi-v2006":
-                controldict_prompt += " Use only native ESI/OpenCFD v2006 controlDict conventions."
-            if not retry or not os.path.isfile(os.path.join(system_dir, "controlDict")):
-                controldict_content = llm_client.invoke(controldict_prompt, CONTROLDICT_SYSTEM_PROMPT).strip()  # type: ignore
-                if controldict_content:
-                    save_file(os.path.join(system_dir, "controlDict"), controldict_content)
-
             run_openfoam_utility(["gmshToFoam", "geometry.msh"], working_dir=case_dir, timeout=_MESH_COMMAND_TIMEOUT_SECONDS, openfoam_target=openfoam_target)
             polyMesh_dir = os.path.join(constant_dir, "polyMesh")
             if not os.path.isdir(polyMesh_dir):

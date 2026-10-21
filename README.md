@@ -13,7 +13,7 @@ Visit [deepwiki.com/csml-rpi/Foam-Agent](https://deepwiki.com/csml-rpi/Foam-Agen
 
 ## Key Features
 
-- **End-to-End Workflow**: Meshing (including external Gmsh `.msh` files), case generation, local execution or Slurm submission, and optional PyVista visualization. Execution requires the corresponding runtime and infrastructure.
+- **End-to-End Workflow**: Meshing with OpenFOAM utilities, generated Gmsh meshes or uploaded Gmsh `.msh` files, case generation, local execution or Slurm submission, and optional PyVista visualization. Execution requires the corresponding runtime and infrastructure.
 - **Multi-Agent Workflow**: Architect, Input Writer, Runner, and Reviewer agents collaborate through a LangGraph pipeline with automatic error correction (up to 25 iterations).
 - **RAG-Enhanced Generation**: Hierarchical FAISS indices built from OpenFOAM tutorials provide context-specific retrieval for accurate configuration file generation.
 - **Composable Service Architecture**: Core functions are exposed as MCP tools, enabling integration with Claude Code, Cursor, and other agentic systems.
@@ -58,9 +58,26 @@ That's it. Foam-Agent will plan the case, generate all OpenFOAM files, run the s
 
 ### 4. Run an Existing Case
 
-An existing directory or ZIP is another Foam-Agent input. `case_import` preserves a read-only `original/` copy, creates a writable `work/` copy, and passes the discovered files, solver, mesh, time directories, and results to the normal Planner. Platform detection uses OpenFOAM header evidence, not dictionary filenames alone; specify `--openfoam_target` when the platform cannot be resolved. A case with `Allrun`, no detected issues, and no explicit prompt or custom mesh skips file planning and routes to Runner. This still requires LLM resources and routing calls. Other cases use LLM planning to select file changes or meshing, or fail when required physical information cannot be inferred. A configured target conflicting with the detected platform is recorded deterministically, then routed from Planner to Reviewer/Input Writer for repair; the Planner LLM does not decide whether the mismatch exists.
+Prompt, external-mesh/material and existing-case inputs share the same main graph:
 
-The local runner uses the same cleanup policy for generated and imported cases. Prior run artifacts and nonzero time directories in `work/` are cleared before execution and are not automatically restored after failure. The `original/` copy remains available; the local workflow does not preserve restart data for continuation runs. HPC execution instead follows the generated Slurm script and the case's `Allrun`.
+```text
+Preparation -> Meshing Planner -> Meshing -> Solver Planner -> Input Writer
+            -> Local/HPC Runner -> optional Visualization
+```
+
+Preparation creates working copies and supplies file facts. The LLM decides mesh
+operations from the requirement and available files; an existing `polyMesh` or
+uploaded path does not force reuse or regeneration. Solver selection and solver
+reference retrieval happen after the actual mesh is ready. Meshing is an ordinary
+node, not a child graph.
+
+For directory/ZIP imports, Preparation preserves a read-only `original/` copy,
+creates `work/`, and reads the existing files and script. Header evidence selects
+the supported native target; specify `--openfoam_target` when detection is
+inconclusive. A configured/detected target conflict stops before mesh planning.
+Solver Planner decides the minimum physical changes after mesh handoff and
+extracts a solver-only `Allrun`, preserving field preparation and solver arguments.
+If required physical information cannot be inferred, planning fails with a reason.
 
 ```bash
 # Preserve the existing physical definition and run it
@@ -76,7 +93,7 @@ python foambench_main.py \
   --openfoam_target esi-v2006
 ```
 
-Request visualization in the prompt for either generated or imported cases; the Planner determines whether it is needed. `--custom_mesh_path` can be combined with `--case_path` and `--prompt_path`; the Planner then decides whether Meshing must run before targeted dictionary changes and execution.
+The three main input modes are requirements only, an uploaded Gmsh `.msh` with requirements, and an existing case with optional requirements. `--case_path` and `--custom_mesh_path` may be supplied together, with or without an explicit requirements file. Every combination enters Preparation: it imports the case when supplied, copies the uploaded Gmsh mesh into the working case's `input/`, and passes all available file facts and requirements to Meshing Planner. Request visualization in the prompt for either generated or imported cases; the Planner determines whether it is needed.
 
 `--case_path` accepts either a case directory or a ZIP archive. If an archive contains multiple cases, select one explicitly:
 
@@ -87,9 +104,9 @@ python foambench_main.py \
   --case_subdir multiphase/interFoam/laminar/damBreak/damBreak
 ```
 
-The task directory contains `original/`, `work/`, and `report/`. `report/case_context.json` records the initial imported context, and `report/logs/` contains workflow logs; local `Allrun.out`, `Allrun.err`, and solver logs remain in `work/`. Existing `Allrun` is executed from `work/` unless the repair workflow changes it. Import rejects symbolic links in a source case. Replacing a non-empty output directory requires both Foam-Agent's ownership marker and `--overwrite_output` (or the API's `overwrite_output=true`). Import itself does not impose a command whitelist or rewrite the script.
+The task directory contains `original/`, `work/`, and `report/`. `report/case_context.json` records the initial imported context, and `report/logs/` contains workflow logs; local `Allrun.out`, `Allrun.err`, and solver logs remain in `work/`. The solver-only `Allrun` is executed from `work/`; mesh operations execute earlier in Meshing. Import rejects symbolic links in a source case. Replacing a non-empty output directory requires both Foam-Agent's ownership marker and `--overwrite_output` (or the API's `overwrite_output=true`). Import itself does not impose a command whitelist or rewrite the script.
 
-Generated and imported cases use the same Reviewer → Input Writer → Runner repair loop, with analysis history and the configured retry limit. Meshing failures also enter Reviewer: a file-scoped repair passes through Input Writer and returns to Meshing; without target files, it retries Meshing directly. Successful mesh repair resumes the pending workflow. Reviewer records error fingerprints and stops when consecutive fingerprints of the errors, filtered case files, and user requirement are identical. The graph recursion limit also bounds execution. There is no interactive clarification or task-resume step. If import planning cannot proceed, correct the inputs indicated by the failure reason and start a new run.
+Generated and imported cases share the same review services and configured repair budget. Mesh failures return to the main-graph Reviewer, then Meshing Planner and Meshing for repair. Solver errors return to Reviewer, then Input Writer for physical repairs or Meshing Planner for mesh repairs. Pending solver-file changes survive mesh retries. Planner and Reviewer declare each file's stage rather than routing by its filename. After mesh repair, the mesh planner uses actual results to decide whether Solver Planner must revisit the physics plan. Solver review retains its existing repeated-fingerprint stop rule; mesh review decides whether another repair is justified within the same configured budget. There is no interactive clarification or task-resume step; correct missing inputs identified by a planning failure and start a new run.
 
 If simulation succeeds but requested visualization fails, the workflow reports `partial_success`, `termination_reason=visualization_failed`, and `Simulation completed successfully, but visualization failed.` The CLI exits nonzero; MCP `run_case` returns the message and `visualization_error` separately from execution errors.
 
@@ -162,7 +179,13 @@ The highest reported scores in this table use **Anthropic Claude Opus 4.6**; mod
 
 ### Custom Mesh Files
 
-Foam-Agent supports external Gmsh `.msh` files (ASCII 2.2 format). Describe boundary conditions in your prompt and pass the mesh:
+Use `--custom_mesh_path` for an already generated Gmsh `.msh` file (ASCII 2.2), matching Foam-Agent's original custom-mesh input. Preparation copies the supplied file; the LLM selects the mesh operations from the requirement and available files. Existing case-internal `constant/polyMesh` remains supported through case import.
+
+The original `gmsh_mesh` backend still generates and runs Gmsh Python code. External `.geo` execution and independent `polyMesh`-directory upload are not included in this update. Fluent mesh input is deferred to a later SpaceClaim/Fluent integration.
+
+Checks and changes to a case's existing mesh follow the LLM plan. Mesh handoff passes actual boundary text and available evidence to Solver Planner without a separate regex patch summary. Missing boundary metadata does not fail mesh handoff; native tool errors still enter the existing repair flow. Mesh plans can create or modify files on the first pass, and ordered commands retain repetitions. Allmesh records native output and new or changed logs without assuming log filenames. Meshing Planner decides which startup dictionaries the selected tools require and declares file tasks; execution does not inject default dictionaries. Solver Planner adapts these files to the physical problem where needed.
+
+For example:
 
 ```bash
 python foambench_main.py \
@@ -248,7 +271,7 @@ Foundation OpenFOAM v10 is the default native target. Set
 
 ### Native target capability parity
 
-`foundation-v10` and `esi-v2006` use the same workflow implementation for prompt planning and RAG, file and Allrun generation, standard/Gmsh/custom meshes, local and HPC execution, review/rewrite, visualization, and existing-case import, with target-specific Docker delivery. This is shared code coverage, not a guarantee that every solver or case succeeds. Their solver names and dictionary syntax remain release-native. Existing cases use conditional graph routes: Planner selects optional mesh preparation and file modification before running; Reviewer supplies file repair plans or mesh retries. `FOAMAGENT_OPENFOAM_FORK=esi` is a legacy translation
+`foundation-v10` and `esi-v2006` use the same workflow implementation for prompt planning and RAG, file and Allrun generation, standard/Gmsh/custom meshes, local and HPC execution, review/rewrite, visualization, and existing-case import, with target-specific Docker delivery. This is shared code coverage, not a guarantee that every solver or case succeeds. Their solver names and dictionary syntax remain release-native. All non-CAD graph inputs pass Preparation and mesh planning before Solver Planner selects physical changes; Reviewer supplies file repair plans or mesh retries. `FOAMAGENT_OPENFOAM_FORK=esi` is a legacy translation
 mode.
 
 Native tutorial corpora are stored by target under `database/`: Foundation v10 uses `database/foundation-v10/{raw,faiss}`, while ESI/OpenCFD v2006 uses `database/esi-v2006/{raw,faiss}`. The sibling `database/script/` directory contains the parsers and FAISS builders shared by both corpora.

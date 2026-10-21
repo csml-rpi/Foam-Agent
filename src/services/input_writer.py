@@ -322,6 +322,7 @@ def build_allrun(
     llm_service: Optional[Any] = None,
     config: Optional[Config] = None,
     openfoam_fork: str = "foundation",
+    phase: str = "all",
 ) -> Dict[str, Any]:
     """
     Build an Allrun script for automated OpenFOAM simulation execution.
@@ -417,7 +418,23 @@ def build_allrun(
         "Return only the list of commands—no explanations, comments, or additional text."
     )
 
-    if mesh_type == "custom_mesh":
+    stage_prompt = ""
+    if phase == "mesh":
+        stage_prompt = (
+            "\nGenerate only the mesh stage, following the supplied ordered commands "
+            "and their arguments exactly. Do not run a solver or prepare physical fields. "
+            "Retain shell setup and helpers necessary for those commands. "
+            "The script is named Allmesh.\n"
+        )
+    elif phase == "solver":
+        stage_prompt = (
+            "\nThe actual mesh is already prepared by Meshing. Generate only the solver "
+            "stage. Do not generate, convert, check, modify or clean up the mesh, and "
+            "do not call Allmesh or other mesh scripts. Preserve necessary physical "
+            "field preparation and solver-parallel decomposition. The script is Allrun.\n"
+        )
+
+    if mesh_type == "custom_mesh" and phase == "all":
         command_system_prompt += "If custom mesh commands are provided, include them in the appropriate order (typically after blockMesh or instead of blockMesh if custom mesh is used). "
     
     command_user_prompt = (
@@ -431,9 +448,13 @@ def build_allrun(
     if mesh_type == "custom_mesh":
         command_user_prompt += f"{mesh_commands_info}\n"
     
-    command_system_prompt += "\n" + _generation_contract(openfoam_fork)
+    command_system_prompt += stage_prompt + "\n" + _generation_contract(openfoam_fork)
 
-    command_response = llm_client.invoke(command_user_prompt, command_system_prompt, pydantic_obj=CommandsPydantic)
+    command_response = (
+        CommandsPydantic(commands=mesh_commands)
+        if phase == "mesh"
+        else llm_client.invoke(command_user_prompt, command_system_prompt, pydantic_obj=CommandsPydantic)
+    )
 
     if progress_callback:
         try:
@@ -461,10 +482,13 @@ def build_allrun(
         f"Reference Allrun scripts from similar cases: {allrun_reference}\n\n"
         "If custom mesh commands are provided, make sure to include them in the appropriate order in the Allrun script. "
         "CRITICAL: Do not include any post processing commands in the Allrun script."
-        "CRITICAL: Do not include any commands to convert mesh to foam format like gmshToFoam or others."
+        + (
+            "CRITICAL: Do not include any commands to convert mesh to foam format like gmshToFoam or others."
+            if phase != "mesh" else ""
+        )
     )
 
-    if mesh_type == "custom_mesh":
+    if mesh_type == "custom_mesh" and phase == "all":
         allrun_system_prompt += "CRITICAL: Do not include any other mesh commands other than the custom mesh commands.\n"
         allrun_system_prompt += "CRITICAL: Do not include any gmshToFoam commands in the Allrun script."
     
@@ -477,16 +501,21 @@ def build_allrun(
         "You need to rely on your OpenFOAM and physics knowledge to discern this, and pay more attention to user requirements, " 
         "as your ultimate goal is to fulfill the user's requirements and generate an allrun script that meets those requirements."
         "CRITICAL: Do not include any post processing commands in the Allrun script."
-        "CRITICAL: Do not include any commands to convert mesh to foam format like gmshToFoam or others."
-        "CRITICAL: Do not include any commands that run gmsh to create the mesh."
-        "Generate the Allrun script strictly based on the above information. Do not include explanations, comments, or additional text. Put the code in ``` tags."
+        + (
+            "CRITICAL: Do not include any commands to convert mesh to foam format like gmshToFoam or others."
+            "CRITICAL: Do not include any commands that run gmsh to create the mesh."
+            if phase != "mesh" else ""
+        )
+        + "Generate the Allrun script strictly based on the above information. Do not include explanations, comments, or additional text. Put the code in ``` tags."
     )
 
-    if mesh_type == "custom_mesh":
+    if mesh_type == "custom_mesh" and phase == "all":
         allrun_user_prompt += "CRITICAL: Do not include any other mesh commands other than the custom mesh commands.\n"
         allrun_user_prompt += "CRITICAL: Do not include any gmshToFoam commands in the Allrun script."
 
-    allrun_system_prompt += "\n" + _generation_contract(openfoam_fork)
+    allrun_system_prompt += stage_prompt + "\n" + _generation_contract(openfoam_fork)
+    if phase == "mesh":
+        allrun_user_prompt += f"\nExecute these planned commands in order: {mesh_commands}\n"
 
     allrun_response = llm_client.invoke(allrun_user_prompt, allrun_system_prompt)
 
@@ -499,7 +528,7 @@ def build_allrun(
     allrun_script = parse_allrun(allrun_response)
     if not allrun_script:
         raise ValueError("The LLM returned an empty Allrun script.")
-    allrun_file_path = os.path.join(case_dir, "Allrun")
+    allrun_file_path = os.path.join(case_dir, "Allmesh" if phase == "mesh" else "Allrun")
     save_file(allrun_file_path, allrun_script)
     
     return {"allrun_path": allrun_file_path, "allrun_script": allrun_script, "commands": command_response.commands}
