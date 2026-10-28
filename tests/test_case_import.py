@@ -590,4 +590,4 @@ def test_allrun_generation_uses_command_help(tmp_path: Path, monkeypatch) -> Non
     assert retrievals == [("openfoam_command_help", "simpleFoam", 2, config)]
     assert "simpleFoam command help" in calls[1][1]
     assert all("ESI/OpenCFD OpenFOAM v2006" in system for _, system in calls)
-    assert (case / "Allrun").read_text(encoding="utf-8") == "#!/bin/sh\nsimpleFoam"
+    assert (case / "Allrun").read_text(encoding="utf-8") == "#!/bin/sh\nsimpleFoam\n"

@@ -52,6 +52,8 @@ solver, retrieve solver cases, or force mesh reuse/regeneration. Existing case
 import services retain target detection, original/work/report copies and target
 mismatch failures. Imported cases enter through Preparation; the old imported-case
 node adapter has been removed.
+Preparation preserves time and partition mesh sources. Prior solver outputs are
+cleaned by Local/HPC Runner only after successful mesh handoff.
 
 Meshing Planner selects a backend, source material, files and ordered commands
 from the requirement and available files. No uploaded path or polyMesh directory
@@ -81,7 +83,14 @@ continue to Writer; pending physical tasks survive either route.
 Retain the three supported input modes and the standalone MCP planning service.
 Imported-case planning only runs after Preparation and Meshing; target checks belong
 to Preparation, with no legacy all-stage planning branch.
-No new safety or boundary-condition policies or quality thresholds are added.
+Mesh handoff requires complete constant/polyMesh output; unresolved time/parallel mesh outputs, including 0/polyMesh, return to repair without deleting initial fields. Native HPC mesh operations are submitted before the solver job. No new boundary-condition policies or quality thresholds are added.
+For parallel reconstruction, `MeshingPlan.final_reconstruction` declares exact
+case-relative partition source directories, native argv and the fixed
+`constant/polyMesh` target. It runs last through the existing native utility
+runner. All declared sources must be complete before the old serial target is
+removed; only successful creation of a complete replacement permits those
+partition directories to remain at handoff. Ordinary serial mesh edits retain
+their existing mesh. No timestamp-based selection or mesh archiving is used.
 
 ### Directory Structure
 
@@ -139,7 +148,7 @@ docker/                # Dockerfile for containerized deployment
 ### Design Patterns
 
 1. **Service-oriented**: Nodes in `src/nodes/` are thin orchestration wrappers. All logic lives in `src/services/`.
-2. **Error correction loop**: Runner detects errors -> Reviewer diagnoses via LLM -> Input Writer rewrites solver files, or Meshing rewrites/regenerates mesh -> re-run. Meshing-stage errors return to the main-graph Reviewer and then Meshing Planner. Existing review limits are retained. Solver-review repeated-error stopping is unchanged; mesh review receives repetition evidence and decides whether to continue within the shared budget. No new safety or boundary checks are added.
+2. **Error correction loop**: Runner detects errors -> Reviewer diagnoses via LLM -> Input Writer rewrites solver files, or Meshing rewrites/regenerates mesh -> re-run. Meshing-stage errors return to the main-graph Reviewer and then Meshing Planner. Existing review limits are retained. Solver-review repeated-error stopping is unchanged; mesh review receives repetition evidence and decides whether to continue within the shared budget. No new boundary-condition policies or mesh quality thresholds are added.
 3. **RAG retrieval**: FAISS indices built from OpenFOAM tutorials provide reference cases to the input writer.
 4. **Two generation modes** (`config.input_writer_generation_mode`):
    - `sequential_dependency` (default): Files generated in order with cross-file context.
@@ -191,4 +200,4 @@ Use `esi-v2006` with a matching runtime to build that corpus. Runtime defaults a
 - **The error correction loop** can run up to 25 iterations. When modifying the reviewer or input writer, consider the impact on convergence.
 - **`GraphState`** defines the state schema. LangGraph merges node-returned updates; some nodes also mutate nested objects such as `Config`. Do not assume every node shares one unchanged dictionary instance.
 - **Visualization failure after simulation success** produces `partial_success`, `termination_reason=visualization_failed`, and the English message `Simulation completed successfully, but visualization failed.` The CLI exits nonzero; MCP `run_case` includes the summary and visualization error. A standalone MCP `visualization` failure raises an error.
-- **HPC monitoring is basic**: it runs Slurm commands in the agent's environment, treats an empty `squeue` result as completed, and does not query `sacct` or validate the final exit code. Monitoring timeout returns the last observed state and may enter the existing repair/resubmission loop. It is not an SSH deployment or job-resume service.
+- **HPC monitoring** runs Slurm commands in the agent's environment and does not query `sacct`. An empty `squeue` result ends monitoring, but success also requires the current attempt's zero exit-code record. Monitoring failure or deadline expiry triggers cancellation and up to 60 seconds of confirmation; an unconfirmed stop terminates the graph with `hpc_job_state_unconfirmed`, including through Gmsh's internal exception handlers. Explicit `sbatch` rejections use error-context script repair and consume the shared `loop_count`; uncertain submissions stop without resubmission. Resources are refreshed from the current case before each stage. This is not an SSH deployment or job-resume service.

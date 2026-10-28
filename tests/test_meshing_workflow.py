@@ -171,6 +171,7 @@ def test_mesh_before_solver_workflow(scenario, target, modules, monkeypatch, tmp
                  "mesh_type": "standard_mesh", "repairing_mesh": scenario == "allmesh_repair_without_commands",
                  "mesh_commands": [] if scenario == "allmesh_repair_without_commands" else ["plannedOperation"],
                  "rewrite_plan": {"target_files": [{"file": "Allmesh", "stage": "mesh", "changes": "Run the planned operation"}]}}
+        _poly_mesh(case)
         result = m.meshing.execute_meshing(state, m.meshing.standard_meshing)
         assert not result["error_logs"]
         assert (case / "Allmesh").read_text() == edited
@@ -287,6 +288,7 @@ def test_mesh_before_solver_workflow(scenario, target, modules, monkeypatch, tmp
             assert (case / "system/fvSchemes").read_text() == "user schemes"
             assert not (case / "system/fvSolution").exists()
             _put(case, "system/controlDict", "tool-updated settings")
+            _poly_mesh(case)
             return {"error_logs": []}
         state = {"case_dir": str(case), "config": Config(openfoam_target=target),
                  "user_requirement": "Prepare only the selected tool's input", "llm_service": StartupLLM()}
@@ -327,7 +329,7 @@ def test_mesh_before_solver_workflow(scenario, target, modules, monkeypatch, tmp
         assert result["error_logs"]
         evidence = result["mesh_execution"]
         assert evidence["command_result"]["timed_out"] == (scenario == "mesh_log_timeout")
-        assert "log.old" not in evidence["logs"] and (case / "log.old").exists()
+        assert "log.old" not in evidence["logs"] and list((case / ".foamagent/mesh-logs").glob("*/log.old"))
         assert "captured native stderr" in str(result["error_logs"])
         if scenario == "mesh_log_read_error":
             assert "native log unavailable" in str(result["error_logs"])
@@ -689,10 +691,9 @@ def test_mesh_before_solver_workflow(scenario, target, modules, monkeypatch, tmp
         state.update(m.preparation.prepare_inputs(state))
         state.update(m.meshing.plan_meshing(state))
         result = m.meshing.execute_meshing(state, m.meshing.imported_meshing)
-        assert not result["error_logs"] and not result.get("termination_reason")
-        assert "patches" not in result["mesh_info"]
-        assert result["mesh_info"]["boundary_text"] == ""
-        assert not Path(result["mesh_info"]["poly_mesh_path"]).exists()
+        assert result["error_logs"][0]["file"] == "mesh_handoff"
+        assert result["repairing_mesh"]
+        assert not (Path(state["case_dir"]) / "constant/polyMesh").exists()
         assert not planned and not selections and not solver_runs
         return
     graph = m.main.create_foam_agent_graph().compile()

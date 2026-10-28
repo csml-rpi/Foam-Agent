@@ -1,15 +1,31 @@
 """Shared mesh planning and single-pass backend execution services."""
 
 from pathlib import Path
+import shutil
+import tempfile
+import shlex
+import subprocess
+import re
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
 from openfoam_target import database_path_for_config, generation_convention, runtime_openfoam_target
-from utils import load_case_files, run_command, _EXPLICIT_FOAM_ERROR_RE
+from utils import load_case_files, run_command, run_openfoam_utility, _EXPLICIT_FOAM_ERROR_RE
 from .input_writer import initial_write, build_allrun, rewrite_files
+from .case_paths import safe_case_relative_from_text, safe_case_relative_path
 from .mesh import copy_custom_mesh, handle_gmsh_mesh
 from .plan import SubtaskModel
+from .run_hpc import HpcWorkflowStop
+
+
+_MESH_FILES = ("points", "faces", "owner", "neighbour", "boundary")
+
+
+class FinalReconstruction(BaseModel):
+    sources: list[str] = Field(min_length=1, description="Exact case-relative processorN/constant/polyMesh source directories, not glob patterns")
+    argv: list[str] = Field(min_length=1, description="Native reconstruction argv producing constant/polyMesh from the declared partition sources, e.g. reconstructParMesh -constant")
+    target: Literal["constant/polyMesh"] = "constant/polyMesh"
 
 
 class MeshingPlan(BaseModel):
@@ -17,19 +33,36 @@ class MeshingPlan(BaseModel):
     mesh_source: str = Field(default="", description="Selected Gmsh .msh file, relative to the case or absolute; empty on custom_mesh uses the case's current polyMesh")
     mesh_subtasks: list[SubtaskModel] = Field(default_factory=list)
     mesh_commands: list[str] = Field(default_factory=list)
+    final_reconstruction: FinalReconstruction | None = None
+
+
+def _unique_pending_repairs(tasks):
+    """Remove stored copies of a repair, retaining distinct instructions per file."""
+    unique = {}
+    for task in tasks:
+        path = safe_case_relative_from_text(task["file"]).as_posix()
+        unique[(path, task["stage"], task["changes"])] = {**task, "file": path}
+    return list(unique.values())
 
 
 def plan_meshing(state):
     case = Path(state["case_dir"])
     original = case / "Allrun"
     script = original.read_text(encoding="utf-8") if original.is_file() else ""
+    # Include root-level mesh sources and nested geometry, using current files
+    # rather than the import snapshot. Archived attempts are not input sources.
+    files = sorted(
+        path.relative_to(case).as_posix() for path in case.rglob("*")
+        if path.is_file() and ".foamagent" not in path.relative_to(case).parts
+    )
     prompt = (
         f"<user_requirement>{state['user_requirement']}</user_requirement>\n"
         f"<custom_mesh_path>{state.get('custom_mesh_path') or ''}</custom_mesh_path>\n"
         f"<case_origin>{state.get('case_origin')}</case_origin>\n"
         f"<explicit_requirement>{state.get('user_requirement_explicit', True)}</explicit_requirement>\n"
-        f"<case_files>{state.get('dir_structure') or {}}</case_files>\n"
+        f"<case_files>{files}</case_files>\n"
         f"<case_contents>{state.get('foamfiles') or ''}</case_contents>\n"
+        f"<mesh_candidates>{mesh_candidates(case)}</mesh_candidates>\n"
         f"<reference>{state.get('tutorial_reference') or ''}</reference>\n"
         f"<allrun_reference>{state.get('allrun_reference') or ''}</allrun_reference>\n"
         f"<existing_allrun>{script}</existing_allrun>\n"
@@ -40,6 +73,15 @@ def plan_meshing(state):
     )
     plan = state["llm_service"].invoke(
         prompt,
+        "Prepare the final mesh in constant/polyMesh before handoff. Time-directory or unreconstructed parallel meshes require explicit overwrite/reconstruction operations. "
+        "For final parallel reconstruction, declare final_reconstruction with exact partition source paths "
+        "and native argv that reconstructs them into constant/polyMesh. This runs separately AFTER all "
+        "other mesh operations. Do not also put that final reconstruction in mesh_commands or Allmesh; "
+        "use normal file tasks to adjust an existing script if needed. Before this operation the executor "
+        "requires complete declared sources, removes the old serial target, and checks the newly written "
+        "target. Do not use final_reconstruction for commands that depend on the old serial target. "
+        "Leave it null for serial reuse or modifications. Other time/parallel candidates must be explicitly "
+        "resolved by the plan; they are not automatically deleted or selected by timestamp. "
         "Plan only the mesh stage from the user requirement and actual supplied files. "
         "Do not select a simulation solver or plan physical fields. Choose standard_mesh "
         "for OpenFOAM utilities, gmsh_mesh for Gmsh generation, or custom_mesh for "
@@ -78,7 +120,10 @@ def plan_meshing(state):
         source = case / source
     changes = list((state.get("rewrite_plan") or {}).get("target_files", []))
     creates = []
-    pending = list(state.get("pending_solver_subtasks") or [])
+    pending = {
+        safe_case_relative_path(task["folder_name"], task["file_name"]).as_posix(): task
+        for task in state.get("pending_solver_subtasks") or []
+    }
     for task in plan.mesh_subtasks:
         if task.action == "modify":
             changes.append({"file": str(Path(task.folder_name) / task.file_name),
@@ -87,16 +132,18 @@ def plan_meshing(state):
         elif task.stage == "mesh":
             creates.append(task.model_dump())
         else:
-            pending.append(task.model_dump())
+            # A newer plan for the same file replaces its deferred create.
+            pending[safe_case_relative_path(task.folder_name, task.file_name).as_posix()] = task.model_dump()
     return {
         "rewrite_plan": {"target_files": changes} if changes else None,
-        "pending_solver_subtasks": pending,
+        "pending_solver_subtasks": list(pending.values()),
         "review_analysis": state.get("review_analysis") or
                            "Apply the mesh planner's explicit file changes: " + str(changes),
         "mesh_type": plan.mesh_type,
         "mesh_source": str(source) if source else None,
         "mesh_subtasks": creates,
         "mesh_commands": plan.mesh_commands,
+        "final_reconstruction": plan.final_reconstruction.model_dump() if plan.final_reconstruction else None,
         "allrun_reference": script or state.get("allrun_reference"),
     }
 
@@ -124,7 +171,10 @@ def _write_mesh_files(state):
 def _run_mesh_commands(state, commands):
     config = state["config"]
     case = Path(state["case_dir"])
-    if any(t["file"] == "Allmesh" for t in (state.get("rewrite_plan") or {}).get("target_files", [])):
+    if state.get("explicit_allmesh") or any(
+        safe_case_relative_from_text(t["file"]).as_posix() == "Allmesh"
+        for t in (state.get("rewrite_plan") or {}).get("target_files", [])
+    ):
         script = {"allrun_path": str(case / "Allmesh")}
     elif not commands:
         return {"error_logs": []}
@@ -139,8 +189,22 @@ def _run_mesh_commands(state, commands):
             user_requirement=state["user_requirement"], llm_service=state["llm_service"],
             config=config, openfoam_fork=generation_convention(config), phase="mesh",
         )
-    before, observations = _mesh_log_snapshot(case)
-    result = run_command(
+    old, observations = _mesh_log_snapshot(case)
+    # RunFunctions skips a utility when log.<application>[.<suffix>] exists.
+    # Other diagnostic filenames may also be user inputs: observe their changes
+    # without moving them out of the working case.
+    old = {name: signature for name, signature in old.items()
+           if Path(name).name.startswith("log.") or name in {"Allmesh.out", "Allmesh.err"}}
+    if old:
+        history = Path(tempfile.mkdtemp(prefix="attempt-", dir=_mesh_history(case)))
+        for name in old:
+            destination = history / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(case / name), destination)
+    before, failures = _mesh_log_snapshot(case)
+    observations.extend(failures)
+    runner = _mesh_script_runner(state)
+    result = runner(
         script["allrun_path"], str(case / "Allmesh.out"), str(case / "Allmesh.err"),
         str(case), config.max_time_limit, openfoam_target=runtime_openfoam_target(config),
     )
@@ -155,6 +219,8 @@ def _run_mesh_commands(state, commands):
         except OSError as error:
             observations.append(f"Could not read {name}: {error}")
             continue
+        if "already run on" in output[name] and "re-run" in output[name]:
+            errors.append({"file": name, "error_content": "Mesh command skipped due to an existing log: " + output[name]})
         match = _EXPLICIT_FOAM_ERROR_RE.search(output[name])
         if match:
             errors.append({"file": name, "error_content": match.group(1).strip()})
@@ -168,7 +234,10 @@ def _mesh_log_snapshot(case):
     files, observations = {}, []
     try:
         for path in case.rglob("*"):
-            if path.name.startswith("log") or path.suffix.lower() in {".log", ".out", ".err"}:
+            relative = path.relative_to(case)
+            if ".foamagent" in relative.parts or relative.as_posix() in {"workflow.log", "review.log"}:
+                continue
+            if path.name.startswith("log.") or path.suffix.lower() in {".log", ".out", ".err"}:
                 try:
                     if path.is_file():
                         stat = path.stat()
@@ -185,12 +254,14 @@ def standard_meshing(state):
 
 
 def gmsh_meshing(state):
+    (Path(state["case_dir"]) / ".foamagent/mesh-source.json").unlink(missing_ok=True)
     result = handle_gmsh_mesh(
         state["user_requirement"], state["case_dir"], state["config"].max_loop,
         llm_service=state["llm_service"],
         openfoam_target=runtime_openfoam_target(state["config"]),
         repair_feedback=state.get("review_analysis") or "",
         retry=bool(state.get("repairing_mesh")),
+        **_native_mesh_runners(state),
     )
     commands = state.get("mesh_commands") or []
     if not result.get("error_logs"):
@@ -210,6 +281,7 @@ def imported_meshing(state):
         source, state["case_dir"],
         openfoam_target=runtime_openfoam_target(state["config"]),
         retry=bool(state.get("repairing_mesh")),
+        **{key: value for key, value in _native_mesh_runners(state).items() if key == "utility_runner"},
     )
     if not result.get("error_logs"):
         commands = (result.get("mesh_commands") or []) + (state.get("mesh_commands") or [])
@@ -242,16 +314,20 @@ class MeshRepairImpact(BaseModel):
 
 def execute_meshing(state, backend):
     current = dict(state)
-    result = {}
+    current.setdefault("mesh_jobs", [])
+    result = {"mesh_jobs": current["mesh_jobs"]}
     resume = state.get("mesh_resume_state") or {
         key: state.get(key) for key in
         ("input_writer_mode", "review_analysis", "requires_input_writer")
     }
     previous_mesh = resume.get("previous_mesh", state.get("mesh_info"))
-    pending = list(resume.get("pending", []))
     targets = (current.get("rewrite_plan") or {}).get("target_files", [])
-    pending.extend(t for t in targets if t["stage"] != "mesh")
+    pending = _unique_pending_repairs(
+        list(resume.get("pending", [])) + [t for t in targets if t["stage"] != "mesh"]
+    )
     current["rewrite_plan"] = {"target_files": [t for t in targets if t["stage"] == "mesh"]}
+    current["explicit_allmesh"] = any(str(Path(t["folder_name"]) / t["file_name"]) == "Allmesh" for t in current.get("mesh_subtasks") or [])
+    reconstructed_sources = []
     try:
         written = _write_mesh_files(current)
         result.update(written)
@@ -259,26 +335,46 @@ def execute_meshing(state, backend):
         current["mesh_subtasks"] = []
         result["mesh_subtasks"] = []
         if not written.get("error_logs"):
+            if written:
+                # Creation returns only new files; edits also need existing case contents.
+                current.update(load_case_files(current))
             rewritten = _rewrite_mesh(current)
             result.update(rewritten)
             current.update(rewritten)
             if not rewritten.get("error_logs"):
                 result.update(backend(current))
+                current.update(result)
+                if not current.get("error_logs") and current.get("final_reconstruction"):
+                    reconstructed_sources = _run_final_reconstruction(current)
+                    result["mesh_execution"] = current["mesh_execution"]
+                    result["final_reconstruction"] = None
+    except HpcWorkflowStop as stop:
+        result.update(stop.state_update())
     except Exception as error:
         native_output = [str(error), str(getattr(error, "stdout", "") or ""),
                          str(getattr(error, "stderr", "") or "")]
         result["error_logs"] = [{"file": "Allmesh", "error_content": "\n".join(native_output)}]
+    finally:
+        result["loop_count"] = current.get("loop_count", 0)
+        if "cluster_info" in current:
+            result["cluster_info"] = current["cluster_info"]
+    if result.get("termination_reason"):
+        return result
     current.update(result)
+    if not current.get("error_logs"):
+        result["error_logs"] = validate_mesh_handoff(Path(current["case_dir"]), reconstructed_sources)
+        current.update(result)
     result.update(load_case_files(current))
     current.update(result)
     if not current.get("error_logs"):
         mesh_dir = Path(current["case_dir"]) / "constant/polyMesh"
         boundary = mesh_dir / "boundary"
+        import gzip
+        boundary_text = boundary.read_text(encoding="utf-8", errors="replace") if boundary.is_file() else gzip.open(str(boundary) + ".gz", "rt", errors="replace").read()
         info = {
             **(current.get("mesh_info") or {}),
             "poly_mesh_path": str(mesh_dir),
-            "boundary_text": boundary.read_text(encoding="utf-8", errors="replace")
-            if boundary.is_file() else "",
+            "boundary_text": boundary_text,
         }
         result["mesh_info"] = info
         impact_reason = ""
@@ -316,3 +412,117 @@ def execute_meshing(state, backend):
         mesh_resume_state={**resume, "pending": pending, "previous_mesh": previous_mesh},
     )
     return result
+
+
+def _mesh_history(case):
+    path = case / ".foamagent/mesh-logs"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _missing_mesh_files(directory):
+    return [name for name in _MESH_FILES
+            if not ((directory / name).is_file() or (directory / (name + ".gz")).is_file())]
+
+
+def mesh_candidates(case):
+    return [{"path": path.relative_to(case).as_posix(), "missing_files": _missing_mesh_files(path)}
+            for path in sorted(case.rglob("polyMesh"))
+            if path.is_dir() and ".foamagent" not in path.relative_to(case).parts]
+
+
+def _run_final_reconstruction(state):
+    plan = FinalReconstruction.model_validate(state["final_reconstruction"])
+    case = Path(state["case_dir"]).resolve()
+    target = case / plan.target
+    if not target.parent.resolve().is_relative_to(case):
+        raise ValueError("Final reconstruction target escapes the working case")
+    # All sources must be independent, complete partitions before removing the old target.
+    for source in plan.sources:
+        path = case / source
+        if (not re.fullmatch(r"processor\d+/constant/polyMesh", source)
+                or not path.resolve().is_relative_to(case)
+                or path.resolve() == target.resolve()):
+            raise ValueError(f"Invalid final reconstruction source: {source}")
+        missing = _missing_mesh_files(path)
+        if missing:
+            raise ValueError(f"Incomplete reconstruction source {source}: missing {missing}")
+    if target.is_symlink():
+        target.unlink()
+    elif target.exists():
+        shutil.rmtree(target)
+    runner = _native_mesh_runners(state).get("utility_runner", run_openfoam_utility)
+    completed = runner(plan.argv, working_dir=str(case), timeout=state["config"].max_time_limit,
+                       openfoam_target=runtime_openfoam_target(state["config"]))
+    if completed.returncode:
+        raise subprocess.CalledProcessError(completed.returncode, plan.argv,
+                                            output=completed.stdout, stderr=completed.stderr)
+    missing = _missing_mesh_files(target)
+    if missing:
+        raise ValueError(f"Final reconstruction did not produce complete {plan.target}: missing {missing}")
+    state["mesh_execution"] = {
+        **(state.get("mesh_execution") or {}),
+        "final_reconstruction": {**plan.model_dump(), "returncode": completed.returncode,
+                                 "stdout": completed.stdout, "stderr": completed.stderr},
+    }
+    return plan.sources
+
+
+def validate_mesh_handoff(case, reconstructed_sources=()):
+    missing = [str(case / "constant/polyMesh" / name)
+               for name in _missing_mesh_files(case / "constant/polyMesh")]
+    pending = []
+    for path in case.rglob("polyMesh"):
+        relative = path.relative_to(case)
+        if ".foamagent" in relative.parts:
+            continue
+        if relative.as_posix() in reconstructed_sources:
+            continue
+        if relative.parts[0].startswith("processor"):
+            pending.append(str(path))
+        else:
+            try:
+                # Time-zero mesh components override constant too. A cellMap-only
+                # directory from refineMesh -overwrite is auxiliary output.
+                if (float(relative.parts[0]) != 0
+                        or len(_missing_mesh_files(path)) < len(_MESH_FILES)):
+                    pending.append(str(path))
+            except ValueError:
+                pass
+    if missing or pending:
+        return [{"file": "mesh_handoff", "error_content":
+                 f"Prepare final constant/polyMesh before solver planning. Missing files: {missing}; "
+                 f"unresolved time/parallel mesh outputs: {pending}. Use native overwrite or reconstruction operations; do not use the old mesh."}]
+    return []
+
+
+def _mesh_script_runner(state):
+    if state.get("requires_hpc"):
+        from .run_hpc import run_stage_hpc
+        def run(script, out, err, case, timeout, **kwargs):
+            result = run_stage_hpc(state, script, "mesh", timeout)
+            return result
+        return run
+    return run_command
+
+
+def _native_mesh_runners(state):
+    if not state.get("requires_hpc"):
+        return {}
+    def run(args, **kwargs):
+        case = Path(state["case_dir"])
+        root = case / ".foamagent/mesh-commands"
+        root.mkdir(parents=True, exist_ok=True)
+        folder = Path(tempfile.mkdtemp(prefix="command-", dir=root))
+        script = folder / "command.sh"
+        script.write_text("#!/bin/bash\nset -e\n" + shlex.join(args) + "\n")
+        from .run_hpc import run_stage_hpc
+        # Slurm monitoring includes queue time; use the configured stage deadline,
+        # not the backend's shorter local process timeout.
+        result = run_stage_hpc(state, str(script), "mesh", state["config"].max_time_limit)
+        out = Path(result["output"]).read_text(errors="replace") if Path(result["output"]).exists() else ""
+        err = Path(result["error"]).read_text(errors="replace") if Path(result["error"]).exists() else str(result)
+        if result.get("returncode"):
+            raise subprocess.CalledProcessError(result["returncode"], args, output=out, stderr=err)
+        return subprocess.CompletedProcess(args, 0, out, err)
+    return {"utility_runner": run, "python_runner": run}

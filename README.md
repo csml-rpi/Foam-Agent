@@ -56,6 +56,8 @@ python foambench_main.py --output ./output --prompt_path ./user_requirement.txt
 
 That's it. Foam-Agent will plan the case, generate all OpenFOAM files, run the simulation, and fix errors automatically.
 
+`--output` is used directly; `foambench_main.py` defaults to the repository's `output/` directory. For prompt workflows through the Python API or `src/main.py` without an output directory, each invocation creates a new `run_N` directory under `Config.run_directory` (default `runs/`). Numbering starts at `Config.run_times` (default 1) and skips existing names, preserving earlier runs even when overwrite is enabled.
+
 ### 4. Run an Existing Case
 
 Prompt, external-mesh/material and existing-case inputs share the same main graph:
@@ -177,13 +179,52 @@ The highest reported scores in this table use **Anthropic Claude Opus 4.6**; mod
 
 ## Advanced Usage
 
+### Mesh handoff and execution
+
+Preparation preserves mesh sources, including time-directory and partition
+meshes, until Meshing Planner has selected the operations to perform. The imported
+`original/` remains read-only. After successful mesh handoff, Local/HPC Runner
+clears prior solver outputs, nonzero time directories and partition directories
+before solver execution, preserving the final `constant/polyMesh`. This workflow
+does not preserve restart data for continuation runs.
+
+Meshing requires complete final mesh files in `constant/polyMesh`. For parallel
+reconstruction, the planner declares a final native reconstruction operation
+after the other mesh operations. The executor verifies the declared partition
+sources before removing the old serial mesh; reconstruction must then succeed
+and produce a complete new serial mesh. Those reconstructed partition sources
+may remain until solver cleanup. Other unresolved time/parallel meshes, including
+`0/polyMesh`, return to repair; ordinary initial fields in `0/` are preserved.
+A zero-time directory containing only auxiliary output such as `cellMap` is allowed.
+No latest-time mesh is selected automatically. Tool logs are
+archived per attempt under `.foamagent/mesh-logs/` so retries can execute again.
+
+For HPC requests, native mesh commands run through Slurm before solver planning.
+Only a completed attempt with its own successful exit result permits the next
+stage. Each mesh or solver job uses `Config.max_time_limit` as its total monitoring
+deadline, including time spent queued; local mesh-tool execution limits are unchanged.
+Resource extraction reads the current decomposition settings before each
+stage submission. Explicit submission rejections are repaired using the previous
+script and rejection message, consuming the same repair budget as Reviewer.
+An uncertain submission result stops the workflow rather than resubmitting.
+
+If monitoring expires or fails, the workflow requests cancellation and waits up
+to 60 seconds to confirm that the job has stopped. If this cannot be confirmed,
+it stops with `hpc_job_state_unconfirmed`, retaining the job ID and diagnostic
+paths, without further repairs or submissions. Slurm commands run in the agent's
+existing cluster environment with a shared filesystem; no SSH deployment is added.
+
+The first mesh-file generation precedes tutorial-case retrieval, although
+Allmesh command-help retrieval remains available. Complete imported cases also
+pass through planning and solver-script extraction.
+
 ### Custom Mesh Files
 
 Use `--custom_mesh_path` for an already generated Gmsh `.msh` file (ASCII 2.2), matching Foam-Agent's original custom-mesh input. Preparation copies the supplied file; the LLM selects the mesh operations from the requirement and available files. Existing case-internal `constant/polyMesh` remains supported through case import.
 
 The original `gmsh_mesh` backend still generates and runs Gmsh Python code. External `.geo` execution and independent `polyMesh`-directory upload are not included in this update. Fluent mesh input is deferred to a later SpaceClaim/Fluent integration.
 
-Checks and changes to a case's existing mesh follow the LLM plan. Mesh handoff passes actual boundary text and available evidence to Solver Planner without a separate regex patch summary. Missing boundary metadata does not fail mesh handoff; native tool errors still enter the existing repair flow. Mesh plans can create or modify files on the first pass, and ordered commands retain repetitions. Allmesh records native output and new or changed logs without assuming log filenames. Meshing Planner decides which startup dictionaries the selected tools require and declares file tasks; execution does not inject default dictionaries. Solver Planner adapts these files to the physical problem where needed.
+Checks and changes to a case's existing mesh follow the LLM plan. Mesh handoff passes actual boundary text and available evidence to Solver Planner. The absence of a parsed patch summary does not itself fail handoff; a missing required mesh file, including `boundary` or its compressed equivalent, does. Native tool errors enter the existing repair flow. Mesh plans can create or modify files on the first pass, and ordered commands retain repetitions. Allmesh records native output and new or changed logs without assuming log filenames. Meshing Planner decides which startup dictionaries the selected tools require and declares file tasks; execution does not inject default dictionaries. Solver Planner adapts these files to the physical problem where needed.
 
 For example:
 
@@ -374,7 +415,7 @@ The current Foundation corpus has Qwen 0.6B, Qwen 8B, and OpenAI small index dir
 
 The HPC node generates a Slurm script and invokes `sbatch` and `squeue` in the agent's environment. The case path must be accessible to the compute nodes; this code does not upload files or establish an SSH connection. The selected OpenFOAM environment must already be available when the job's runtime guard executes.
 
-Current monitoring treats an empty `squeue` response as `COMPLETED`, then checks case logs. It does not query `sacct` or validate a Slurm exit code. The wait defaults to 3600 seconds with 30-second polling; timeout returns the last observed state, which may enter the existing Reviewer/repair/resubmission loop even while the original job remains active. Job disappearance is therefore not independent confirmation of successful execution.
+An empty `squeue` response ends monitoring, but success also requires the current attempt's zero exit-code record and case-log checks. Monitoring does not query `sacct`. Monitoring failure or deadline expiry triggers cancellation and confirmation that the job has stopped; an unconfirmed stop terminates the workflow with `hpc_job_state_unconfirmed`. See [Mesh handoff and execution](#mesh-handoff-and-execution) for stage deadlines, submission repair and cancellation details.
 
 ### Building the Docker Image from Source
 

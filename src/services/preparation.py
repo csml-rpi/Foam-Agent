@@ -8,8 +8,7 @@ from logger import setup_logging
 from openfoam_target import ESI_V2006, FOUNDATION_V10, configured_openfoam_target
 from utils import load_agent_resources, load_case_files
 from .case_import import CaseImportError, import_case, build_case_context
-from .output_safety import prepare_output_directory
-from .plan import resolve_case_dir
+from .output_safety import prepare_output_directory, validate_output_path
 
 
 def prepare_inputs(state):
@@ -21,13 +20,7 @@ def prepare_inputs(state):
             if update.get("workflow_status") == "failed":
                 return update
         else:
-            requested = config.case_dir or resolve_case_dir(
-                "case", run_times=config.run_times, run_directory=config.run_directory,
-            )
-            case = prepare_output_directory(
-                requested, overwrite=config.overwrite_case_dir,
-                source_path=state.get("custom_mesh_path"),
-            )
+            case = _prepare_generated_case_dir(config, state.get("custom_mesh_path"))
             setup_logging(str(case))
             try:
                 llm, stats = load_agent_resources(config)
@@ -45,6 +38,10 @@ def prepare_inputs(state):
 
         current = {**state, **update}
         case = Path(current["case_dir"])
+        from router_func import llm_requires_hpc
+        update["requires_hpc"] = current.get("requires_hpc")
+        if update["requires_hpc"] is None:
+            update["requires_hpc"] = llm_requires_hpc(current)
         if state.get("custom_mesh_path"):
             source = Path(state["custom_mesh_path"]).expanduser().resolve()
             destination = case / "input" / source.name
@@ -60,6 +57,29 @@ def prepare_inputs(state):
             "workflow_status": "failed", "termination_reason": "preparation_failed",
             "error_logs": [{"file": "preparation", "error_content": str(exc)}],
         }
+
+
+def _prepare_generated_case_dir(config, source_path):
+    if config.case_dir:
+        return prepare_output_directory(
+            config.case_dir, overwrite=config.overwrite_case_dir, source_path=source_path,
+        )
+
+    run_number = max(1, config.run_times)
+    while True:
+        requested = Path(config.run_directory) / f"run_{run_number}"
+        if requested.exists() or requested.is_symlink():
+            run_number += 1
+            continue
+        case = validate_output_path(requested, source_path=source_path)
+        case.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            # Reserve this run before writing its ownership marker or inputs.
+            case.mkdir()
+        except FileExistsError:
+            run_number += 1
+            continue
+        return prepare_output_directory(case, overwrite=False, source_path=source_path)
 
 
 def prepare_imported_case(state: dict[str, Any]) -> dict[str, Any]:

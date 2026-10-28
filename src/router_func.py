@@ -107,6 +107,8 @@ def _route_runner(state: GraphState):
         return "local_runner"
 
 def route_after_runner(state: GraphState):
+    if state.get("termination_reason"):
+        return END
     if state.get("error_logs") and len(state["error_logs"]) > 0:
         return "reviewer"
 

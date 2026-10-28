@@ -3,6 +3,7 @@
 from pathlib import Path
 from utils import read_case_foamfiles, scan_case_directory, load_case_files, save_file
 from services.input_writer import initial_write, build_allrun, rewrite_files
+from services.case_paths import safe_case_relative_from_text
 from translation.esi_translator import convert_case_to_esi_if_needed
 from openfoam_target import database_path_for_config, generation_convention, uses_legacy_esi_translation
 
@@ -27,6 +28,7 @@ def input_writer_node(state):
         save_file(str(Path(state["case_dir"]) / "Allrun"), script)
         state.update(load_case_files(state))
     mode = state["input_writer_mode"]
+    created_allrun = False
     
     if state.get("case_origin") == "imported" and state.get("requires_input_writer") is False:
         out = {}
@@ -35,6 +37,11 @@ def input_writer_node(state):
     else:
         out = _initial_write_mode(state)
         if not out.get("error_logs"):
+            # Preserve explicit creates even after pending tasks are consumed.
+            created_allrun = any(
+                str(Path(t["folder_name"]) / t["file_name"]) == "Allrun"
+                for t in state["subtasks"]
+            )
             if state.get("pending_solver_subtasks"):
                 # Consume successful creates even if the following edits fail.
                 out.update(pending_solver_subtasks=[], subtasks=[], input_writer_mode="rewrite")
@@ -46,7 +53,11 @@ def input_writer_node(state):
         out["solver_allrun"] = None
     if (not (Path(state["case_dir"]) / "Allrun").is_file()
             or (state.get("case_origin") == "imported" and script == ""
-                and not any(t["file"] == "Allrun" for t in (state.get("rewrite_plan") or {}).get("target_files", [])))):
+                and not created_allrun
+                and not any(
+                    safe_case_relative_from_text(t["file"]).as_posix() == "Allrun"
+                    for t in (state.get("rewrite_plan") or {}).get("target_files", [])
+                ))):
         _build_solver_allrun({**state, **out})
     out.update(load_case_files({**state, **out}))
     return out
@@ -121,7 +132,10 @@ def _initial_write_mode(state):
     # Imported scripts have already been split by solver_planner.
     explicit_allrun = any(
         str(Path(t["folder_name"]) / t["file_name"]) == "Allrun" for t in state["subtasks"]
-    ) or any(t["file"] == "Allrun" for t in (state.get("rewrite_plan") or {}).get("target_files", []))
+    ) or any(
+        safe_case_relative_from_text(t["file"]).as_posix() == "Allrun"
+        for t in (state.get("rewrite_plan") or {}).get("target_files", [])
+    )
     if not state.get("solver_allrun") and not explicit_allrun:
         _build_solver_allrun({**state, **write_out})
 

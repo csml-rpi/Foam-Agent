@@ -163,6 +163,27 @@ def error_fingerprint(state: dict[str, Any]) -> str:
         name: digest for name, digest in files.items()
         if not _is_runtime_artifact(name)
     }
+    if "submit_job.slurm" in inputs:
+        # Keep real submission-script edits visible, but an otherwise identical
+        # script gets a fresh wrapper directory on every stage attempt.
+        case = Path(state["case_dir"]).resolve()
+        try:
+            script = (case / "submit_job.slurm").read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            pass
+        else:
+            for stage in ("mesh", "solver"):
+                jobs_root = case / ".foamagent" / (stage + "-jobs")
+                for job in state.get(stage + "_jobs") or []:
+                    if not job.get("script"):
+                        continue
+                    attempt = Path(job["script"]).parent
+                    if attempt.parent == jobs_root:
+                        script = script.replace(
+                            attempt.relative_to(case).as_posix(),
+                            f".foamagent/{stage}-jobs/<attempt>",
+                        )
+            inputs["submit_job.slurm"] = hashlib.sha256(script.encode("utf-8")).hexdigest()
     payload = {
         "errors": state.get("error_logs") or [],
         "inputs": inputs,

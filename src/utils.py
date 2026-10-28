@@ -881,10 +881,13 @@ class GraphState(TypedDict):
     case_dir: str
     case_name: str
     subtasks: List[dict]
+    mesh_jobs: Optional[List[dict]]
+    solver_jobs: Optional[List[dict]]
     solver_planned: bool
     replan_solver: bool
     pending_solver_subtasks: Optional[List[dict]]
     mesh_execution: Optional[dict]
+    final_reconstruction: Optional[dict]
     loop_count: int
     # Additional state fields that will be added during execution
     llm_service: Optional['LLMService']
