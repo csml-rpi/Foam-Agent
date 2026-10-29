@@ -20,6 +20,9 @@ from .run_hpc import HpcWorkflowStop
 
 
 _MESH_FILES = ("points", "faces", "owner", "neighbour", "boundary")
+_MESH_SOURCE_SUFFIXES = {
+    ".msh", ".stl", ".obj", ".ftr", ".nas", ".vtk", ".vtp", ".ply", ".off", ".geo", ".gz", ".emesh",
+}
 
 
 class FinalReconstruction(BaseModel):
@@ -191,10 +194,16 @@ def _run_mesh_commands(state, commands):
         )
     old, observations = _mesh_log_snapshot(case)
     # RunFunctions skips a utility when log.<application>[.<suffix>] exists.
-    # Other diagnostic filenames may also be user inputs: observe their changes
-    # without moving them out of the working case.
+    # Rotate only conventional case-root logs. Nested files and mesh sources
+    # can be utility inputs even when their names start with log.
+    sources = {(case / Path(source).expanduser()).resolve() for source in
+               (state.get("mesh_source"), state.get("custom_mesh_path")) if source}
     old = {name: signature for name, signature in old.items()
-           if Path(name).name.startswith("log.") or name in {"Allmesh.out", "Allmesh.err"}}
+           if name in {"Allmesh.out", "Allmesh.err"} or (
+               Path(name).parent == Path(".") and name.startswith("log.")
+               and Path(name).suffix.lower() not in _MESH_SOURCE_SUFFIXES
+               and (case / name).resolve() not in sources
+           )}
     if old:
         history = Path(tempfile.mkdtemp(prefix="attempt-", dir=_mesh_history(case)))
         for name in old:

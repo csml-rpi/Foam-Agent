@@ -51,7 +51,7 @@ def create_slurm_script(
         "1. Proper SLURM directives (#SBATCH) based on the cluster information provided"
         "2. Do not load openfoam"
         "3. Load libaraies for openfoam for run in parallel"
-        "4. Directory navigation and execution of the Allrun script"
+        f"4. Directory navigation and execution of the {execution_script} script"
         "5. Error handling and status reporting"
         "6. Any cluster-specific optimizations or requirements"
         "7. Use your understanding of the documentation of the cluster and figure out the syntax of their jobscript. "
@@ -76,12 +76,10 @@ def create_slurm_script(
         f"Memory: {cluster_info['memory']} GB per node\n"
         f"Case directory: {case_dir}\n"
         f""
-        f"Generate a complete SLURM script that will run the OpenFOAM simulation using the Allrun script."
+        f"Generate a complete SLURM script that will run the OpenFOAM simulation using the {execution_script} script."
     )
     
     llm_client = llm_service if llm_service is not None else global_llm_service
-    user_prompt = user_prompt.replace("Allrun", execution_script)
-    system_prompt = system_prompt.replace("Allrun", execution_script)
     response = llm_client.invoke(user_prompt, system_prompt)
     
     # Clean up the response to extract just the script content
@@ -136,7 +134,7 @@ def create_slurm_script_with_error_context(
         "1. Proper SLURM directives (#SBATCH) based on the cluster information provided"
         "2. Do not load OpenFOAM"
         "3. Load libaraies for openfoam for run in parallel"
-        "4. Directory navigation and execution of the Allrun script"
+        f"4. Directory navigation and execution of the {execution_script} script"
         "5. Error handling and status reporting"
         "6. Any cluster-specific optimizations or requirements"
         "7. Use your understanding of the documentation of the cluster and figure out the syntax of their jobscript. "
@@ -180,11 +178,9 @@ def create_slurm_script_with_error_context(
         user_prompt += f"Previous SLURM script that failed:\n```bash\n{previous_script_content}\n```\n"
         user_prompt += "Please analyze this error and the previous script to identify the issue and create a corrected version."
     
-    user_prompt += f"\nGenerate a complete SLURM script that will run the OpenFOAM simulation using the Allrun script. Return ONLY the complete SLURM script content. Do not include any explanations or markdown formatting."
+    user_prompt += f"\nGenerate a complete SLURM script that will run the OpenFOAM simulation using the {execution_script} script. Return ONLY the complete SLURM script content. Do not include any explanations or markdown formatting."
     
     llm_client = llm_service if llm_service is not None else global_llm_service
-    user_prompt = user_prompt.replace("Allrun", execution_script)
-    system_prompt = system_prompt.replace("Allrun", execution_script)
     response = llm_client.invoke(user_prompt, system_prompt)
     
     # Clean up the response to extract just the script content

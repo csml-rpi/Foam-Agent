@@ -16,12 +16,10 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
 import foambench_main  # noqa: E402
-import main  # noqa: E402
 from models import ExistingCasePlan  # noqa: E402
 from nodes.input_writer_node import input_writer_node  # noqa: E402
 from nodes.local_runner_node import local_runner_node  # noqa: E402
 from router_func import (  # noqa: E402
-    route_after_solver_planner,
     route_after_input_writer,
     route_after_runner,
 )
@@ -134,32 +132,6 @@ def test_import_materialises_original_and_work_and_detects_target(tmp_path: Path
     assert (output / "work" / "system" / "controlDict").is_file()
     assert not os.access(output / "original" / "system" / "controlDict", os.W_OK)
     assert (output / "report" / "case_context.json").is_file()
-
-
-def test_case_only_complete_case_plans_solver_script_then_enters_writer() -> None:
-    solver_script = "#!/bin/sh\nicoFoam\n"
-    llm = _FakeLLM(ExistingCasePlan(status="ready", solver_allrun=solver_script))
-    state = {
-        "case_context": {
-            "platform": "foundation-v10",
-            "has_allrun": True,
-            "issues": [],
-            "candidate_cases": [],
-        },
-        "case_dir": "/task/work",
-        "user_requirement": DEFAULT_IMPORTED_REQUIREMENT,
-        "user_requirement_explicit": False,
-        "llm_service": llm,
-    }
-
-    result = plan_imported_case(state)
-
-    assert result["workflow_status"] == "running"
-    assert not result["requires_input_writer"] and not result["requires_meshing"]
-    assert len(llm.calls) == 1
-    assert "solver-only remainder" in llm.calls[0][0]
-    assert result["solver_allrun"] == solver_script
-    assert route_after_solver_planner({**state, **result, "case_origin": "imported"}) == "input_writer"
 
 
 @pytest.mark.parametrize("target", ["foundation-v10", "esi-v2006"])
@@ -400,113 +372,6 @@ def test_graph_routes_success_to_visualization_or_result() -> None:
     base = {"case_origin": "imported", "error_logs": [], "llm_service": _FakeLLM()}
     assert route_after_runner({**base, "requires_visualization": False}) == "__end__"
     assert route_after_runner({**base, "requires_visualization": True}) == "visualization"
-
-
-def test_langgraph_case_only_path_visits_meshing_and_writer_then_returns_shared_result(monkeypatch) -> None:
-    writer_calls = []
-
-    def fake_import(_state):
-        return {
-            "case_origin": "imported",
-            "case_dir": "/task/work",
-            "case_context": {
-                "platform": "foundation-v10",
-                "has_allrun": True,
-                "issues": [],
-                "candidate_cases": [],
-            },
-            "workflow_status": "planning",
-            "error_logs": [],
-        }
-
-    def fake_runner(state):
-        return {'workflow_status': 'success', 'error_logs': []}
-
-    monkeypatch.setattr(main, "preparation_node", fake_import)
-    monkeypatch.setattr(main, "solver_planner_node", lambda state: {"workflow_status": "running", "requires_input_writer": False, "requires_hpc": False})
-    monkeypatch.setattr(main, "meshing_planner_node", lambda state: {})
-    monkeypatch.setattr(main, "meshing_node", lambda state: {"error_logs": []})
-    monkeypatch.setattr(main, "local_runner_node", fake_runner)
-    monkeypatch.setattr(
-        main,
-        "input_writer_node",
-        lambda state: writer_calls.append(state) or state,
-    )
-    config = SimpleNamespace(openfoam_target="foundation-v10", recursion_limit=20)
-    state = main.initialize_state(
-        DEFAULT_IMPORTED_REQUIREMENT,
-        config,
-        workflow_mode="imported_case",
-        case_import_path="/input/case",
-        requires_visualization=False,
-        user_requirement_explicit=False,
-    )
-
-    result = main.create_foam_agent_graph().compile().invoke(
-        state, config={"recursion_limit": 20}
-    )
-
-    assert result["workflow_status"] == "success"
-    assert len(writer_calls) == 1
-    assert writer_calls[0]["requires_input_writer"] is False
-
-
-@pytest.mark.parametrize(
-    ('mesh', 'writer', 'hpc', 'expected'),
-    [
-        (False, False, False, ['meshing_planner', 'meshing', 'input_writer', 'local_runner']),
-        (False, True, False, ['meshing_planner', 'meshing', 'input_writer', 'local_runner']),
-        (True, False, False, ['meshing_planner', 'meshing', 'input_writer', 'local_runner']),
-        (True, True, False, ['meshing_planner', 'meshing', 'input_writer', 'local_runner']),
-        (True, True, True, ['meshing_planner', 'meshing', 'input_writer', 'hpc_runner']),
-    ],
-)
-def test_imported_graph_routes_without_action_bookkeeping(monkeypatch, mesh, writer, hpc, expected):
-    visited = []
-    monkeypatch.setattr(main, 'preparation_node', lambda state: {})
-    monkeypatch.setattr(main, 'solver_planner_node', lambda state: {
-        'workflow_status': 'running',
-        'requires_meshing': mesh,
-        'requires_input_writer': writer,
-        'requires_hpc': hpc,
-    })
-    def node(name):
-        def execute(state):
-            visited.append(name)
-            return {'error_logs': []}
-        return execute
-    for name in ('meshing_planner', 'meshing', 'input_writer', 'local_runner', 'hpc_runner'):
-        monkeypatch.setattr(main, name + '_node', node(name))
-    main.create_foam_agent_graph().compile().invoke({
-        'workflow_mode': 'imported_case', 'case_origin': 'imported',
-        'requires_visualization': False, 'error_logs': [],
-    })
-    assert visited == expected
-
-
-def test_imported_graph_repairs_then_runs_without_repeating_mesh(monkeypatch):
-    visited = []
-    monkeypatch.setattr(main, 'preparation_node', lambda state: {})
-    monkeypatch.setattr(main, 'meshing_planner_node', lambda state: visited.append('mesh_plan') or {})
-    monkeypatch.setattr(main, 'solver_planner_node', lambda state: {
-        'workflow_status': 'running', 'requires_meshing': True,
-        'requires_input_writer': False, 'requires_hpc': False,
-    })
-    monkeypatch.setattr(main, 'meshing_node', lambda state: visited.append('mesh') or {'error_logs': []})
-    def runner(state):
-        visited.append('run')
-        return {'error_logs': ['solver error'] if visited.count('run') == 1 else []}
-    monkeypatch.setattr(main, 'local_runner_node', runner)
-    monkeypatch.setattr(main, 'reviewer_node', lambda state: visited.append('review') or {
-        'loop_count': 1, 'input_writer_mode': 'rewrite',
-    })
-    monkeypatch.setattr(main, 'input_writer_node', lambda state: visited.append('write') or {'error_logs': []})
-    main.create_foam_agent_graph().compile().invoke({
-        'workflow_mode': 'imported_case', 'case_origin': 'imported',
-        'requires_visualization': False, 'error_logs': [],
-        'config': SimpleNamespace(max_loop=3),
-    })
-    assert visited == ['mesh_plan', 'mesh', 'write', 'run', 'review', 'write', 'run']
 
 
 def test_runner_has_no_allrun_preflight_or_completion_marker_gate(

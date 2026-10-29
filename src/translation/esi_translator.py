@@ -15,7 +15,7 @@ _DEFAULT_RULES_PATH = (
     Path(__file__).resolve().parent / "esi_translation_rules.json"
 )
 
-_SKIP_FILENAMES = {".", "..", "Allrun", "Allclean"}
+_SKIP_FILENAMES = {".", "..", "Allrun", "Allmesh", "Allclean"}
 _SKIP_SUFFIXES = ("~", ".bak", ".orig", ".sh", ".out", ".err", ".log")
 _BINARY_EXTENSIONS = {
     ".stl", ".gz", ".zip", ".foam", ".vtk", ".obj", ".ans", ".dat",
