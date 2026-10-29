@@ -15,6 +15,11 @@ import pytest
 from test_meshing_workflow import ROOT, _poly_mesh, _put, modules
 
 
+def _tool_fn(tool):
+    """Access the function when FastMCP wraps a registered tool."""
+    return getattr(tool, "fn", tool)
+
+
 def _state(case, **updates):
     from config import Config
     return {"case_dir": str(case), "config": Config(openfoam_target="foundation-v10", max_loop=3),
@@ -424,11 +429,11 @@ def test_mcp_plan_writer_preserves_root_paths_and_task_metadata(modules, tmp_pat
 
     monkeypatch.setattr(server, "initial_write", generate)
     context = SimpleNamespace(info=log, error=log)
-    response = asyncio.run(server.plan(server.PlanRequest(user_requirement="Run the case"), context))
+    response = asyncio.run(_tool_fn(server.plan)(server.PlanRequest(user_requirement="Run the case"), context))
     assert response.subtasks[0] == {"file": "Allrun", "folder": "", "stage": "solver", "action": "create", "changes": "Use icoFoam"}
     # Accept both the plan's legacy keys and the service's native path keys.
     for subtasks in (response.subtasks, tasks):
-        asyncio.run(server.input_writer(server.GenerateFilesRequest(
+        asyncio.run(_tool_fn(server.input_writer)(server.GenerateFilesRequest(
             **metadata, user_requirement="Run the case", subtasks=subtasks, overwrite_output=True,
         ), context))
     assert captured == [tasks, tasks]
@@ -486,7 +491,7 @@ def test_writer_preserves_explicit_allrun_and_automatic_fallback(
 
         context = SimpleNamespace(info=log, error=log, report_progress=report_progress)
         # Exercise the public MCP keys and the actual generation service.
-        response = asyncio.run(server.input_writer(server.GenerateFilesRequest(
+        response = asyncio.run(_tool_fn(server.input_writer)(server.GenerateFilesRequest(
             case_name="case", case_solver="icoFoam", case_domain="incompressible",
             case_category="laminar", user_requirement="Run the case",
             subtasks=[{"file": t["file_name"], "folder": t["folder_name"],
