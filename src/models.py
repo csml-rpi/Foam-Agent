@@ -1,123 +1,60 @@
-from typing import List, Optional, Dict, Any
+from dataclasses import asdict, dataclass, field
+from typing import Any, List, Literal, Optional
 from pydantic import BaseModel, Field
 
-
-class CreateCaseIn(BaseModel):
-    user_prompt: str
-    output_dir: Optional[str] = None
-
-
-class CreateCaseOut(BaseModel):
-    case_id: str
-    case_dir: str
-
-
-# NOTE: These models are deprecated and replaced by FastMCP server models in src/mcp/fastmcp_server.py
-# Use PlanRequest/PlanResponse and GenerateFilesRequest/GenerateFilesResponse instead
-class PlanIn(BaseModel):
-    """Deprecated: Use PlanRequest in fastmcp_server.py instead."""
-    case_id: str  # Deprecated: case_id is no longer required, use user_requirement only
-
-
-class Subtask(BaseModel):
-    file: str
-    folder: str
-
-
-class PlanOut(BaseModel):
-    """Deprecated: Use PlanResponse in fastmcp_server.py instead."""
-    plan: List[Subtask]
-    case_info: Dict  # Deprecated: case_info is now expanded to case_name, case_solver, case_domain, case_category
-
-
-class GenerateFileIn(BaseModel):
-    """Deprecated: Use GenerateFilesRequest in fastmcp_server.py instead."""
-    case_id: str  # Deprecated: use case_name instead
-    file: str
-    folder: str
-    write: bool = True
-    overwrite: bool = True
-
-
-class GenerateFileOut(BaseModel):
-    content: str
-    written_path: Optional[str] = None
-
-
-class MeshIn(BaseModel):
-    case_id: str
-    mesh_config: Dict
-
-
-class MeshOut(BaseModel):
-    job_id: Optional[str] = None
-    status: str
-
-
-class HPCScriptIn(BaseModel):
-    case_id: str
-    hpc_config: Dict
-
-
-class HPCScriptOut(BaseModel):
-    script_content: str
-    script_path: str
-
-
-class RunIn(BaseModel):
-    case_id: str
-    environment: str  # "local" | "hpc"
-    extra: Optional[Dict] = None
+from openfoam_target import ESI_V2006
 
 
 class RunOut(BaseModel):
     job_id: Optional[str]
-    status: str  # "submitted" | "completed" | "failed"
-
-
-class JobStatusIn(BaseModel):
-    job_id: str
-
-
-class JobStatusOut(BaseModel):
     status: str
-    details: Optional[Dict] = None
 
 
-class LogsIn(BaseModel):
-    case_id: str
-    job_id: Optional[str] = None
+class CaseImportError(ValueError):
+    """Raised when an existing case cannot be materialised for the workflow."""
 
 
-class LogsOut(BaseModel):
-    logs: Dict[str, str]
+@dataclass
+class CaseManifest:
+    """Materialised existing case and the context discovered during import."""
+
+    source: str
+    case_root: str
+    output_root: str
+    platform: str
+    version: Optional[str]
+    application: Optional[str]
+    allrun_provided: bool
+    mesh_state: str
+    candidate_cases: list[str] = field(default_factory=list)
+    issues: list[str] = field(default_factory=list)
+    target_mismatch: bool = False
+
+    @property
+    def supported(self) -> bool:
+        return self.platform in {
+            "foundation-v10",
+            ESI_V2006,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        result = asdict(self)
+        result["supported"] = self.supported
+        return result
 
 
-class ApplyFixIn(BaseModel):
-    case_id: str
-    foamfiles: Optional[Any] = None  # FoamPydantic object
-    error_logs: List[str] = []
-    review_analysis: str = ""
-    user_requirement: str = ""
-    dir_structure: Optional[Dict] = None
+class PlannedFileChange(BaseModel):
+    """One file-level change requested by the planner or reviewer."""
+
+    file: str = Field(description="Relative file path, e.g. system/fvSchemes or 0/U")
+    changes: str = Field(description="Semicolon-separated concrete changes for this file")
 
 
-class ApplyFixOut(BaseModel):
-    status: str
-    written: List[str]
-    updated_dir_structure: Optional[Dict] = None
-    updated_foamfiles: Optional[Any] = None  # FoamPydantic object
-    cleared_error_logs: List[str] = []
+class ExistingCasePlan(BaseModel):
+    """Decisions for the existing-case graph routes."""
 
-
-class VisualizationIn(BaseModel):
-    case_id: str
-    quantity: str
-    extra: Optional[Dict] = None
-
-
-class VisualizationOut(BaseModel):
-    job_id: Optional[str]
-    artifacts: List[str]
-
-
+    status: Literal["ready", "failed"] = "ready"
+    requires_meshing: bool = False
+    requires_input_writer: bool = False
+    target_files: List[PlannedFileChange] = Field(default_factory=list)
+    reason: str = ""

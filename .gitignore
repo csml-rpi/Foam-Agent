@@ -5,6 +5,11 @@ CLAUDE.md
 runs/
 output/
 benchmark/
+
+# Local ESI translation dev artifacts (extracted v10 cases, not for PR)
+*_v10_ready/
+tests/fixtures/v10/
+.venv/
 database/foamgpt/data
 
 # Byte-compiled / optimized / DLL files

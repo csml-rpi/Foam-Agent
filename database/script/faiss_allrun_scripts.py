@@ -29,8 +29,8 @@ def main():
     parser.add_argument(
         "--database_path",
         type=str,
-        default=Path(__file__).resolve().parent.parent,
-        help="Path to the database directory (default: '../../')",
+        default=Path(__file__).resolve().parent.parent / "foundation-v10",
+        help="Path to one target corpus (default: '../foundation-v10')",
     )
         
     parser.add_argument(

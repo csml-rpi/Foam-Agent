@@ -1,0 +1,70 @@
+{
+  "file_maps": {
+    "constant/momentumTransport": "constant/turbulenceProperties",
+    "constant/physicalProperties": "constant/thermophysicalProperties"
+  },
+  "keyword_swaps": [
+    {
+      "pattern": "\\bmodel\\s+kEpsilon;",
+      "replacement": "RASModel kEpsilon;",
+      "scope": ["turbulenceProperties"]
+    },
+    {
+      "pattern": "\\bmodel\\s+kOmegaSST;",
+      "replacement": "RASModel kOmegaSST;",
+      "scope": ["turbulenceProperties"]
+    },
+    {
+      "pattern": "\\bmodel\\s+RNGkEpsilon;",
+      "replacement": "RASModel RNGkEpsilon;",
+      "scope": ["turbulenceProperties"]
+    },
+    {
+      "pattern": "\\bmodel\\s+realizableKE;",
+      "replacement": "RASModel realizableKE;",
+      "scope": ["turbulenceProperties"]
+    },
+    {
+      "pattern": "\\bapplication\\s+buoyantFoam;",
+      "replacement": "application     buoyantPimpleFoam;"
+    },
+    {
+      "pattern": "\\bhePsiThermo;",
+      "replacement": "heRhoThermo;"
+    },
+    {
+      "pattern": "\\bviscosityModel\\b",
+      "replacement": "transportModel"
+    }
+  ],
+  "blacklisted_solvers": [
+    "adjointShapeOptimisationFoam",
+    "boundaryFoam"
+  ],
+  "transient_solvers": [
+    "icoFoam",
+    "pisoFoam",
+    "pimpleFoam",
+    "rhoPimpleFoam",
+    "rhoCentralFoam",
+    "interFoam",
+    "multiphaseInterFoam"
+  ],
+  "incompressible_transient_solvers": [
+    "icoFoam",
+    "pisoFoam"
+  ],
+  "solvers_using_transport_properties": [
+    "icoFoam",
+    "pisoFoam",
+    "simpleFoam",
+    "pimpleFoam"
+  ],
+  "chemkin_markers": [
+    "Chemkin",
+    "chemkin",
+    "foam:chemkin"
+  ],
+  "pfinal_block": "\n\n    pFinal\n    {\n        $p;\n        relTol          0;\n    }",
+  "pref_injection": "\n    pRefCell        0;\n    pRefValue       0;"
+}

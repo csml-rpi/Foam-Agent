@@ -1,14 +1,19 @@
 import os
 import re
-from typing import List, Any
-from models import RunIn, RunOut
-from utils import remove_files, remove_file, remove_numeric_folders, run_command, check_foam_errors
+import shutil
+from pathlib import Path
+from typing import Any, List
+
+from utils import check_foam_errors, remove_numeric_folders, run_command
+
 
 def run_allrun_and_collect_errors(
     case_dir: str,
     timeout: int = 3600,
-    max_retries: int = 1
-) -> List[str]:
+    max_retries: int = 1,
+    *,
+    openfoam_target: str = "",
+) -> List[Any]:
     """
     Execute the Allrun script and collect any error logs from the simulation.
     
@@ -19,16 +24,15 @@ def run_allrun_and_collect_errors(
     Args:
         case_dir (str): Directory path containing the OpenFOAM case and Allrun script
         timeout (int, optional): Maximum execution time in seconds. Defaults to 3600.
-        max_retries (int, optional): Maximum number of retry attempts. Defaults to 3.
+        max_retries (int, optional): Maximum number of retry attempts. Defaults to 1.
+
+        openfoam_target: Optional native runtime target.
     
     Returns:
-        List[str]: List of error messages found in the simulation logs.
+        List[Any]: Structured execution errors and errors found in simulation logs.
                  Empty list indicates successful execution with no errors.
     
-    Raises:
-        FileNotFoundError: If Allrun script does not exist in case_dir
-        RuntimeError: If Allrun script execution fails repeatedly
-        TimeoutError: If execution exceeds timeout limit
+    Execution failures, missing Allrun, and timeouts are returned as errors.
     
     Example:
         >>> errors = run_allrun_and_collect_errors(
@@ -42,79 +46,128 @@ def run_allrun_and_collect_errors(
         ...     print(f"Found {len(errors)} errors")
     """
     allrun_file_path = os.path.join(case_dir, "Allrun")
-    if not os.path.exists(allrun_file_path):
-        return [f"Allrun script not found at {allrun_file_path}"]
+    if not os.path.isfile(allrun_file_path):
+        return [
+            {
+                "file": "Allrun",
+                "error_content": f"Allrun script not found at {allrun_file_path}",
+            }
+        ]
     
     out_file = os.path.join(case_dir, "Allrun.out")
     err_file = os.path.join(case_dir, "Allrun.err")
+    _cleanup_run_artifacts(case_dir)
 
-    # Cleanup
-    remove_files(case_dir, prefix="log")
-    remove_file(err_file)
-    remove_file(out_file)
-    remove_numeric_folders(case_dir)
-
-    last_error_logs = []
-
-    # Run with retries
+    last_error_logs: List[Any] = []
     for attempt in range(1, max_retries + 1):
         print(f"Running Allrun (attempt {attempt}/{max_retries})")
-        run_command(allrun_file_path, out_file, err_file, case_dir, timeout)
+        command_kwargs = (
+            {"openfoam_target": openfoam_target}
+            if openfoam_target
+            else {}
+        )
+        command_result = run_command(
+            allrun_file_path,
+            out_file,
+            err_file,
+            case_dir,
+            timeout,
+            **command_kwargs,
+        )
 
-        # Inspect
-        error_logs = check_foam_errors(case_dir)
-        if len(error_logs) == 0:
+        error_logs: List[Any] = []
+        timed_out = bool(_result_field(command_result, "timed_out", False))
+        returncode = _result_field(command_result, "returncode", 0)
+        if timed_out:
+            output = _execution_output(case_dir)
+            error_logs.append(
+                {
+                    "file": "Allrun",
+                    "error_content": f"Allrun exceeded the {timeout} second execution timeout."
+                    + (f"\n{output}" if output else ""),
+                }
+            )
+        elif returncode not in (None, 0):
+            output = _execution_output(case_dir)
+            error_logs.append(
+                {
+                    "file": "Allrun",
+                    "error_content": f"Allrun exited with non-zero return code {returncode}."
+                    + (f"\n{output}" if output else ""),
+                }
+            )
+
+        error_logs.extend(check_foam_errors(case_dir))
+        error_logs = _deduplicate_errors(error_logs)
+        if not error_logs:
             return []
 
         last_error_logs = error_logs
         if attempt < max_retries:
             print("Allrun reported errors; retrying after cleanup...")
-            remove_files(case_dir, prefix="log")
-            remove_file(err_file)
-            remove_file(out_file)
-            remove_numeric_folders(case_dir)
+            _cleanup_run_artifacts(case_dir)
 
     return last_error_logs
 
 
-def run_simulation_local(
-    case_id: str,
-    case_dir: str,
-    timeout: int = 3600,
-    max_retries: int = 1
-) -> RunOut:
-    """
-    Run OpenFOAM simulation locally and return execution status.
-    
-    This function executes the Allrun script in the specified case directory
-    and returns the execution status along with any job information.
-    For local execution, job_id is always None.
-    
-    Args:
-        case_id (str): Unique identifier for the case
-        case_dir (str): Directory path containing the OpenFOAM case
-        timeout (int, optional): Maximum execution time in seconds. Defaults to 3600.
-        max_retries (int, optional): Maximum number of retry attempts. Defaults to 3.
-    
-    Returns:
-        RunOut: Contains:
-            - job_id (None): Always None for local execution
-            - status (str): Execution status ("completed" or "failed")
-    
-    Raises:
-        FileNotFoundError: If case directory or Allrun script does not exist
-        RuntimeError: If simulation execution fails
-    
-    Example:
-        >>> result = run_simulation_local(
-        ...     case_id="test_case",
-        ...     case_dir="/path/to/case",
-        ...     timeout=1800
-        ... )
-        >>> print(f"Simulation status: {result.status}")
-    """
-    errors = run_allrun_and_collect_errors(case_dir, timeout, max_retries)
-    status = "completed" if len(errors) == 0 else "failed"
-    return RunOut(job_id=None, status=status)
+def _result_field(result: Any, name: str, default: Any = None) -> Any:
+    """Read a run result while remaining compatible with older monkeypatches."""
+    if isinstance(result, dict):
+        return result.get(name, default)
+    return getattr(result, name, default)
 
 
+def _deduplicate_errors(errors: List[Any]) -> List[Any]:
+    deduplicated: List[Any] = []
+    seen: set[Any] = set()
+    for error in errors:
+        if isinstance(error, dict):
+            key = (error.get("file"), error.get("error_content"))
+        else:
+            key = str(error)
+        if key not in seen:
+            seen.add(key)
+            deduplicated.append(error)
+    return deduplicated
+
+
+def _cleanup_run_artifacts(case_dir: str) -> None:
+    """Remove disposable outputs before retrying a newly generated case."""
+    root = Path(case_dir)
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if entry.is_symlink():
+                if entry.name.startswith("log") or entry.name in {"Allrun.out", "Allrun.err"}:
+                    entry.unlink()
+                continue
+            if entry.is_file() and (
+                entry.name.startswith("log")
+                or entry.name in {"Allrun.out", "Allrun.err"}
+            ):
+                entry.unlink()
+            elif entry.is_dir() and (
+                re.fullmatch(r"processor\d+", entry.name)
+                or entry.name in {"postProcessing", "VTK"}
+            ):
+                shutil.rmtree(entry)
+        except OSError as exc:
+            raise RuntimeError(f"Unable to clean prior run artifact {entry}: {exc}") from exc
+    remove_numeric_folders(case_dir)
+
+
+def _execution_output(case_dir: str) -> str:
+    """Return recent process output as diagnostic context for the Reviewer."""
+    excerpts: List[str] = []
+    for name in ("Allrun.err", "Allrun.out"):
+        path = Path(case_dir) / name
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if content.strip():
+            excerpts.append(f"[{name}]\n" + "\n".join(content.splitlines()[-200:]))
+    return "\n\n".join(excerpts)

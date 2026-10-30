@@ -1,76 +1,88 @@
 # reviewer_node.py
-import os
-import glob
-import re
-import shutil
-from services.review import review_error_logs
+from services.best_snapshot import save_best_snapshot
+from services.review import review_error_logs, generate_rewrite_plan, error_fingerprint
 from logger import log_review
-
-
-def _compute_progress_score(case_dir: str, error_logs: list) -> float:
-    """Highest timestep reached across log.* files; fall back to -len(error_logs)."""
-    best_t = None
-    for log_path in glob.glob(os.path.join(case_dir, "log.*")):
-        try:
-            with open(log_path, errors="ignore") as f:
-                for line in f:
-                    m = re.match(r"^Time = ([\d.eE+\-]+)", line)
-                    if m:
-                        t = float(m.group(1))
-                        if best_t is None or t > best_t:
-                            best_t = t
-        except Exception:
-            pass
-    return float(best_t) if best_t is not None else -len(error_logs)
+from openfoam_target import generation_convention
 
 
 def reviewer_node(state):
-    """Reviewer node: single-call review (FA 1.1.0 style) + best-state snapshot."""
+    """
+    Reviewer node: Reviews the error logs and provides analysis and suggestions
+    for fixing the errors. This node only focuses on analysis, not file modification.
+    """
     print("<reviewer>")
-    if len(state["error_logs"]) == 0:
+    if not state.get("error_logs"):
         print("No error to review.")
         print("</reviewer>")
         return state
 
+    # Log error logs to review.log
     log_review(str(state["error_logs"]), "error_logs")
 
-    case_dir = state["case_dir"]
-    error_logs = state.get("error_logs", [])
-    loop_count = state.get("loop_count", 0)
+    snapshot_updates = save_best_snapshot(state)
+    fingerprint = error_fingerprint(state)
+    fingerprints = list(state.get("error_fingerprints") or [])
+    repeated = bool(fingerprints and fingerprint == fingerprints[-1])
+    fingerprints.append(fingerprint)
+    if repeated:
+        print("Repair made no progress: errors and case inputs are unchanged.")
+        print("</reviewer>")
+        return {
+            **snapshot_updates,
+            "error_fingerprints": fingerprints,
+            "workflow_status": "failed",
+            "termination_reason": "repair_made_no_progress",
+        }
+
+    # Stateless review via service
     history_text = state.get("history_text") or []
-
-    # Best-state snapshot before this loop's rewrite can regress it
-    snapshot_updates = {}
-    score = _compute_progress_score(case_dir, error_logs)
-    best_score = state.get("best_progress_score")
-    if best_score is None:
-        best_score = float("-inf")
-    if score > best_score:
-        snap = case_dir.rstrip("/") + "_best"
-        if os.path.exists(snap):
-            shutil.rmtree(snap)
-        shutil.copytree(case_dir, snap)
-        print(f"<snapshot>progress={score:.4g} > {best_score:.4g}, saved to {snap}</snapshot>")
-        snapshot_updates = {"best_case_snapshot_dir": snap, "best_progress_score": score}
-
     review_content, updated_history = review_error_logs(
-        tutorial_reference=state.get("tutorial_reference", ""),
-        foamfiles=state.get("foamfiles"),
-        error_logs=error_logs,
-        user_requirement=state.get("user_requirement", ""),
-        similar_case_advice=state.get("similar_case_advice"),
+        tutorial_reference=state.get('tutorial_reference') or '',
+        foamfiles=state.get('foamfiles'),
+        error_logs=state.get('error_logs'),
+        user_requirement=state.get('user_requirement', ''),
+        similar_case_advice=state.get('similar_case_advice'),
         history_text=history_text,
-        loop_count=loop_count,
+        loop_count=state.get("loop_count", 0),
+        llm_service=state.get("llm_service"),
+        openfoam_target=generation_convention(state["config"]),
     )
 
     log_review(review_content, "review_analysis")
 
+    if state.get("repairing_mesh"):
+        review_content = (
+            "Mesh preprocessing failed. After any file edits, the workflow will retry "
+            "meshing with this feedback before running the solver. "
+            "Return an empty target_files list if only mesh regeneration is needed.\n"
+            + review_content
+        )
+
+    rewrite_plan = None
+    if state.get("case_origin") == "imported" or state.get("repairing_mesh"):
+        rewrite_plan = generate_rewrite_plan(
+            foamfiles=state.get('foamfiles'),
+            error_logs=state.get('error_logs', []),
+            review_analysis=review_content,
+            llm_service=state.get("llm_service"),
+            openfoam_target=generation_convention(state["config"]),
+            user_requirement=state.get('user_requirement', ''),
+        )
+        log_review(str(rewrite_plan), "rewrite_plan")
+
     print("</reviewer>")
 
-    return {
+    next_loop_count = state.get("loop_count", 0) + 1
+    result = {
         **snapshot_updates,
+        "error_fingerprints": fingerprints,
         "history_text": updated_history,
         "review_analysis": review_content,
-        "loop_count": loop_count + 1,
+        "rewrite_plan": rewrite_plan,
+        "loop_count": next_loop_count,
         "input_writer_mode": "rewrite",
     }
+    if next_loop_count >= state["config"].max_loop:
+        result["termination_reason"] = "max_review_loop_reached"
+        result["workflow_status"] = "failed"
+    return result

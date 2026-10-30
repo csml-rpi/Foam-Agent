@@ -1,6 +1,11 @@
 #!/bin/bash
 set -e
 
+if [ "${FOAMAGENT_OPENFOAM_TARGET:-}" = "esi-v2006" ]; then
+    echo "ERROR: this image contains Foundation OpenFOAM v10. Build/run foamagent:esi-v2006 instead." >&2
+    exit 64
+fi
+
 # Source OpenFOAM environment in a controlled way: allow non-zero RC, then validate
 set +e
 source /opt/openfoam10/etc/bashrc
@@ -12,6 +17,10 @@ if [ -z "$WM_PROJECT_DIR" ] || ! command -v blockMesh >/dev/null 2>&1; then
     echo "ERROR: OpenFOAM environment failed to load (rc=$openfoam_rc)." >&2
     echo "Diag: WM_PROJECT_DIR='${WM_PROJECT_DIR:-unset}', blockMesh=$(command -v blockMesh || echo 'NOT-IN-PATH')" >&2
     exit 1
+fi
+if [ "${WM_PROJECT_VERSION:-}" != "10" ]; then
+    echo "ERROR: expected Foundation OpenFOAM v10, found ${WM_PROJECT_VERSION:-unset}." >&2
+    exit 64
 fi
 
 # Initialize conda

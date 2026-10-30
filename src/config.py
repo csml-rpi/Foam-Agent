@@ -3,16 +3,18 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from openfoam_target import normalise_openfoam_target
+
 
 @dataclass
 class Config:
     max_loop: int = 25
-    batchsize: int = 10
     searchdocs: int = 10 # max(10, searchdocs)
     run_times: int = 1   # current run number (for directory naming)
     database_path: str = Path(__file__).resolve().parent.parent / "database"
     run_directory: str = Path(__file__).resolve().parent.parent / "runs"
     case_dir: str = ""
+    overwrite_case_dir: bool = False
     max_time_limit: int = 3600  # Max time limit after which the openfoam run will be terminated, in seconds
     recursion_limit: int = 100  # LangGraph recursion limit
     # Input writer generation mode:
@@ -31,7 +33,7 @@ class Config:
     # - "ollama": local models
     # - "bedrock": AWS Bedrock
     # - "anthropic": Anthropic Claude API (requires ANTHROPIC_API_KEY)
-    model_provider: str = "openai-codex"  # [openai, openai-codex, ollama, bedrock, anthropic]
+    model_provider: str = "openai-codex"  # [openai, openai-codex, ollama, bedrock, anthropic, deepseek]
     # model_version examples:
     # - OpenAI: "gpt-5-mini"
     # - OpenAI Codex subscription: "gpt-5.3-codex" (or whichever Codex model you have access to)
@@ -40,7 +42,11 @@ class Config:
     # - Anthropic: claude-3-5-sonnet-latest
     model_version: str = "gpt-5.3-codex"
     temperature: float = 1
-
+    openfoam_fork: str = "foundation"  # Default to Foundation v10
+    # An explicit target is additive.  Leaving it empty keeps the existing
+    # Foundation/generic-ESI routing exactly as it was before v2006 support.
+    openfoam_target: str = ""
+    
     # Embedding Configuration
     embedding_provider: str = "huggingface"  # [openai, huggingface, ollama]
     embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"  # e.g. "text-embedding-3-small", "text-embedding-3-large", "Qwen/Qwen3-Embedding-0.6B", "Qwen/Qwen3-Embedding-8B"
@@ -65,7 +71,7 @@ class Config:
 
         provider_env = _env_nonempty(provider_key)
         if provider_env is not None:
-            allowed = {"openai", "openai-codex", "ollama", "bedrock", "anthropic"}
+            allowed = {"openai", "openai-codex", "ollama", "bedrock", "anthropic", "deepseek"}
             if provider_env in allowed:
                 self.model_provider = provider_env
                 print(f"<config>model_provider={self.model_provider} (env:{provider_key})</config>")
@@ -106,3 +112,38 @@ class Config:
             print(f"<config>embedding_model={self.embedding_model} (env:{emb_model_key})</config>")
         else:
             print(f"<config>embedding_model={self.embedding_model} (default)</config>")
+
+        # OpenFOAM Fork Override
+        fork_key = "FOAMAGENT_OPENFOAM_FORK"
+        fork_env = _env_nonempty(fork_key)
+        if fork_env is not None:
+            allowed_forks = {"foundation", "esi"}
+            if fork_env.lower() in allowed_forks:
+                self.openfoam_fork = fork_env.lower()
+                print(f"<config>openfoam_fork={self.openfoam_fork} (env:{fork_key})</config>")
+            else:
+                self.openfoam_fork = "foundation"  # Safe fallback assignment
+                print(f"<config>openfoam_fork={self.openfoam_fork} (default; invalid env:{fork_key}={fork_env!r})</config>")
+        else:
+            print(f"<config>openfoam_fork={self.openfoam_fork} (default)</config>")
+
+        # Explicit version target.  This is intentionally separate from
+        # FOAMAGENT_OPENFOAM_FORK so old ``esi`` configurations retain their
+        # post-generation translation behaviour.
+        target_key = "FOAMAGENT_OPENFOAM_TARGET"
+        target_env = _env_nonempty(target_key)
+        if target_env is not None:
+            # Unlike the historical fork switch, this is an explicit native
+            # platform contract.  Silently falling back to Foundation after a
+            # spelling error could run a v2006 case against the wrong solver.
+            self.openfoam_target = normalise_openfoam_target(target_env)
+            print(
+                f"<config>openfoam_target={self.openfoam_target} "
+                f"(env:{target_key})</config>"
+            )
+        else:
+            # Validate programmatic construction too, while preserving the
+            # historical empty value as the legacy path.
+            self.openfoam_target = normalise_openfoam_target(self.openfoam_target)
+            label = self.openfoam_target or "legacy"
+            print(f"<config>openfoam_target={label} (default)</config>")

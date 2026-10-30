@@ -1,27 +1,9 @@
-# input_writer_node.py
-import os
-from utils import save_file, parse_context, retrieve_faiss, FoamPydantic, FoamfilePydantic
+"""Thin LangGraph adapter for OpenFOAM input generation and rewriting."""
+
+from utils import read_case_foamfiles, scan_case_directory
 from services.input_writer import initial_write, build_allrun, rewrite_files
-import re
-from typing import List
-from pydantic import BaseModel, Field
-
-
-
-
-def parse_allrun(text: str) -> str:
-    match = re.search(r'```(.*?)```', text, re.DOTALL)
-    
-    return match.group(1).strip() 
-
-def retrieve_commands(command_path) -> str:
-    with open(command_path, 'r') as file:
-        commands = file.readlines()
-    
-    return f"[{', '.join([command.strip() for command in commands])}]"
-    
-class CommandsPydantic(BaseModel):
-    commands: List[str] = Field(description="List of commands")
+from translation.esi_translator import convert_case_to_esi_if_needed
+from openfoam_target import database_path_for_config, generation_convention, uses_legacy_esi_translation
 
 def input_writer_node(state):
     """
@@ -45,17 +27,29 @@ def _rewrite_mode(state):
         print("No review analysis available for rewrite mode.")
         print("</input_writer>")
         return state
-
-    return rewrite_files(
+    out = rewrite_files(
+        loop_count=state.get("loop_count", 0),
         case_dir=state["case_dir"],
         error_logs=state.get("error_logs", []),
         review_analysis=state.get("review_analysis", ""),
-        rewrite_plan=None,
+        rewrite_plan=state.get("rewrite_plan"),
         user_requirement=state.get("user_requirement", ""),
         foamfiles=state.get("foamfiles"),
         dir_structure=state.get("dir_structure", {}),
-        loop_count=state.get("loop_count", 0),
+        openfoam_fork=generation_convention(state["config"]),
+        case_solver=state.get("case_solver", ""),
+        llm_service=state.get("llm_service"),
     )
+    print("</input_writer>")
+    
+    if uses_legacy_esi_translation(state["config"]):
+        convert_case_to_esi_if_needed(state["case_dir"], state["config"])
+    
+    # Rescan the directory and foam files to reflect any translations
+    out["dir_structure"] = scan_case_directory(state["case_dir"])
+    out["foamfiles"] = read_case_foamfiles(state["case_dir"], out["dir_structure"])
+
+    return out
 
 def _initial_write_mode(state):
     """
@@ -69,10 +63,13 @@ def _initial_write_mode(state):
         subtasks=state["subtasks"],
         user_requirement=state["user_requirement"],
         tutorial_reference=state["tutorial_reference"],
-        case_solver=state['case_stats']['case_solver'],
+        case_solver=state["case_solver"],
+        openfoam_fork=generation_convention(config),
         generation_mode=getattr(config, "input_writer_generation_mode", "sequential_dependency"),
         similar_case_advice=state.get("similar_case_advice"),
         reuse_generated_dir=getattr(config, "reuse_generated_dir", ""),
+        llm_service=state.get("llm_service"),
+        config=config,
     )
 
     dir_structure = write_out["dir_structure"]
@@ -81,25 +78,36 @@ def _initial_write_mode(state):
     # Build Allrun via service
     mesh_type = state.get("mesh_type")
     mesh_commands = state.get("mesh_commands") or []
-    advice = state.get("similar_case_advice")
-    advice_d = advice.model_dump() if hasattr(advice, "model_dump") else (advice if isinstance(advice, dict) else {})
-    pre_solver_steps = advice_d.get("pre_solver_steps") if advice_d else None
-    allrun_out = build_allrun(
+    advice = state.get("similar_case_advice") or {}
+    advice = advice.model_dump() if hasattr(advice, "model_dump") else advice
+    build_allrun(
+        pre_solver_steps=advice.get("pre_solver_steps", []) if isinstance(advice, dict) else [],
         case_dir=state["case_dir"],
-        database_path=config.database_path,
+        database_path=str(database_path_for_config(config)),
         searchdocs=config.searchdocs,
         dir_structure=dir_structure,
         case_info=state["case_info"],
         allrun_reference=state["allrun_reference"],
         mesh_type=mesh_type,
         mesh_commands=mesh_commands,
-        pre_solver_steps=pre_solver_steps,
+        user_requirement=state["user_requirement"],
+        llm_service=state.get("llm_service"),
+        config=config,
+        openfoam_fork=generation_convention(config),
     )
 
     print("</input_writer>")
+
+    if uses_legacy_esi_translation(config):
+        convert_case_to_esi_if_needed(state["case_dir"], config)
+    
+    # Rescan the directory and foam files to reflect any translations
+    dir_structure = scan_case_directory(state["case_dir"])
+    foamfiles = read_case_foamfiles(state["case_dir"], dir_structure)
 
     return {
         "dir_structure": dir_structure,
         "commands": [],
         "foamfiles": foamfiles,
     }
+
