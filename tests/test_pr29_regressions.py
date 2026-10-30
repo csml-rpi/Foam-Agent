@@ -396,3 +396,17 @@ def test_no_progress_restores_without_another_model_call(tmp_path):
     state.update(restore_best_snapshot(state))
     assert state['termination_reason'] == 'repair_made_no_progress'
     assert main.workflow_exit_code(state) != 0
+
+
+def test_numpy_retrieval_scores_are_normalized_for_dataset_json(monkeypatch):
+    import numpy as np
+    plan = importlib.import_module('services.plan')
+    candidate = {'case_name': 'reference', 'case_domain': 'incompressible',
+                 'case_category': 'laminar', 'case_solver': 'icoFoam',
+                 'score': np.float32(0.25), 'dir_structure': 'system/controlDict'}
+    monkeypatch.setattr(plan, 'retrieve_faiss', lambda index, *a, **k:
+                        [candidate] if index == 'openfoam_tutorials_structure' else [])
+    client = SimpleNamespace()
+    plan.retrieve_references('case', 'icoFoam', 'incompressible', 'laminar', llm_service=client)
+    assert type(client.retrieval_top3_scores[0]) is float
+    assert json.loads(json.dumps(client.retrieval_top3_scores)) == [0.25]

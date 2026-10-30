@@ -255,8 +255,9 @@ def retrieve_references(case_name: str,
     )
     print(f"Retrieved {len(faiss_structure_all)} candidates from FAISS.")
     client = llm_service if llm_service is not None else global_llm_service
-    client.retrieval_top3_scores = [c.get("score") for c in faiss_structure_all[:3]]
-    client.retrieval_top3_cases = [c.get("case_name", "") for c in faiss_structure_all[:3]]
+    client.retrieval_top3_scores = [float(c["score"]) if c.get("score") is not None else None
+                                   for c in faiss_structure_all[:3]]
+    client.retrieval_top3_cases = [str(c.get("case_name", "")) for c in faiss_structure_all[:3]]
 
     # Hard constraint: domain must match; solver match is a ranking preference.
     domain_matched = [
