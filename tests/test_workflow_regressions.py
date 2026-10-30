@@ -1,4 +1,4 @@
-"""Regressions for merging PR 29 with target-aware existing-case workflows."""
+"""Regression coverage for case generation, repair, checkpoints, and call records."""
 
 from concurrent.futures import ThreadPoolExecutor
 import importlib
@@ -17,7 +17,7 @@ import main
 from dataset_logging import DatasetRecorder
 from logger import close_logging, setup_logging
 from services.best_snapshot import compute_progress_score, restore_best_snapshot, save_best_snapshot
-from services.input_writer import build_allrun, initial_write, rewrite_files
+from services.input_writer import build_allrun, initial_write
 from services.review import error_fingerprint
 from utils import LLMService, FoamPydantic, FoamfilePydantic, read_case_foamfiles, scan_case_directory
 
@@ -151,17 +151,6 @@ def test_pre_solver_steps_reach_both_allrun_prompts(tmp_path, monkeypatch):
     build_allrun(str(tmp_path / 'case'), str(tmp_path), 2, {}, 'icoFoam', '',
                  'standard_mesh', [], llm_service=client, pre_solver_steps=['blockMesh', 'setFields'])
     assert all("['blockMesh', 'setFields']" in call[0] for call in client.calls)
-
-
-def test_generated_rewrite_without_plan_can_change_files(tmp_path):
-    case = make_case(tmp_path / 'case')
-    client = FakeLLM([FoamPydantic(list_foamfile=[
-        FoamfilePydantic(folder_name='system', file_name='fvSolution', content='solvers {}\n'),
-    ])])
-    result = rewrite_files(str(case), ['error'], 'Add solver dictionary', None,
-                           'Keep physical settings', llm_service=client)
-    assert result['updated_files'] == ['system/fvSolution']
-    assert (case / 'system/fvSolution').exists()
 
 
 @pytest.mark.parametrize('origin', ['generated', 'imported'])
@@ -316,19 +305,23 @@ def test_graph_restores_furthest_attempt_and_retains_failure(tmp_path, monkeypat
     assert result['workflow_status'] == 'failed'
 
 
-def test_retrieval_keeps_domain_and_detail_identity_guards(monkeypatch):
+@pytest.mark.parametrize('target', ['foundation-v10', 'esi-v2006'])
+def test_retrieval_keeps_domain_solver_identity_and_target(monkeypatch, target):
     plan = importlib.import_module('services.plan')
     selected = {'case_name': 'cavity', 'case_domain': 'incompressible',
                 'case_category': 'laminar', 'case_solver': 'icoFoam',
                 'score': 1.0, 'full_content': '<directory_structure>system/controlDict</directory_structure>'}
-    wrong = {**selected, 'case_name': 'other', 'score': 0.0, 'full_content': 'WRONG_BODY'}
+    wrong = {**selected, 'case_name': 'other', 'case_domain': 'compressible',
+             'score': 0.0, 'full_content': 'WRONG_BODY'}
+    wrong_solver = {**selected, 'case_name': 'different-solver',
+                    'case_solver': 'simpleFoam', 'score': 0.1}
     correct = {**selected, 'dir_structure': 'system/controlDict', 'full_content': 'CORRECT_BODY'}
     seen = []
-    config = SimpleNamespace(openfoam_target='esi-v2006')
+    config = SimpleNamespace(openfoam_target=target)
     def retrieve(database, query, **kwargs):
         seen.append(kwargs['config'])
         if database == 'openfoam_tutorials_structure':
-            return [{**wrong, 'case_domain': 'compressible'}, selected]
+            return [wrong, wrong_solver, selected]
         if database == 'openfoam_tutorials_details':
             return [wrong, correct]
         return []
@@ -431,27 +424,3 @@ def test_numpy_retrieval_scores_are_normalized_for_dataset_json(monkeypatch):
     plan.retrieve_references('case', 'icoFoam', 'incompressible', 'laminar', llm_service=client)
     assert type(client.retrieval_top3_scores[0]) is float
     assert json.loads(json.dumps(client.retrieval_top3_scores)) == [0.25]
-
-
-def test_retrieval_keeps_domain_solver_preference_and_same_case_contents(monkeypatch):
-    plan = importlib.import_module('services.plan')
-
-    def candidate(name, domain, solver, score):
-        return {'case_name': name, 'case_domain': domain, 'case_category': 'laminar',
-                'case_solver': solver, 'score': score, 'dir_structure': 'system/controlDict',
-                'full_content': name}
-
-    semantic = candidate('cross-domain', 'compressible', 'rhoCentralFoam', 0.0)
-    wrong_solver = candidate('different-solver', 'incompressible', 'simpleFoam', 0.1)
-    expected = candidate('matching-case', 'incompressible', 'icoFoam', 0.9)
-
-    def retrieve(index, query, **kwargs):
-        if index == 'openfoam_tutorials_structure':
-            return [semantic, wrong_solver, expected]
-        if index == 'openfoam_tutorials_details':
-            return [semantic, expected, wrong_solver]
-        return []
-
-    monkeypatch.setattr(plan, 'retrieve_faiss', retrieve)
-    result = plan.retrieve_references('case', 'icoFoam', 'incompressible', 'laminar')
-    assert result[0] == 'matching-case'

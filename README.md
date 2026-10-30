@@ -91,6 +91,8 @@ The task directory contains `original/`, `work/`, and `report/`. `report/case_co
 
 Generated and imported cases use the same Reviewer → Input Writer → Runner repair loop, with analysis history and the configured retry limit. Reviewer diagnoses the current error once, then Input Writer selects and rewrites the necessary files without a separate rewrite-plan call. Meshing failures follow the same analysis and rewrite steps, then return to Meshing before the solver runs. Successful mesh repair resumes the pending workflow. Reviewer records error fingerprints and stops when consecutive fingerprints of the errors, filtered case files, and user requirement are identical. The graph recursion limit also bounds execution. There is no interactive clarification or task-resume step. If import planning cannot proceed, correct the inputs indicated by the failure reason and start a new run.
 
+When repair reaches its retry limit or makes no progress, the workflow restores the furthest recorded attempt and still reports failure.
+
 If simulation succeeds but requested visualization fails, the workflow reports `partial_success`, `termination_reason=visualization_failed`, and `Simulation completed successfully, but visualization failed.` The CLI exits nonzero; MCP `run_case` returns the message and `visualization_error` separately from execution errors.
 
 ## Configuration
@@ -142,35 +144,6 @@ Set in `src/config.py` via `input_writer_generation_mode`:
 |---|---|---|
 | `sequential_dependency` | Files generated in order with cross-file context | Expensive runs (HPC, long simulations) |
 | `parallel_no_context` | Files generated in parallel, no cross-file context | Fast local runs where retry is cheap |
-
-### Review checkpoints and training records
-
-Generated cases, imported cases, and mesh repairs use one Reviewer analysis call
-before Input Writer selects and rewrites the necessary files. Initial import
-planning can still specify a file-scoped change; subsequent error repairs use the
-current diagnosis rather than the initial plan.
-The standalone MCP `apply_fixes` tool retains its explicit file-scoped plan.
-Reference retrieval requires a matching physical domain and verifies that tutorial
-contents belong to the selected case. Per-file advice guides template reuse and
-pre-solver steps, while user requirements and the configured target take precedence.
-
-If repair reaches its loop limit or repeats identical errors with unchanged inputs,
-the workflow restores the attempt with the highest logged simulation timestep.
-Checkpoints live under the case's `.foamagent/` directory. Restoration preserves
-workflow, review, and training logs and keeps the workflow's failed status and
-nonzero exit code. The progress score is a recovery heuristic, not physical validation.
-
-To capture successful planning, generation, and repair calls as JSONL:
-
-```bash
-python foambench_main.py --output /tmp/foamagent-case \
-  --dataset_log_path /tmp/foamagent-case/dataset.jsonl --case_id example
-```
-
-Training capture is optional and uses the workflow's configured model client.
-Records include prompts, responses, case and step identifiers, estimated token
-counts, and retrieval metadata. Structured responses are saved as JSON. Planning
-records are buffered until output-directory checks and preparation succeed.
 
 ### Reported Benchmark Results
 
