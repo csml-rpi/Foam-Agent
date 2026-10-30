@@ -16,7 +16,8 @@ class Config:
     case_dir: str = ""
     overwrite_case_dir: bool = False
     max_time_limit: int = 3600  # Max time limit after which the openfoam run will be terminated, in seconds
-    recursion_limit: int = 100  # LangGraph recursion limit
+    # None budgets the graph for max_loop; an explicit limit remains unchanged.
+    recursion_limit: int | None = None
     # Input writer generation mode:
     # - "sequential_dependency": generate files sequentially; use already-generated files as context to enforce consistency.
     # - "parallel_no_context": generate files in parallel without cross-file context (faster, may need more reviewer iterations).
@@ -55,6 +56,12 @@ class Config:
         Priority: env var (if set & non-empty) > default value.
         Always prints what value is used to make runs reproducible.
         """
+
+        if self.recursion_limit is None:
+            # A repair can traverse meshing_planner, meshing, solver_planner,
+            # input_writer, runner and reviewer. Allow the initial pipeline,
+            # optional visualization and the graph's final stop as well.
+            self.recursion_limit = 6 * max(1, self.max_loop) + 8
 
         def _env_nonempty(key: str) -> str | None:
             v = os.getenv(key)

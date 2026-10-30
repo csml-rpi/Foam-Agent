@@ -14,7 +14,7 @@ Visit [deepwiki.com/csml-rpi/Foam-Agent](https://deepwiki.com/csml-rpi/Foam-Agen
 ## Key Features
 
 - **End-to-End Workflow**: Meshing (including external Gmsh `.msh` files), case generation, local execution or Slurm submission, and optional PyVista visualization. Execution requires the corresponding runtime and infrastructure.
-- **Multi-Agent Workflow**: Architect, Input Writer, Runner, and Reviewer agents collaborate through a LangGraph pipeline with automatic error correction (up to 25 iterations).
+- **Multi-Agent Workflow**: Multiple agents collaborate on planning, file generation, execution, and automatic error correction, with up to 25 repair iterations by default.
 - **RAG-Enhanced Generation**: Hierarchical FAISS indices built from OpenFOAM tutorials provide context-specific retrieval for accurate configuration file generation.
 - **Composable Service Architecture**: Core functions are exposed as MCP tools, enabling integration with Claude Code, Cursor, and other agentic systems.
 
@@ -58,9 +58,9 @@ That's it. Foam-Agent will plan the case, generate all OpenFOAM files, run the s
 
 ### 4. Run an Existing Case
 
-An existing directory or ZIP is another Foam-Agent input. `case_import` preserves a read-only `original/` copy, creates a writable `work/` copy, and passes the discovered files, solver, mesh, time directories, and results to the normal Planner. Platform detection uses OpenFOAM header evidence, not dictionary filenames alone; specify `--openfoam_target` when the platform cannot be resolved. A case with `Allrun`, no detected issues, and no explicit prompt or custom mesh skips file planning and routes to Runner. This still requires LLM resources and routing calls. Other cases use LLM planning to select file changes or meshing, or fail when required physical information cannot be inferred. A configured target conflicting with the detected platform is recorded deterministically, then routed from Planner to Reviewer/Input Writer for repair; the Planner LLM does not decide whether the mismatch exists.
+An existing directory or ZIP is another Foam-Agent input. Foam-Agent preserves a read-only `original/` copy and creates a writable `work/` copy. It plans mesh operations from the requirements and available files, then prepares the solver setup after the mesh is ready. Existing meshes may be reused or modified according to the plan. Specify `--openfoam_target` when the OpenFOAM version cannot be determined. A configured target conflicting with the detected platform stops the workflow. If required physical information cannot be inferred, planning fails with a reason.
 
-The local runner uses the same cleanup policy for generated and imported cases. Prior run artifacts and nonzero time directories in `work/` are cleared before execution and are not automatically restored after failure. The `original/` copy remains available; the local workflow does not preserve restart data for continuation runs. HPC execution instead follows the generated Slurm script and the case's `Allrun`.
+After successful mesh preparation, the local and HPC runners clear prior solver outputs, nonzero time directories and partition directories before solver execution, preserving the final mesh. For imported cases, cleanup affects `work/`; the read-only `original/` copy remains available. Cleared outputs are not automatically restored after failure. This workflow does not preserve restart data for continuation runs.
 
 ```bash
 # Preserve the existing physical definition and run it
@@ -72,11 +72,10 @@ python foambench_main.py \
 python foambench_main.py \
   --output ./output/modified-case \
   --case_path /path/to/case \
-  --prompt_path ./requirements.txt \
-  --openfoam_target esi-v2006
+  --prompt_path ./requirements.txt
 ```
 
-Request visualization in the prompt for either generated or imported cases; the Planner determines whether it is needed. `--custom_mesh_path` can be combined with `--case_path` and `--prompt_path`; the Planner then decides whether Meshing must run before targeted dictionary changes and execution.
+Request visualization in the prompt for either generated or imported cases; the Planner determines whether it is needed. `--case_path` and `--custom_mesh_path` can be combined, with or without `--prompt_path`. Foam-Agent plans mesh operations using the supplied inputs before preparing the solver setup.
 
 `--case_path` accepts either a case directory or a ZIP archive. If an archive contains multiple cases, select one explicitly:
 
@@ -87,9 +86,9 @@ python foambench_main.py \
   --case_subdir multiphase/interFoam/laminar/damBreak/damBreak
 ```
 
-The task directory contains `original/`, `work/`, and `report/`. `report/case_context.json` records the initial imported context, and `report/logs/` contains workflow logs; local `Allrun.out`, `Allrun.err`, and solver logs remain in `work/`. Existing `Allrun` is executed from `work/` unless the repair workflow changes it. Import rejects symbolic links in a source case. Replacing a non-empty output directory requires both Foam-Agent's ownership marker and `--overwrite_output` (or the API's `overwrite_output=true`). Import itself does not impose a command whitelist or rewrite the script.
+The task directory contains `original/`, `work/`, and `report/`. `report/logs/` contains workflow logs; local `Allrun.out`, `Allrun.err`, and solver logs remain in `work/`. Mesh commands run separately before the solver-only `Allrun` is executed from `work/`. Import rejects symbolic links in a source case. Replacing a non-empty output directory requires both Foam-Agent's ownership marker and `--overwrite_output` (or the API's `overwrite_output=true`).
 
-Generated and imported cases use the same Reviewer → Input Writer → Runner repair loop, with analysis history and the configured retry limit. Meshing failures also enter Reviewer: a file-scoped repair passes through Input Writer and returns to Meshing; without target files, it retries Meshing directly. Successful mesh repair resumes the pending workflow. Reviewer records error fingerprints and stops when consecutive fingerprints of the errors, filtered case files, and user requirement are identical. The graph recursion limit also bounds execution. There is no interactive clarification or task-resume step. If import planning cannot proceed, correct the inputs indicated by the failure reason and start a new run.
+Generated and imported cases both support automatic repair of mesh and solver setup errors. If the workflow cannot continue, it reports the reason. Correct the relevant inputs and start a new run; interactive clarification and resuming interrupted tasks are not currently supported.
 
 If simulation succeeds but requested visualization fails, the workflow reports `partial_success`, `termination_reason=visualization_failed`, and `Simulation completed successfully, but visualization failed.` The CLI exits nonzero; MCP `run_case` returns the message and `visualization_error` separately from execution errors.
 
@@ -178,7 +177,7 @@ docker run -it \
   -e FOAMAGENT_MODEL_PROVIDER=openai \
   -e FOAMAGENT_MODEL_VERSION=gpt-5-mini \
   -e OPENAI_API_KEY=your-key-here \
-  -v /path/to/my_mesh.msh:/home/openfoam/Foam-Agent/my_mesh.msh \
+  -v /path/to/tandem_wing.msh:/home/openfoam/Foam-Agent/tandem_wing.msh \
   -p 7860:7860 \
   leoyue123/foamagent
 ```
@@ -248,7 +247,7 @@ Foundation OpenFOAM v10 is the default native target. Set
 
 ### Native target capability parity
 
-`foundation-v10` and `esi-v2006` use the same workflow implementation for prompt planning and RAG, file and Allrun generation, standard/Gmsh/custom meshes, local and HPC execution, review/rewrite, visualization, and existing-case import, with target-specific Docker delivery. This is shared code coverage, not a guarantee that every solver or case succeeds. Their solver names and dictionary syntax remain release-native. Existing cases use conditional graph routes: Planner selects optional mesh preparation and file modification before running; Reviewer supplies file repair plans or mesh retries. `FOAMAGENT_OPENFOAM_FORK=esi` is a legacy translation
+`foundation-v10` and `esi-v2006` use the same workflow implementation for prompt planning and RAG, file and Allrun generation, standard/Gmsh/custom meshes, local and HPC execution, review/rewrite, visualization, and existing-case import, with target-specific Docker delivery. This is shared code coverage, not a guarantee that every solver or case succeeds. Their solver names and dictionary syntax remain release-native. `FOAMAGENT_OPENFOAM_FORK=esi` is a legacy translation
 mode.
 
 Native tutorial corpora are stored by target under `database/`: Foundation v10 uses `database/foundation-v10/{raw,faiss}`, while ESI/OpenCFD v2006 uses `database/esi-v2006/{raw,faiss}`. The sibling `database/script/` directory contains the parsers and FAISS builders shared by both corpora.
@@ -265,7 +264,7 @@ Native tutorial corpora are stored by target under `database/`: Foundation v10 u
 
 #### Claude Code Skill
 
-For Claude Code users who clone this repo, a `/foam` skill is included in `.claude/skills/foam.md`. It orchestrates the MCP tools into a complete workflow:
+For Claude Code users who clone this repo, a `/foam` skill is included in `.claude/skills/foam.md`. This skill is currently written for Foundation OpenFOAM v10. It orchestrates the MCP tools into a complete workflow:
 
 ```
 /foam Simulate lid-driven cavity flow at Re=1000
@@ -315,7 +314,7 @@ For the default native target, install and source **Foundation OpenFOAM v10** ([
 echo $WM_PROJECT_DIR   # should print e.g. /opt/openfoam10
 ```
 
-Then run:
+Before running, configure your provider, model, and credentials as described under "LLM Provider and Model" and "API Keys". If using the default `openai-codex` provider, first complete the sign-in steps under "Codex OAuth Sign-in". Then run:
 
 ```bash
 python foambench_main.py --output ./output --prompt_path ./user_requirement.txt
@@ -323,7 +322,7 @@ python foambench_main.py --output ./output --prompt_path ./user_requirement.txt
 
 ### Native ESI/OpenCFD v2006
 
-Build the isolated ESI v2006 corpus from an ESI v2006 installation, then select the target explicitly. Existing configurations remain unchanged unless this target is supplied.
+Regular users can obtain the provided ESI v2006 corpus and indices with `git lfs pull`; rebuilding is not required. Prepare the matching ESI v2006 runtime, then select the target explicitly. The rebuild command below is for maintainers who need to update the corpus. Existing configurations remain unchanged unless this target is supplied.
 
 ```bash
 # Maintainers: rebuild the versioned v2006 corpus from a sourced ESI/OpenCFD
@@ -351,7 +350,7 @@ The current Foundation corpus has Qwen 0.6B, Qwen 8B, and OpenAI small index dir
 
 The HPC node generates a Slurm script and invokes `sbatch` and `squeue` in the agent's environment. The case path must be accessible to the compute nodes; this code does not upload files or establish an SSH connection. The selected OpenFOAM environment must already be available when the job's runtime guard executes.
 
-Current monitoring treats an empty `squeue` response as `COMPLETED`, then checks case logs. It does not query `sacct` or validate a Slurm exit code. The wait defaults to 3600 seconds with 30-second polling; timeout returns the last observed state, which may enter the existing Reviewer/repair/resubmission loop even while the original job remains active. Job disappearance is therefore not independent confirmation of successful execution.
+Mesh and solver jobs run through Slurm. Queue time counts toward the configured monitoring deadline (`Config.max_time_limit`). If monitoring fails or times out, Foam-Agent attempts to cancel the job. If it reports `hpc_job_state_unconfirmed`, check the job status in Slurm before starting another run. Uncertain submission results do not trigger automatic resubmission.
 
 ### Building the Docker Image from Source
 
@@ -381,7 +380,7 @@ docker run -it foamagent:esi-v2006
 | Problem | Solution |
 |---|---|
 | OpenFOAM environment not found | Ensure the intended OpenFOAM bashrc is sourced. The default path is Foundation v10; `FOAMAGENT_OPENFOAM_TARGET=esi-v2006` requires an ESI v2006 environment at runtime |
-| Database files missing | Ensure the full repo is cloned including `database/`. Native ESI also needs `database/esi-v2006/` built from v2006 tutorials |
+| Database files missing | Install Git LFS and run `git lfs pull` in the repository to download the corpus and indices. Use data matching the OpenFOAM target and configured embedding model; rebuild only when updating the corpus or creating indices not provided by the repository |
 | Missing dependencies | `conda env update -n FoamAgent -f environment.yml --prune` |
 | API key errors | Ensure the appropriate key is set (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.) |
 | MCP connection errors | Verify the container is running and port 7860 is accessible |

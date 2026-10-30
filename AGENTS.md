@@ -34,23 +34,63 @@ Requires a sourced OpenFOAM runtime (`$WM_PROJECT_DIR` must be set): Foundation 
 
 ### Workflow Pipeline (LangGraph StateGraph)
 
-Defined in `src/main.py`. Prompt-generated and imported cases share the same
-Planner, Input Writer, Meshing, Runner, Reviewer, and visualization nodes.
+Defined in `src/main.py`. All non-CAD inputs enter `preparation`, followed by
+`meshing_planner`, an ordinary `meshing` node, and `solver_planner`. Node adapters
+remain thin service wrappers; mesh backends are not graph nodes or child graphs.
 
 ```
-START
-          |
-          +-- prompt -> PLANNER -> MESHING (if needed) -> INPUT_WRITER
-          |              -> LOCAL/HPC RUNNER -> REVIEWER -> retry INPUT_WRITER
-          |              -> VISUALIZATION (if requested) -> END
-          |
-          +-- existing case -> CASE_IMPORT -> PLANNER -> conditional routing
-                               -> INPUT_WRITER / MESHING / LOCAL/HPC RUNNER
-                               -> REVIEWER -> repair action -> END
+START -> PREPARATION -> MESHING_PLANNER -> MESHING -> SOLVER_PLANNER
+      -> INPUT_WRITER -> LOCAL/HPC RUNNER -> [VISUALIZATION] -> END
+
+Solver errors -> REVIEWER -> INPUT_WRITER for solver repairs
+                         -> MESHING_PLANNER -> MESHING for mesh repairs -> SOLVER_PLANNER or INPUT_WRITER
 ```
 
-Routing decisions are implemented in `src/router_func.py`. A complete imported
-case with `Allrun`, no detected issues, and no explicit prompt or custom mesh skips file planning and routes to Runner. LLM resources and routing decisions are still required. Other imported cases use LLM planning: missing files may be generated; missing physical information that cannot be inferred produces a planning failure. An explicit target conflict is recorded deterministically and routed to Reviewer for repair.
+Preparation installs working copies of prompt, external material and imported
+case inputs and records actual file facts. It does not select a simulation
+solver, retrieve solver cases, or force mesh reuse/regeneration. Existing case
+import services retain target detection, original/work/report copies and target
+mismatch failures. Imported cases enter through Preparation; the old imported-case
+node adapter has been removed.
+Preparation preserves time and partition mesh sources. Prior solver outputs are
+cleaned by Local/HPC Runner only after successful mesh handoff.
+
+Meshing Planner selects a backend, source material, files and ordered commands
+from the requirement and available files. No uploaded path or polyMesh directory
+forces a backend or reuse policy. Standard OpenFOAM utilities, generated Gmsh,
+uploaded Gmsh .msh files and meshes inside imported cases use the same graph.
+External .geo scripts and standalone polyMesh directories are outside this update;
+SpaceClaim/Fluent input is deferred. Planners use prepared input paths, case file
+listings and contents; mesh handoff includes actual patches and boundary text.
+
+Meshing generates/edits mesh inputs, executes Allmesh or converter tools and
+reads final patches. Mesh failures return to the main-graph Reviewer, then
+Meshing Planner and Meshing, using the existing shared repair budget. Meshing Planner
+decides which utility startup dictionaries to create or modify through normal file tasks;
+execution does not inject defaults. Converter staging files stay separate from simulation settings.
+
+Solver selection and solver-reference retrieval happen in Solver Planner after
+mesh handoff. It selects physical/solver file changes and extracts a solver-only
+Allrun from an imported script, preserving field preparation and solver-parallel
+setup. Allmesh owns mesh operations. The actual mesh path, patches
+and available conversion/check evidence are passed to the solver
+planner, writer and reviewer; unknown values are not filled by name heuristics.
+
+Planner and Reviewer declare file stages and create/modify instructions. Filename
+heuristics no longer classify or silently discard tasks. After mesh repair, the mesh
+planner assesses actual results and decides whether to revisit Solver Planner or
+continue to Writer; pending physical tasks survive either route.
+Retain the three supported input modes and the standalone MCP planning service.
+Imported-case planning only runs after Preparation and Meshing; target checks belong
+to Preparation, with no legacy all-stage planning branch.
+Mesh handoff requires complete constant/polyMesh output; unresolved time/parallel mesh outputs, including 0/polyMesh, return to repair without deleting initial fields. Native HPC mesh operations are submitted before the solver job. No new boundary-condition policies or quality thresholds are added.
+For parallel reconstruction, `MeshingPlan.final_reconstruction` declares exact
+case-relative partition source directories, native argv and the fixed
+`constant/polyMesh` target. It runs last through the existing native utility
+runner. All declared sources must be complete before the old serial target is
+removed; only successful creation of a complete replacement permits those
+partition directories to remain at handoff. Ordinary serial mesh edits retain
+their existing mesh. No timestamp-based selection or mesh archiving is used.
 
 ### Directory Structure
 
@@ -63,18 +103,21 @@ src/
   router_func.py       # LLM-based routing decisions
   logger.py            # Structured XML-tagged logging
   nodes/               # LangGraph node functions (thin wrappers calling services)
-    planner_node.py
+    meshing_planner_node.py
+    solver_planner_node.py
     input_writer_node.py
-    meshing_node.py
+    meshing_node.py     # Ordinary node selecting one of three backend services
     local_runner_node.py
     hpc_runner_node.py
     reviewer_node.py
     visualization_node.py
-    imported_case_node.py
+    preparation_node.py
   services/            # Business logic (where the real work happens)
-    plan.py            # Case planning and analysis
+    preparation.py     # Shared input preparation and imported-case materialisation
+    plan.py            # Solver metadata, references and file planning
     input_writer.py    # OpenFOAM file generation via LLM + RAG
-    mesh.py            # Mesh generation (blockMesh / Gmsh conversion)
+    meshing.py         # Mesh planning and single-pass standard execution
+    mesh.py            # Gmsh generation and uploaded mesh conversion backends
     run_local.py       # Local OpenFOAM execution
     run_hpc.py         # HPC job submission
     review.py          # Error diagnosis and fix planning
@@ -105,7 +148,7 @@ docker/                # Dockerfile for containerized deployment
 ### Design Patterns
 
 1. **Service-oriented**: Nodes in `src/nodes/` are thin orchestration wrappers. All logic lives in `src/services/`.
-2. **Error correction loop**: Runner detects errors -> Reviewer diagnoses via LLM -> Input Writer rewrites targeted files -> re-run (default `max_loop=25`, also bounded by the graph recursion limit). Meshing failures also reach Reviewer; repair returns to Meshing, with or without a targeted file rewrite. Repeated identical error/case/request fingerprints stop the repair loop.
+2. **Error correction loop**: Runner detects errors -> Reviewer diagnoses via LLM -> Input Writer rewrites solver files, or Meshing rewrites/regenerates mesh -> re-run. Meshing-stage errors return to the main-graph Reviewer and then Meshing Planner. Existing review limits are retained. Solver-review repeated-error stopping is unchanged; mesh review receives repetition evidence and decides whether to continue within the shared budget. No new boundary-condition policies or mesh quality thresholds are added.
 3. **RAG retrieval**: FAISS indices built from OpenFOAM tutorials provide reference cases to the input writer.
 4. **Two generation modes** (`config.input_writer_generation_mode`):
    - `sequential_dependency` (default): Files generated in order with cross-file context.
@@ -157,4 +200,4 @@ Use `esi-v2006` with a matching runtime to build that corpus. Runtime defaults a
 - **The error correction loop** can run up to 25 iterations. When modifying the reviewer or input writer, consider the impact on convergence.
 - **`GraphState`** defines the state schema. LangGraph merges node-returned updates; some nodes also mutate nested objects such as `Config`. Do not assume every node shares one unchanged dictionary instance.
 - **Visualization failure after simulation success** produces `partial_success`, `termination_reason=visualization_failed`, and the English message `Simulation completed successfully, but visualization failed.` The CLI exits nonzero; MCP `run_case` includes the summary and visualization error. A standalone MCP `visualization` failure raises an error.
-- **HPC monitoring is basic**: it runs Slurm commands in the agent's environment, treats an empty `squeue` result as completed, and does not query `sacct` or validate the final exit code. Monitoring timeout returns the last observed state and may enter the existing repair/resubmission loop. It is not an SSH deployment or job-resume service.
+- **HPC monitoring** runs Slurm commands in the agent's environment and does not query `sacct`. An empty `squeue` result ends monitoring, but success also requires the current attempt's zero exit-code record. Monitoring failure or deadline expiry triggers cancellation and up to 60 seconds of confirmation; an unconfirmed stop terminates the graph with `hpc_job_state_unconfirmed`, including through Gmsh's internal exception handlers. Explicit `sbatch` rejections use error-context script repair and consume the shared `loop_count`; uncertain submissions stop without resubmission. Resources are refreshed from the current case before each stage. This is not an SSH deployment or job-resume service.

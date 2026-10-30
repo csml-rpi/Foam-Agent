@@ -3,55 +3,6 @@ from langgraph.graph import END
 from utils import GraphState
 
 
-def route_workflow_entry(state: GraphState):
-    """Choose new generation or existing-case import."""
-    if state.get("workflow_mode") == "imported_case":
-        print("<router>Existing case requested. Routing to case_import node.</router>")
-        return "case_import"
-    print("<router>Prompt workflow requested. Routing to planner node.</router>")
-    return "planner"
-
-
-def llm_requires_custom_mesh(state: GraphState) -> int:
-    """
-    Use LLM to determine if user requires custom mesh based on their requirement.
-    
-    Args:
-        state: Current graph state containing user requirement and LLM service
-        
-    Returns:
-        int: 1 if custom mesh is required, 2 if gmsh mesh is required, 0 otherwise
-    """
-    user_requirement = state["user_requirement"]
-    
-    system_prompt = (
-        "You are an expert in OpenFOAM workflow analysis. "
-        "Analyze the user requirement to determine if they want to use a custom mesh file. "
-        "Look for keywords like: custom mesh, mesh file, .msh, .stl, .obj, gmsh, snappyHexMesh, "
-        "or any mention of importing/using external mesh files. "
-        "If the user explicitly mentions or implies they want to use a custom mesh file, return 'custom_mesh'. "
-        "If they want to use standard OpenFOAM mesh generation (blockMesh, snappyHexMesh with STL, etc.), return 'standard_mesh'. "
-        "Look for keywords like gmsh and determine if they want to create mesh using gmsh. If they want to create mesh using gmsh, return 'gmsh_mesh'. "
-        "Be conservative - if unsure, assume 'standard_mesh' unless clearly specified otherwise."
-        "Only return 'custom_mesh' or 'standard_mesh' or 'gmsh_mesh'. Don't return anything else."
-    )
-    
-    user_prompt = (
-        f"User requirement: {user_requirement}\n\n"
-        "Determine if the user wants to use a custom mesh file. "
-        "Return exactly 'custom_mesh' if they want to use a custom mesh file, "
-        "'standard_mesh' if they want standard OpenFOAM mesh generation or 'gmsh_mesh' if they want to create mesh using gmsh."
-    )
-    
-    response = state["llm_service"].invoke(user_prompt, system_prompt)
-    if "custom_mesh" in response.lower():
-        return 1
-    elif "gmsh_mesh" in response.lower():
-        return 2
-    else:
-        return 0
-
-
 def llm_requires_hpc(state: GraphState) -> bool:
     """
     Use LLM to determine if user requires HPC/cluster execution based on their requirement.
@@ -111,57 +62,32 @@ def llm_requires_visualization(state: GraphState) -> bool:
     return "yes_visualization" in response.lower()
 
 
-def route_after_planner(state: GraphState):
-    """
-    Route after planner node based on whether user wants custom mesh.
-    For current version, if user wants custom mesh, user should be able to provide a path to the mesh file.
-    """
-    if state.get("case_origin") == "imported":
-        if state.get("workflow_status") == "failed":
-            if state.get("target_mismatch"):
-                # A configured-vs-detected OpenFOAM target mismatch is an environment/config
-                # error, not something the reviewer's file-rewrite loop can fix. End directly
-                # so the caller sees the actionable "case_target_mismatch" diagnostic instead of
-                # a wasted repair loop ending in "max_review_loop_reached".
-                print("<router>Case target mismatch detected. Ending workflow.</router>")
-            return END
-        if state.get("requires_meshing"):
-            return "meshing"
-        if state.get("requires_input_writer"):
-            return "input_writer"
-        return _route_runner(state)
-
-    mesh_type = state.get("mesh_type", "standard_mesh")
-    if mesh_type == "custom_mesh":
-        print("<router>Custom mesh requested. Routing to meshing node.</router>")
-        return "meshing"
-    elif mesh_type == "gmsh_mesh":
-        print("<router>GMSH mesh requested. Routing to meshing node.</router>")
-        return "meshing"
-    else:
-        print("<router>Standard mesh generation. Routing to input_writer node.</router>")
-        return "input_writer"
+def route_after_solver_planner(state: GraphState):
+    """Successful solver planning hands physical files to the writer."""
+    if state.get("workflow_status") == "failed":
+        return END
+    return "meshing_planner" if state.get("repairing_mesh") else "input_writer"
 
 
 def route_after_meshing(state: GraphState):
-    """Route imported cases as planned; generated cases continue to Input Writer."""
+    """Plan the solver after initial meshing; preserve pending repairs on retries."""
+    if state.get("termination_reason"):
+        return END
     if state.get("error_logs"):
         return "reviewer"
-    if state.get("case_origin") == "imported":
-        return "input_writer" if state.get("requires_input_writer") else _route_runner(state)
-    return "input_writer"
+    return "solver_planner" if not state.get("solver_planned") or state.get("replan_solver") else "input_writer"
 
 
 def route_after_input_writer(state: GraphState):
     """
     Route after input_writer node based on whether user wants to run on HPC.
-    Prefer planner-cached decision to avoid repeated LLM routing jitter.
+    Prefer solver-planner-cached decisions to avoid repeated LLM routing jitter.
     """
     if state.get("error_logs"):
         return "reviewer"
 
     if state.get("repairing_mesh"):
-        return "meshing"
+        return "meshing_planner"
 
     return _route_runner(state)
 
@@ -181,6 +107,8 @@ def _route_runner(state: GraphState):
         return "local_runner"
 
 def route_after_runner(state: GraphState):
+    if state.get("termination_reason"):
+        return END
     if state.get("error_logs") and len(state["error_logs"]) > 0:
         return "reviewer"
 
@@ -193,16 +121,16 @@ def route_after_runner(state: GraphState):
         return "visualization"
     return END
 
-def route_after_case_import(state: GraphState):
-    """Imported cases now enter the normal planner and LLM repair workflow."""
+def route_after_preparation(state: GraphState):
+    """Prepared inputs enter mesh planning before solver selection."""
     if state.get("workflow_status") == "failed":
         return END
-    return "planner"
+    return "meshing_planner"
 
 
 def route_after_reviewer(state: GraphState):
     """Use the same file-rewrite loop for generated and imported cases."""
-    if state.get("termination_reason") == "repair_made_no_progress":
+    if state.get("termination_reason") in {"repair_made_no_progress", "mesh_review_stopped"}:
         return END
     loop_count = state.get("loop_count", 0)
     if loop_count >= state["config"].max_loop:
@@ -216,6 +144,6 @@ def route_after_reviewer(state: GraphState):
         return "visualization" if requires_visualization else END
 
     print(f"<router>Loop {loop_count}: Continuing to fix errors.</router>")
-    if state.get("repairing_mesh") and not (state.get("rewrite_plan") or {}).get("target_files"):
-        return "meshing"
+    if state.get("repairing_mesh"):
+        return "meshing_planner"
     return "input_writer"

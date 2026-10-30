@@ -3,9 +3,27 @@ import os
 import json
 import subprocess
 import re
+import time
 from models import RunOut
 from utils import check_foam_errors, save_file
 from . import global_llm_service
+
+
+class HpcWorkflowStop(RuntimeError):
+    """A stage cannot safely retry, or has exhausted the shared repair budget."""
+
+    def __init__(self, reason: str, message: str, record=None):
+        super().__init__(message)
+        self.reason = reason
+        self.record = record or {}
+
+    def state_update(self):
+        return {
+            "workflow_status": "failed", "termination_reason": self.reason,
+            "job_id": self.record.get("job_id"),
+            "slurm_script_path": self.record.get("script"),
+            "error_logs": [{"file": "hpc", "error_content": f"{self}\n{self.record}"}],
+        }
 
 
 def create_slurm_script(
@@ -14,6 +32,7 @@ def create_slurm_script(
     *,
     llm_service: Optional[Any] = None,
     openfoam_target: str = "",
+    execution_script: str = "Allrun",
 ) -> str:
     """
     Create a SLURM script for OpenFOAM simulation using LLM.
@@ -32,7 +51,7 @@ def create_slurm_script(
         "1. Proper SLURM directives (#SBATCH) based on the cluster information provided"
         "2. Do not load openfoam"
         "3. Load libaraies for openfoam for run in parallel"
-        "4. Directory navigation and execution of the Allrun script"
+        f"4. Directory navigation and execution of the {execution_script} script"
         "5. Error handling and status reporting"
         "6. Any cluster-specific optimizations or requirements"
         "7. Use your understanding of the documentation of the cluster and figure out the syntax of their jobscript. "
@@ -57,7 +76,7 @@ def create_slurm_script(
         f"Memory: {cluster_info['memory']} GB per node\n"
         f"Case directory: {case_dir}\n"
         f""
-        f"Generate a complete SLURM script that will run the OpenFOAM simulation using the Allrun script."
+        f"Generate a complete SLURM script that will run the OpenFOAM simulation using the {execution_script} script."
     )
     
     llm_client = llm_service if llm_service is not None else global_llm_service
@@ -94,6 +113,7 @@ def create_slurm_script_with_error_context(
     *,
     llm_service: Optional[Any] = None,
     openfoam_target: str = "",
+    execution_script: str = "Allrun",
 ) -> str:
     """
     Create a SLURM script for OpenFOAM simulation using LLM, with error context for retries.
@@ -114,7 +134,7 @@ def create_slurm_script_with_error_context(
         "1. Proper SLURM directives (#SBATCH) based on the cluster information provided"
         "2. Do not load OpenFOAM"
         "3. Load libaraies for openfoam for run in parallel"
-        "4. Directory navigation and execution of the Allrun script"
+        f"4. Directory navigation and execution of the {execution_script} script"
         "5. Error handling and status reporting"
         "6. Any cluster-specific optimizations or requirements"
         "7. Use your understanding of the documentation of the cluster and figure out the syntax of their jobscript. "
@@ -158,7 +178,7 @@ def create_slurm_script_with_error_context(
         user_prompt += f"Previous SLURM script that failed:\n```bash\n{previous_script_content}\n```\n"
         user_prompt += "Please analyze this error and the previous script to identify the issue and create a corrected version."
     
-    user_prompt += f"\nGenerate a complete SLURM script that will run the OpenFOAM simulation using the Allrun script. Return ONLY the complete SLURM script content. Do not include any explanations or markdown formatting."
+    user_prompt += f"\nGenerate a complete SLURM script that will run the OpenFOAM simulation using the {execution_script} script. Return ONLY the complete SLURM script content. Do not include any explanations or markdown formatting."
     
     llm_client = llm_service if llm_service is not None else global_llm_service
     response = llm_client.invoke(user_prompt, system_prompt)
@@ -205,16 +225,19 @@ def submit_slurm_job(script_path: str) -> Tuple[Optional[str], bool, str]:
         job_id_match = re.search(r'Submitted batch job (\d+)', output)
         if job_id_match:
             return job_id_match.group(1), True, ""
-        return None, False, f"Could not extract job ID from output: {output}"
+        raise HpcWorkflowStop("hpc_submission_unconfirmed",
+                              f"Could not extract job ID from sbatch output: {output}")
     except subprocess.CalledProcessError as e:
         return None, False, f"Failed to submit job: {e.stderr}"
+    except HpcWorkflowStop:
+        raise
     except Exception as e:
-        return None, False, f"Unexpected error: {str(e)}"
+        raise HpcWorkflowStop("hpc_submission_unconfirmed", f"Submission could not be confirmed: {e}") from e
 
 
-def check_job_status(job_id: str) -> Tuple[Optional[str], bool, str]:
+def check_job_status(job_id: str, *, timeout: Optional[float] = None) -> Tuple[Optional[str], bool, str]:
     try:
-        result = subprocess.run(["squeue", "-j", job_id, "--noheader", "-o", "%T"], capture_output=True, text=True, check=True)
+        result = subprocess.run(["squeue", "-j", job_id, "--noheader", "-o", "%T"], capture_output=True, text=True, check=True, timeout=timeout)
         status = result.stdout.strip()
         if status:
             return status, True, ""
@@ -362,19 +385,21 @@ def check_logs_for_errors(case_dir: str):
 
 def wait_for_job(job_id: str, max_wait_time: int = 3600, wait_interval: int = 30) -> Tuple[str, bool, str]:
     """Poll job status until finished or timeout. Returns (status, ok, err)."""
-    import time
-    elapsed = 0
+    deadline = time.monotonic() + max_wait_time
     last_status = "PENDING"
-    while elapsed < max_wait_time:
-        status, ok, err = check_job_status(job_id)
+    while (remaining := deadline - time.monotonic()) > 0:
+        status, ok, err = check_job_status(job_id, timeout=remaining)
         if not ok:
+            if time.monotonic() >= deadline:
+                return "TIMEOUT", False, f"Monitoring exceeded {max_wait_time}s: {err}"
             return status or "UNKNOWN", False, err
         last_status = status
-        if status in ["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"]:
+        if status in {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE", "REVOKED"}:
             return status, True, ""
-        time.sleep(wait_interval)
-        elapsed += wait_interval
-    return last_status or "TIMEOUT", True, ""
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(wait_interval, remaining))
+    return "TIMEOUT", False, f"Monitoring exceeded {max_wait_time}s; last state: {last_status}"
 
 
 def _add_openfoam_runtime_guard(
@@ -404,3 +429,85 @@ def _add_openfoam_runtime_guard(
             break
         insert_at += 1
     return "\n".join([*lines[:insert_at], guard.rstrip("\n"), *lines[insert_at:]]) + "\n"
+
+
+def run_stage_hpc(state, script, stage, timeout):
+    """Submit one stage attempt; queue disappearance alone is not completion."""
+    from pathlib import Path
+    import tempfile
+    import shlex
+    case = Path(state["case_dir"]).resolve()
+    root = case / ".foamagent" / (stage + "-jobs")
+    root.mkdir(parents=True, exist_ok=True)
+    attempt = Path(tempfile.mkdtemp(prefix="attempt-", dir=root))
+    marker, out, err = (attempt / name for name in ("exit-code", "stdout", "stderr"))
+    wrapper = attempt / "run-stage.sh"
+    q = lambda p: shlex.quote(str(p))
+    wrapper.write_text("#!/bin/bash\n" +
+        f"cd {q(case)} || exit 1\n" +
+        f"bash {'-e -o pipefail ' if stage == 'mesh' else ''}{q(Path(script).resolve())} > {q(out)} 2> {q(err)}\n" +
+        "rc=$?\n" + f"printf '%s\\n' \"$rc\" > {q(marker)}.tmp\n" +
+        f"mv {q(marker)}.tmp {q(marker)}\nexit \"$rc\"\n")
+    wrapper.chmod(0o700)
+    cluster = extract_cluster_info_from_requirement(state["user_requirement"], str(case), llm_service=state.get("llm_service"))
+    state["cluster_info"] = cluster
+    from openfoam_target import runtime_openfoam_target
+    previous_script, submission_error = "", ""
+    record = {"job_id": None, "output": str(out), "error": str(err)}
+    submission_number = 0
+    while True:
+        if state.get("loop_count", 0) >= state["config"].max_loop:
+            raise HpcWorkflowStop("max_review_loop_reached", "Slurm submission exhausted the shared repair budget", record)
+        kwargs = dict(llm_service=state.get("llm_service"),
+                      openfoam_target=runtime_openfoam_target(state["config"]), execution_script=str(wrapper))
+        if submission_error:
+            batch = create_slurm_script_with_error_context(str(case), cluster, submission_error, previous_script, **kwargs)
+        else:
+            batch = create_slurm_script(str(case), cluster, **kwargs)
+        previous_script = Path(batch).read_text()
+        submission_number += 1
+        batch_copy = attempt / f"submit-{submission_number}.slurm"
+        batch_copy.write_text(previous_script)
+        record = {"job_id": None, "script": str(batch_copy), "output": str(out), "error": str(err)}
+        state.setdefault(stage + "_jobs", []).append(record)
+        try:
+            submitted = run_simulation_hpc(str(batch_copy))
+        except HpcWorkflowStop as stop:
+            record.update(status="submission_unknown", returncode=1, diagnostic=str(stop))
+            stop.record = record
+            raise
+        record.update(job_id=submitted.job_id, status=submitted.status)
+        if submitted.status == "submitted" and submitted.job_id:
+            break
+        record["returncode"] = 1
+        if not submitted.status.startswith("failed:") or submitted.job_id:
+            raise HpcWorkflowStop("hpc_submission_unconfirmed", "Submission result is not a confirmed rejection", record)
+        submission_error = submitted.status
+        state["loop_count"] = state.get("loop_count", 0) + 1
+
+    status, ok, error = wait_for_job(submitted.job_id, max_wait_time=timeout)
+    record["status"] = status
+    if not ok:
+        try:
+            cancelled = subprocess.run(["scancel", str(submitted.job_id)], check=False, capture_output=True, text=True, timeout=60)
+            record["cancellation"] = {"returncode": cancelled.returncode, "stderr": cancelled.stderr}
+        except Exception as exc:
+            record["cancellation"] = {"error": str(exc)}
+        final_status, confirmed, confirmation_error = wait_for_job(submitted.job_id, max_wait_time=60, wait_interval=5)
+        record.update(cancellation_status=final_status, cancellation_diagnostic=confirmation_error)
+        if not confirmed:
+            record.update(returncode=1, diagnostic=error)
+            raise HpcWorkflowStop("hpc_job_state_unconfirmed", "Could not confirm that the Slurm job stopped; no further work will run", record)
+    try:
+        code = int(marker.read_text().strip())
+    except (OSError, ValueError):
+        code = 1
+        error = error or "No exit result for this stage attempt"
+    record.update(returncode=code if ok and status == "COMPLETED" else 1,
+                  timed_out=status == "TIMEOUT", diagnostic=error)
+    # Keep conventional stage outputs for the existing error collector.
+    for src, name in ((out, stage == "mesh" and "Allmesh.out" or "Allrun.out"),
+                      (err, stage == "mesh" and "Allmesh.err" or "Allrun.err")):
+        (case / name).write_text(src.read_text(errors="replace") if src.exists()
+                                 else error or "No output was produced for this stage attempt")
+    return record

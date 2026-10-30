@@ -118,8 +118,12 @@ async def plan(
         
         await ctx.info(f"Generated {len(plan_data['subtasks'])} subtasks")
         
-        # Convert subtasks to PlanResponse format
-        subtasks = [{"file": s["file_name"], "folder": s["folder_name"]} for s in plan_data["subtasks"]]
+        # Keep legacy path keys while preserving the planner's file instructions.
+        subtasks = [
+            {"file": task["file_name"], "folder": task["folder_name"],
+             **{key: task[key] for key in ("stage", "action", "changes") if key in task}}
+            for task in plan_data["subtasks"]
+        ]
         
         return PlanResponse(
             subtasks=subtasks,
@@ -211,11 +215,12 @@ async def input_writer(
             if isinstance(st, dict):
                 # Handle both formats: {file, folder} or {file_name, folder_name}
                 file_name = st.get("file_name") or st.get("file")
-                folder_name = st.get("folder_name") or st.get("folder")
-                if file_name and folder_name:
+                folder_name = st.get("folder_name", st.get("folder"))
+                if file_name and folder_name is not None:
                     converted_subtasks.append({
                         "file_name": file_name,
-                        "folder_name": folder_name
+                        "folder_name": folder_name,
+                        **{key: st[key] for key in ("stage", "action", "changes") if key in st},
                     })
                 else:
                     raise ValueError(f"Invalid subtask format: {st}. Must have 'file'/'file_name' and 'folder'/'folder_name'")
@@ -594,7 +599,7 @@ class RunCaseRequest(BaseModel):
     )
     custom_mesh_path: Optional[str] = Field(
         default=None,
-        description="Optional external mesh used by the imported-case workflow",
+        description="Optional Gmsh .msh file (ASCII 2.2 format)",
     )
     openfoam_target: Optional[str] = Field(
         default=None,

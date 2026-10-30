@@ -1,7 +1,9 @@
 """Thin LangGraph adapter for OpenFOAM input generation and rewriting."""
 
-from utils import read_case_foamfiles, scan_case_directory
+from pathlib import Path
+from utils import read_case_foamfiles, scan_case_directory, load_case_files, save_file
 from services.input_writer import initial_write, build_allrun, rewrite_files
+from services.case_paths import safe_case_relative_from_text
 from translation.esi_translator import convert_case_to_esi_if_needed
 from openfoam_target import database_path_for_config, generation_convention, uses_legacy_esi_translation
 
@@ -13,12 +15,65 @@ def input_writer_node(state):
         state: The current state containing all necessary information
     """
 
+    state = dict(state)
+    state["user_requirement"] += (
+        f"\n<actual_mesh>{state.get('mesh_info') or {}}</actual_mesh>\n"
+        "Mesh operations belong to Allmesh and Meshing. When writing Allrun, "
+        "preserve its solver-only stage; do not add mesh generation, conversion, "
+        "checks, modifications or cleanup. Physical field preparation and "
+        "solver-parallel decomposition remain in Allrun."
+    )
+    script = state.get("solver_allrun")
+    if script:
+        save_file(str(Path(state["case_dir"]) / "Allrun"), script)
+        state.update(load_case_files(state))
     mode = state["input_writer_mode"]
+    created_allrun = False
     
-    if mode == "rewrite":
-        return _rewrite_mode(state)
+    if state.get("case_origin") == "imported" and state.get("requires_input_writer") is False:
+        out = {}
+    elif mode == "rewrite":
+        out = _rewrite_mode(state) if (state.get("rewrite_plan") or {}).get("target_files") else {}
     else:
-        return _initial_write_mode(state)
+        out = _initial_write_mode(state)
+        if not out.get("error_logs"):
+            # Preserve explicit creates even after pending tasks are consumed.
+            created_allrun = any(
+                str(Path(t["folder_name"]) / t["file_name"]) == "Allrun"
+                for t in state["subtasks"]
+            )
+            if state.get("pending_solver_subtasks"):
+                # Consume successful creates even if the following edits fail.
+                out.update(pending_solver_subtasks=[], subtasks=[], input_writer_mode="rewrite")
+            if (state.get("rewrite_plan") or {}).get("target_files"):
+                out.update(_rewrite_mode({**state, **out}))
+    if out.get("error_logs"):
+        return out
+    if script is not None:
+        out["solver_allrun"] = None
+    if (not (Path(state["case_dir"]) / "Allrun").is_file()
+            or (state.get("case_origin") == "imported" and script == ""
+                and not created_allrun
+                and not any(
+                    safe_case_relative_from_text(t["file"]).as_posix() == "Allrun"
+                    for t in (state.get("rewrite_plan") or {}).get("target_files", [])
+                ))):
+        _build_solver_allrun({**state, **out})
+    out.update(load_case_files({**state, **out}))
+    return out
+
+
+def _build_solver_allrun(state):
+    config = state["config"]
+    return build_allrun(
+        case_dir=state["case_dir"], database_path=str(database_path_for_config(config)),
+        searchdocs=config.searchdocs, dir_structure=state.get("dir_structure") or {},
+        case_info=state.get("case_info") or f"solver: {state.get('case_solver') or ''}",
+        allrun_reference=state.get("allrun_reference") or "",
+        mesh_type=state.get("mesh_type"), mesh_commands=[],
+        user_requirement=state["user_requirement"], llm_service=state.get("llm_service"),
+        config=config, openfoam_fork=generation_convention(config), phase="solver",
+    )
 
 def _rewrite_mode(state):
     """Rewrite mode: delegate to service to modify files based on review analysis."""
@@ -74,23 +129,15 @@ def _initial_write_mode(state):
     dir_structure = write_out["dir_structure"]
     foamfiles = write_out["foamfiles"]
 
-    # Build Allrun via service
-    mesh_type = state.get("mesh_type")
-    mesh_commands = state.get("mesh_commands") or []
-    build_allrun(
-        case_dir=state["case_dir"],
-        database_path=str(database_path_for_config(config)),
-        searchdocs=config.searchdocs,
-        dir_structure=dir_structure,
-        case_info=state["case_info"],
-        allrun_reference=state["allrun_reference"],
-        mesh_type=mesh_type,
-        mesh_commands=mesh_commands,
-        user_requirement=state["user_requirement"],
-        llm_service=state.get("llm_service"),
-        config=config,
-        openfoam_fork=generation_convention(config),
+    # Imported scripts have already been split by solver_planner.
+    explicit_allrun = any(
+        str(Path(t["folder_name"]) / t["file_name"]) == "Allrun" for t in state["subtasks"]
+    ) or any(
+        safe_case_relative_from_text(t["file"]).as_posix() == "Allrun"
+        for t in (state.get("rewrite_plan") or {}).get("target_files", [])
     )
+    if not state.get("solver_allrun") and not explicit_allrun:
+        _build_solver_allrun({**state, **write_out})
 
     print("</input_writer>")
 

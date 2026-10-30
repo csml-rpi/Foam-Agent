@@ -881,6 +881,13 @@ class GraphState(TypedDict):
     case_dir: str
     case_name: str
     subtasks: List[dict]
+    mesh_jobs: Optional[List[dict]]
+    solver_jobs: Optional[List[dict]]
+    solver_planned: bool
+    replan_solver: bool
+    pending_solver_subtasks: Optional[List[dict]]
+    mesh_execution: Optional[dict]
+    final_reconstruction: Optional[dict]
     loop_count: int
     # Additional state fields that will be added during execution
     llm_service: Optional['LLMService']
@@ -898,11 +905,14 @@ class GraphState(TypedDict):
     case_domain: Optional[str]
     case_category: Optional[str]
     case_solver: Optional[str]
+    mesh_source: Optional[str]
     # Mesh-related state fields
     mesh_info: Optional[dict]
     mesh_commands: Optional[List[str]]
     custom_mesh_used: Optional[bool]
     mesh_type: Optional[str]
+    mesh_subtasks: Optional[List[dict]]
+    solver_allrun: Optional[str]
     repairing_mesh: bool
     mesh_resume_state: Optional[dict]
     custom_mesh_path: Optional[str]
@@ -919,7 +929,7 @@ class GraphState(TypedDict):
     cluster_info: Optional[dict]
     slurm_script_path: Optional[str]
     termination_reason: Optional[str]
-    # Existing cases participate in the same planner/writer/runner/reviewer graph.
+    # Existing cases share Meshing and the solver-planner/writer/runner/reviewer graph.
     workflow_mode: str
     case_origin: str
     user_requirement_explicit: bool
@@ -1145,6 +1155,7 @@ def run_command(
     max_time_limit: int,
     *,
     openfoam_target: str = "",
+    fail_fast: bool = False,
 ) -> Dict[str, Any]:
     print(f"Executing script {script_path} in {working_dir}")
     script = Path(script_path).expanduser().resolve()
@@ -1183,7 +1194,8 @@ def run_command(
         'active WM_PROJECT_VERSION=${WM_PROJECT_VERSION:-unset}" >&2; exit 64; '
         'fi; '
         'fi; '
-        'exec bash "$foamagent_script"'
+        + ('exec bash -e -o pipefail "$foamagent_script"' if fail_fast
+           else 'exec bash "$foamagent_script"')
     )
 
     timed_out = False
@@ -1454,6 +1466,12 @@ def load_case_files(state: dict[str, Any]) -> dict[str, Any]:
         return {}
     directory = scan_case_directory(case_dir)
     input_directory = _case_input_directory(directory)
+    scripts = [name for name in ("Allrun", "Allmesh", "generate_mesh.py")
+               if (Path(case_dir) / name).is_file()]
+    if scripts:
+        input_directory[""] = scripts
+    if (Path(case_dir) / "constant/polyMesh/boundary").is_file():
+        input_directory["constant/polyMesh"] = ["boundary"]
     foamfiles = read_case_foamfiles(case_dir, input_directory)
     return {
         "dir_structure": directory,

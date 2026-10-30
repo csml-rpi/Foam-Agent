@@ -13,6 +13,7 @@ def run_allrun_and_collect_errors(
     max_retries: int = 1,
     *,
     openfoam_target: str = "",
+    mesh_prepared: bool = False,
 ) -> List[Any]:
     """
     Execute the Allrun script and collect any error logs from the simulation.
@@ -56,7 +57,7 @@ def run_allrun_and_collect_errors(
     
     out_file = os.path.join(case_dir, "Allrun.out")
     err_file = os.path.join(case_dir, "Allrun.err")
-    _cleanup_run_artifacts(case_dir)
+    _cleanup_run_artifacts(case_dir, preserve_mesh=mesh_prepared)
 
     last_error_logs: List[Any] = []
     for attempt in range(1, max_retries + 1):
@@ -105,7 +106,7 @@ def run_allrun_and_collect_errors(
         last_error_logs = error_logs
         if attempt < max_retries:
             print("Allrun reported errors; retrying after cleanup...")
-            _cleanup_run_artifacts(case_dir)
+            _cleanup_run_artifacts(case_dir, preserve_mesh=mesh_prepared)
 
     return last_error_logs
 
@@ -131,7 +132,7 @@ def _deduplicate_errors(errors: List[Any]) -> List[Any]:
     return deduplicated
 
 
-def _cleanup_run_artifacts(case_dir: str) -> None:
+def _cleanup_run_artifacts(case_dir: str, *, preserve_mesh: bool = False) -> None:
     """Remove disposable outputs before retrying a newly generated case."""
     root = Path(case_dir)
     try:
@@ -156,7 +157,16 @@ def _cleanup_run_artifacts(case_dir: str) -> None:
                 shutil.rmtree(entry)
         except OSError as exc:
             raise RuntimeError(f"Unable to clean prior run artifact {entry}: {exc}") from exc
-    remove_numeric_folders(case_dir)
+    if not preserve_mesh:
+        remove_numeric_folders(case_dir)
+    else:
+        for entry in root.iterdir():
+            try:
+                float(entry.name)
+            except ValueError:
+                continue
+            if entry.name != "0" and not entry.is_symlink() and entry.is_dir() and not any(entry.rglob("polyMesh")):
+                shutil.rmtree(entry)
 
 
 def _execution_output(case_dir: str) -> str:
