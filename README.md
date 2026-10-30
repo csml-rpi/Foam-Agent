@@ -13,8 +13,8 @@ Visit [deepwiki.com/csml-rpi/Foam-Agent](https://deepwiki.com/csml-rpi/Foam-Agen
 
 ## Key Features
 
-- **End-to-End Workflow**: Meshing with OpenFOAM utilities, generated Gmsh meshes or uploaded Gmsh `.msh` files, case generation, local execution or Slurm submission, and optional PyVista visualization. Execution requires the corresponding runtime and infrastructure.
-- **Multi-Agent Workflow**: Architect, Input Writer, Runner, and Reviewer agents collaborate through a LangGraph pipeline with automatic error correction (up to 25 iterations).
+- **End-to-End Workflow**: Meshing (including external Gmsh `.msh` files), case generation, local execution or Slurm submission, and optional PyVista visualization. Execution requires the corresponding runtime and infrastructure.
+- **Multi-Agent Workflow**: Multiple agents collaborate on planning, file generation, execution, and automatic error correction, with up to 25 repair iterations by default.
 - **RAG-Enhanced Generation**: Hierarchical FAISS indices built from OpenFOAM tutorials provide context-specific retrieval for accurate configuration file generation.
 - **Composable Service Architecture**: Core functions are exposed as MCP tools, enabling integration with Claude Code, Cursor, and other agentic systems.
 
@@ -56,30 +56,11 @@ python foambench_main.py --output ./output --prompt_path ./user_requirement.txt
 
 That's it. Foam-Agent will plan the case, generate all OpenFOAM files, run the simulation, and fix errors automatically.
 
-`--output` is used directly; `foambench_main.py` defaults to the repository's `output/` directory. For prompt workflows through the Python API or `src/main.py` without an output directory, each invocation creates a new `run_N` directory under `Config.run_directory` (default `runs/`). Numbering starts at `Config.run_times` (default 1) and skips existing names, preserving earlier runs even when overwrite is enabled.
-
 ### 4. Run an Existing Case
 
-Prompt, external-mesh/material and existing-case inputs share the same main graph:
+An existing directory or ZIP is another Foam-Agent input. Foam-Agent preserves a read-only `original/` copy and creates a writable `work/` copy. It plans mesh operations from the requirements and available files, then prepares the solver setup after the mesh is ready. Existing meshes may be reused or modified according to the plan. Specify `--openfoam_target` when the OpenFOAM version cannot be determined. A configured target conflicting with the detected platform stops the workflow. If required physical information cannot be inferred, planning fails with a reason.
 
-```text
-Preparation -> Meshing Planner -> Meshing -> Solver Planner -> Input Writer
-            -> Local/HPC Runner -> optional Visualization
-```
-
-Preparation creates working copies and supplies file facts. The LLM decides mesh
-operations from the requirement and available files; an existing `polyMesh` or
-uploaded path does not force reuse or regeneration. Solver selection and solver
-reference retrieval happen after the actual mesh is ready. Meshing is an ordinary
-node, not a child graph.
-
-For directory/ZIP imports, Preparation preserves a read-only `original/` copy,
-creates `work/`, and reads the existing files and script. Header evidence selects
-the supported native target; specify `--openfoam_target` when detection is
-inconclusive. A configured/detected target conflict stops before mesh planning.
-Solver Planner decides the minimum physical changes after mesh handoff and
-extracts a solver-only `Allrun`, preserving field preparation and solver arguments.
-If required physical information cannot be inferred, planning fails with a reason.
+After successful mesh preparation, the local and HPC runners clear prior solver outputs, nonzero time directories and partition directories before solver execution, preserving the final mesh. For imported cases, cleanup affects `work/`; the read-only `original/` copy remains available. Cleared outputs are not automatically restored after failure. This workflow does not preserve restart data for continuation runs.
 
 ```bash
 # Preserve the existing physical definition and run it
@@ -91,11 +72,10 @@ python foambench_main.py \
 python foambench_main.py \
   --output ./output/modified-case \
   --case_path /path/to/case \
-  --prompt_path ./requirements.txt \
-  --openfoam_target esi-v2006
+  --prompt_path ./requirements.txt
 ```
 
-The three main input modes are requirements only, an uploaded Gmsh `.msh` with requirements, and an existing case with optional requirements. `--case_path` and `--custom_mesh_path` may be supplied together, with or without an explicit requirements file. Every combination enters Preparation: it imports the case when supplied, copies the uploaded Gmsh mesh into the working case's `input/`, and passes all available file facts and requirements to Meshing Planner. Request visualization in the prompt for either generated or imported cases; the Planner determines whether it is needed.
+Request visualization in the prompt for either generated or imported cases; the Planner determines whether it is needed. `--case_path` and `--custom_mesh_path` can be combined, with or without `--prompt_path`. Foam-Agent plans mesh operations using the supplied inputs before preparing the solver setup.
 
 `--case_path` accepts either a case directory or a ZIP archive. If an archive contains multiple cases, select one explicitly:
 
@@ -106,9 +86,9 @@ python foambench_main.py \
   --case_subdir multiphase/interFoam/laminar/damBreak/damBreak
 ```
 
-The task directory contains `original/`, `work/`, and `report/`. `report/case_context.json` records the initial imported context, and `report/logs/` contains workflow logs; local `Allrun.out`, `Allrun.err`, and solver logs remain in `work/`. The solver-only `Allrun` is executed from `work/`; mesh operations execute earlier in Meshing. Import rejects symbolic links in a source case. Replacing a non-empty output directory requires both Foam-Agent's ownership marker and `--overwrite_output` (or the API's `overwrite_output=true`). Import itself does not impose a command whitelist or rewrite the script.
+The task directory contains `original/`, `work/`, and `report/`. `report/logs/` contains workflow logs; local `Allrun.out`, `Allrun.err`, and solver logs remain in `work/`. Mesh commands run separately before the solver-only `Allrun` is executed from `work/`. Import rejects symbolic links in a source case. Replacing a non-empty output directory requires both Foam-Agent's ownership marker and `--overwrite_output` (or the API's `overwrite_output=true`).
 
-Generated and imported cases share the same review services and configured repair budget. Mesh failures return to the main-graph Reviewer, then Meshing Planner and Meshing for repair. Solver errors return to Reviewer, then Input Writer for physical repairs or Meshing Planner for mesh repairs. Pending solver-file changes survive mesh retries. Planner and Reviewer declare each file's stage rather than routing by its filename. After mesh repair, the mesh planner uses actual results to decide whether Solver Planner must revisit the physics plan. Solver review retains its existing repeated-fingerprint stop rule; mesh review decides whether another repair is justified within the same configured budget. There is no interactive clarification or task-resume step; correct missing inputs identified by a planning failure and start a new run.
+Generated and imported cases both support automatic repair of mesh and solver setup errors. If the workflow cannot continue, it reports the reason. Correct the relevant inputs and start a new run; interactive clarification and resuming interrupted tasks are not currently supported.
 
 If simulation succeeds but requested visualization fails, the workflow reports `partial_success`, `termination_reason=visualization_failed`, and `Simulation completed successfully, but visualization failed.` The CLI exits nonzero; MCP `run_case` returns the message and `visualization_error` separately from execution errors.
 
@@ -179,54 +159,9 @@ The highest reported scores in this table use **Anthropic Claude Opus 4.6**; mod
 
 ## Advanced Usage
 
-### Mesh handoff and execution
-
-Preparation preserves mesh sources, including time-directory and partition
-meshes, until Meshing Planner has selected the operations to perform. The imported
-`original/` remains read-only. After successful mesh handoff, Local/HPC Runner
-clears prior solver outputs, nonzero time directories and partition directories
-before solver execution, preserving the final `constant/polyMesh`. This workflow
-does not preserve restart data for continuation runs.
-
-Meshing requires complete final mesh files in `constant/polyMesh`. For parallel
-reconstruction, the planner declares a final native reconstruction operation
-after the other mesh operations. The executor verifies the declared partition
-sources before removing the old serial mesh; reconstruction must then succeed
-and produce a complete new serial mesh. Those reconstructed partition sources
-may remain until solver cleanup. Other unresolved time/parallel meshes, including
-`0/polyMesh`, return to repair; ordinary initial fields in `0/` are preserved.
-A zero-time directory containing only auxiliary output such as `cellMap` is allowed.
-No latest-time mesh is selected automatically. Tool logs are
-archived per attempt under `.foamagent/mesh-logs/` so retries can execute again.
-
-For HPC requests, native mesh commands run through Slurm before solver planning.
-Only a completed attempt with its own successful exit result permits the next
-stage. Each mesh or solver job uses `Config.max_time_limit` as its total monitoring
-deadline, including time spent queued; local mesh-tool execution limits are unchanged.
-Resource extraction reads the current decomposition settings before each
-stage submission. Explicit submission rejections are repaired using the previous
-script and rejection message, consuming the same repair budget as Reviewer.
-An uncertain submission result stops the workflow rather than resubmitting.
-
-If monitoring expires or fails, the workflow requests cancellation and waits up
-to 60 seconds to confirm that the job has stopped. If this cannot be confirmed,
-it stops with `hpc_job_state_unconfirmed`, retaining the job ID and diagnostic
-paths, without further repairs or submissions. Slurm commands run in the agent's
-existing cluster environment with a shared filesystem; no SSH deployment is added.
-
-The first mesh-file generation precedes tutorial-case retrieval, although
-Allmesh command-help retrieval remains available. Complete imported cases also
-pass through planning and solver-script extraction.
-
 ### Custom Mesh Files
 
-Use `--custom_mesh_path` for an already generated Gmsh `.msh` file (ASCII 2.2), matching Foam-Agent's original custom-mesh input. Preparation copies the supplied file; the LLM selects the mesh operations from the requirement and available files. Existing case-internal `constant/polyMesh` remains supported through case import.
-
-The original `gmsh_mesh` backend still generates and runs Gmsh Python code. External `.geo` execution and independent `polyMesh`-directory upload are not included in this update. Fluent mesh input is deferred to a later SpaceClaim/Fluent integration.
-
-Checks and changes to a case's existing mesh follow the LLM plan. Mesh handoff passes actual boundary text and available evidence to Solver Planner. The absence of a parsed patch summary does not itself fail handoff; a missing required mesh file, including `boundary` or its compressed equivalent, does. Native tool errors enter the existing repair flow. Mesh plans can create or modify files on the first pass, and ordered commands retain repetitions. Allmesh records native output and new or changed logs without assuming log filenames. Meshing Planner decides which startup dictionaries the selected tools require and declares file tasks; execution does not inject default dictionaries. Solver Planner adapts these files to the physical problem where needed.
-
-For example:
+Foam-Agent supports external Gmsh `.msh` files (ASCII 2.2 format). Describe boundary conditions in your prompt and pass the mesh:
 
 ```bash
 python foambench_main.py \
@@ -242,7 +177,7 @@ docker run -it \
   -e FOAMAGENT_MODEL_PROVIDER=openai \
   -e FOAMAGENT_MODEL_VERSION=gpt-5-mini \
   -e OPENAI_API_KEY=your-key-here \
-  -v /path/to/my_mesh.msh:/home/openfoam/Foam-Agent/my_mesh.msh \
+  -v /path/to/tandem_wing.msh:/home/openfoam/Foam-Agent/tandem_wing.msh \
   -p 7860:7860 \
   leoyue123/foamagent
 ```
@@ -312,7 +247,7 @@ Foundation OpenFOAM v10 is the default native target. Set
 
 ### Native target capability parity
 
-`foundation-v10` and `esi-v2006` use the same workflow implementation for prompt planning and RAG, file and Allrun generation, standard/Gmsh/custom meshes, local and HPC execution, review/rewrite, visualization, and existing-case import, with target-specific Docker delivery. This is shared code coverage, not a guarantee that every solver or case succeeds. Their solver names and dictionary syntax remain release-native. All non-CAD graph inputs pass Preparation and mesh planning before Solver Planner selects physical changes; Reviewer supplies file repair plans or mesh retries. `FOAMAGENT_OPENFOAM_FORK=esi` is a legacy translation
+`foundation-v10` and `esi-v2006` use the same workflow implementation for prompt planning and RAG, file and Allrun generation, standard/Gmsh/custom meshes, local and HPC execution, review/rewrite, visualization, and existing-case import, with target-specific Docker delivery. This is shared code coverage, not a guarantee that every solver or case succeeds. Their solver names and dictionary syntax remain release-native. `FOAMAGENT_OPENFOAM_FORK=esi` is a legacy translation
 mode.
 
 Native tutorial corpora are stored by target under `database/`: Foundation v10 uses `database/foundation-v10/{raw,faiss}`, while ESI/OpenCFD v2006 uses `database/esi-v2006/{raw,faiss}`. The sibling `database/script/` directory contains the parsers and FAISS builders shared by both corpora.
@@ -329,7 +264,7 @@ Native tutorial corpora are stored by target under `database/`: Foundation v10 u
 
 #### Claude Code Skill
 
-For Claude Code users who clone this repo, a `/foam` skill is included in `.claude/skills/foam.md`. It orchestrates the MCP tools into a complete workflow:
+For Claude Code users who clone this repo, a `/foam` skill is included in `.claude/skills/foam.md`. This skill is currently written for Foundation OpenFOAM v10. It orchestrates the MCP tools into a complete workflow:
 
 ```
 /foam Simulate lid-driven cavity flow at Re=1000
@@ -379,7 +314,7 @@ For the default native target, install and source **Foundation OpenFOAM v10** ([
 echo $WM_PROJECT_DIR   # should print e.g. /opt/openfoam10
 ```
 
-Then run:
+Before running, configure your provider, model, and credentials as described under "LLM Provider and Model" and "API Keys". If using the default `openai-codex` provider, first complete the sign-in steps under "Codex OAuth Sign-in". Then run:
 
 ```bash
 python foambench_main.py --output ./output --prompt_path ./user_requirement.txt
@@ -387,7 +322,7 @@ python foambench_main.py --output ./output --prompt_path ./user_requirement.txt
 
 ### Native ESI/OpenCFD v2006
 
-Build the isolated ESI v2006 corpus from an ESI v2006 installation, then select the target explicitly. Existing configurations remain unchanged unless this target is supplied.
+Regular users can obtain the provided ESI v2006 corpus and indices with `git lfs pull`; rebuilding is not required. Prepare the matching ESI v2006 runtime, then select the target explicitly. The rebuild command below is for maintainers who need to update the corpus. Existing configurations remain unchanged unless this target is supplied.
 
 ```bash
 # Maintainers: rebuild the versioned v2006 corpus from a sourced ESI/OpenCFD
@@ -415,7 +350,7 @@ The current Foundation corpus has Qwen 0.6B, Qwen 8B, and OpenAI small index dir
 
 The HPC node generates a Slurm script and invokes `sbatch` and `squeue` in the agent's environment. The case path must be accessible to the compute nodes; this code does not upload files or establish an SSH connection. The selected OpenFOAM environment must already be available when the job's runtime guard executes.
 
-An empty `squeue` response ends monitoring, but success also requires the current attempt's zero exit-code record and case-log checks. Monitoring does not query `sacct`. Monitoring failure or deadline expiry triggers cancellation and confirmation that the job has stopped; an unconfirmed stop terminates the workflow with `hpc_job_state_unconfirmed`. See [Mesh handoff and execution](#mesh-handoff-and-execution) for stage deadlines, submission repair and cancellation details.
+Mesh and solver jobs run through Slurm. Queue time counts toward the configured monitoring deadline (`Config.max_time_limit`). If monitoring fails or times out, Foam-Agent attempts to cancel the job. If it reports `hpc_job_state_unconfirmed`, check the job status in Slurm before starting another run. Uncertain submission results do not trigger automatic resubmission.
 
 ### Building the Docker Image from Source
 
@@ -445,7 +380,7 @@ docker run -it foamagent:esi-v2006
 | Problem | Solution |
 |---|---|
 | OpenFOAM environment not found | Ensure the intended OpenFOAM bashrc is sourced. The default path is Foundation v10; `FOAMAGENT_OPENFOAM_TARGET=esi-v2006` requires an ESI v2006 environment at runtime |
-| Database files missing | Ensure the full repo is cloned including `database/`. Native ESI also needs `database/esi-v2006/` built from v2006 tutorials |
+| Database files missing | Install Git LFS and run `git lfs pull` in the repository to download the corpus and indices. Use data matching the OpenFOAM target and configured embedding model; rebuild only when updating the corpus or creating indices not provided by the repository |
 | Missing dependencies | `conda env update -n FoamAgent -f environment.yml --prune` |
 | API key errors | Ensure the appropriate key is set (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.) |
 | MCP connection errors | Verify the container is running and port 7860 is accessible |
