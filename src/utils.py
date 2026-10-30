@@ -755,6 +755,7 @@ class LLMService:
         Returns:
             The LLM response with token usage statistics
         """
+        call_started = time.monotonic()
         self.total_calls += 1
         
         messages = []
@@ -808,7 +809,8 @@ class LLMService:
                 self.total_completion_tokens += completion_tokens
                 self.total_tokens += total_tokens
                 
-                if log_context and self.dataset_recorder.path:
+                if self.dataset_recorder.path:
+                    log_context = log_context or {}
                     self.dataset_recorder.record(
                         step=log_context.get("step", ""),
                         substep=log_context.get("substep", ""),
@@ -818,6 +820,7 @@ class LLMService:
                         user_prompt=user_prompt,
                         response=response_content,
                         model=self.model_version,
+                        duration_seconds=time.monotonic() - call_started,
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                         retrieval_top3_scores=list(self.retrieval_top3_scores),

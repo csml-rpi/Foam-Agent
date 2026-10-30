@@ -89,7 +89,7 @@ python foambench_main.py \
 
 The task directory contains `original/`, `work/`, and `report/`. `report/case_context.json` records the initial imported context, and `report/logs/` contains workflow logs; local `Allrun.out`, `Allrun.err`, and solver logs remain in `work/`. Existing `Allrun` is executed from `work/` unless the repair workflow changes it. Import rejects symbolic links in a source case. Replacing a non-empty output directory requires both Foam-Agent's ownership marker and `--overwrite_output` (or the API's `overwrite_output=true`). Import itself does not impose a command whitelist or rewrite the script.
 
-Generated and imported cases use the same Reviewer → Input Writer → Runner repair loop, with analysis history and the configured retry limit. Meshing failures also enter Reviewer: a file-scoped repair passes through Input Writer and returns to Meshing; without target files, it retries Meshing directly. Successful mesh repair resumes the pending workflow. Reviewer records error fingerprints and stops when consecutive fingerprints of the errors, filtered case files, and user requirement are identical. The graph recursion limit also bounds execution. There is no interactive clarification or task-resume step. If import planning cannot proceed, correct the inputs indicated by the failure reason and start a new run.
+Generated and imported cases use the same Reviewer → Input Writer → Runner repair loop, with analysis history and the configured retry limit. Reviewer diagnoses the current error once, then Input Writer selects and rewrites the necessary files without a separate rewrite-plan call. Meshing failures follow the same analysis and rewrite steps, then return to Meshing before the solver runs. Successful mesh repair resumes the pending workflow. Reviewer records error fingerprints and stops when consecutive fingerprints of the errors, filtered case files, and user requirement are identical. The graph recursion limit also bounds execution. There is no interactive clarification or task-resume step. If import planning cannot proceed, correct the inputs indicated by the failure reason and start a new run.
 
 If simulation succeeds but requested visualization fails, the workflow reports `partial_success`, `termination_reason=visualization_failed`, and `Simulation completed successfully, but visualization failed.` The CLI exits nonzero; MCP `run_case` returns the message and `visualization_error` separately from execution errors.
 
@@ -145,8 +145,11 @@ Set in `src/config.py` via `input_writer_generation_mode`:
 
 ### Review checkpoints and training records
 
-Generated cases use one Reviewer analysis call before rewriting the necessary files.
-Existing cases and mesh repairs retain an explicit file-scoped rewrite plan.
+Generated cases, imported cases, and mesh repairs use one Reviewer analysis call
+before Input Writer selects and rewrites the necessary files. Initial import
+planning can still specify a file-scoped change; subsequent error repairs use the
+current diagnosis rather than the initial plan.
+The standalone MCP `apply_fixes` tool retains its explicit file-scoped plan.
 Reference retrieval requires a matching physical domain and verifies that tutorial
 contents belong to the selected case. Per-file advice guides template reuse and
 pre-solver steps, while user requirements and the configured target take precedence.
@@ -274,7 +277,7 @@ Foundation OpenFOAM v10 is the default native target. Set
 
 ### Native target capability parity
 
-`foundation-v10` and `esi-v2006` use the same workflow implementation for prompt planning and RAG, file and Allrun generation, standard/Gmsh/custom meshes, local and HPC execution, review/rewrite, visualization, and existing-case import, with target-specific Docker delivery. This is shared code coverage, not a guarantee that every solver or case succeeds. Their solver names and dictionary syntax remain release-native. Existing cases use conditional graph routes: Planner selects optional mesh preparation and file modification before running; Reviewer supplies file repair plans or mesh retries. `FOAMAGENT_OPENFOAM_FORK=esi` is a legacy translation
+`foundation-v10` and `esi-v2006` use the same workflow implementation for prompt planning and RAG, file and Allrun generation, standard/Gmsh/custom meshes, local and HPC execution, review/rewrite, visualization, and existing-case import, with target-specific Docker delivery. This is shared code coverage, not a guarantee that every solver or case succeeds. Their solver names and dictionary syntax remain release-native. Existing cases use conditional graph routes: Planner selects optional mesh preparation and file modification before running; Reviewer supplies the error diagnosis for direct file repair and mesh retries. `FOAMAGENT_OPENFOAM_FORK=esi` is a legacy translation
 mode.
 
 Native tutorial corpora are stored by target under `database/`: Foundation v10 uses `database/foundation-v10/{raw,faiss}`, while ESI/OpenCFD v2006 uses `database/esi-v2006/{raw,faiss}`. The sibling `database/script/` directory contains the parsers and FAISS builders shared by both corpora.

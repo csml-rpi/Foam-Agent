@@ -536,7 +536,7 @@ async def apply_fixes(
         
         await ctx.info("Rewriting OpenFOAM files based on review analysis...")
         
-        # Build the same explicit, file-scoped repair plan used by the graph.
+        # This standalone tool retains an explicit, file-scoped repair plan.
         from services.input_writer import rewrite_files
 
         foamfiles = read_case_foamfiles(request.case_dir)

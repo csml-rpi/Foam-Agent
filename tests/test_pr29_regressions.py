@@ -53,7 +53,8 @@ def state_for(case, **kwargs):
     }
 
 
-def test_dataset_basename_and_structured_response(tmp_path, monkeypatch):
+@pytest.mark.parametrize('log_context', [None, {'step': 'rewrite'}])
+def test_dataset_basename_and_structured_response(tmp_path, monkeypatch, log_context):
     monkeypatch.chdir(tmp_path)
     client = LLMService.__new__(LLMService)
     client.dataset_recorder = DatasetRecorder('dataset.jsonl', 'case-A')
@@ -69,11 +70,12 @@ def test_dataset_basename_and_structured_response(tmp_path, monkeypatch):
         with_structured_output=lambda schema: SimpleNamespace(invoke=lambda messages: response),
     )
     assert client.invoke('prompt', 'system', pydantic_obj=FoamPydantic,
-                         log_context={'step': 'rewrite'}) == response
+                         log_context=log_context) == response
     record = json.loads(Path('dataset.jsonl').read_text())
     assert record['case_id'] == 'case-A'
     assert json.loads(record['response']) == {'list_foamfile': []}
     assert record['retrieval_top3_cases'] == ['reference']
+    assert record['duration_seconds'] >= 0
     assert client.total_calls == 1
 
 
@@ -162,19 +164,38 @@ def test_generated_rewrite_without_plan_can_change_files(tmp_path):
     assert (case / 'system/fvSolution').exists()
 
 
-@pytest.mark.parametrize('origin,mesh,expected_calls', [
-    ('generated', False, 1), ('imported', False, 2), ('generated', True, 2),
-])
-def test_reviewer_preserves_strict_case_and_mesh_planning(tmp_path, origin, mesh, expected_calls):
+@pytest.mark.parametrize('origin', ['generated', 'imported'])
+@pytest.mark.parametrize('mesh', [False, True])
+def test_reviewer_uses_direct_repair_for_all_case_origins(tmp_path, origin, mesh):
     node = importlib.import_module('nodes.reviewer_node')
-    from services.review import RewritePlan
     case = make_case(tmp_path / 'case')
-    client = FakeLLM(['Repair the solver configuration', RewritePlan(target_files=[])])
-    state = state_for(case, case_origin=origin, repairing_mesh=mesh, llm_service=client)
+    client = FakeLLM(['Repair the solver configuration'])
+    state = state_for(case, case_origin=origin, repairing_mesh=mesh, llm_service=client,
+                      rewrite_plan={'target_files': [{'file': 'system/controlDict', 'changes': 'Old plan'}]})
     result = node.reviewer_node(state)
-    assert len(client.calls) == expected_calls
-    assert (result['rewrite_plan'] is not None) == (expected_calls == 2)
+    assert len(client.calls) == 1
+    assert result['rewrite_plan'] is None
     assert result['loop_count'] == 1
+
+
+@pytest.mark.parametrize('origin', ['generated', 'imported'])
+def test_direct_mesh_repair_rewrites_before_remeshing(tmp_path, origin):
+    from nodes.input_writer_node import input_writer_node
+    from nodes.reviewer_node import reviewer_node
+    from router_func import route_after_input_writer, route_after_reviewer
+
+    case = make_case(tmp_path / 'case')
+    client = FakeLLM(['Correct the mesh dictionary', FoamPydantic(list_foamfile=[
+        FoamfilePydantic(folder_name='system', file_name='blockMeshDict', content='blocks ();\n'),
+    ])])
+    state = state_for(case, case_origin=origin, repairing_mesh=True, llm_service=client)
+    state.update(reviewer_node(state))
+    assert route_after_reviewer(state) == 'input_writer'
+    state.update(input_writer_node(state))
+    assert (case / 'system/blockMeshDict').read_text() == 'blocks ();\n'
+    assert state['updated_files'] == ['system/blockMeshDict']
+    assert route_after_input_writer(state) == 'meshing'
+    assert len(client.calls) == 2
 
 
 def test_snapshot_restore_preserves_logs_dataset_and_state(tmp_path):
@@ -410,3 +431,27 @@ def test_numpy_retrieval_scores_are_normalized_for_dataset_json(monkeypatch):
     plan.retrieve_references('case', 'icoFoam', 'incompressible', 'laminar', llm_service=client)
     assert type(client.retrieval_top3_scores[0]) is float
     assert json.loads(json.dumps(client.retrieval_top3_scores)) == [0.25]
+
+
+def test_retrieval_keeps_domain_solver_preference_and_same_case_contents(monkeypatch):
+    plan = importlib.import_module('services.plan')
+
+    def candidate(name, domain, solver, score):
+        return {'case_name': name, 'case_domain': domain, 'case_category': 'laminar',
+                'case_solver': solver, 'score': score, 'dir_structure': 'system/controlDict',
+                'full_content': name}
+
+    semantic = candidate('cross-domain', 'compressible', 'rhoCentralFoam', 0.0)
+    wrong_solver = candidate('different-solver', 'incompressible', 'simpleFoam', 0.1)
+    expected = candidate('matching-case', 'incompressible', 'icoFoam', 0.9)
+
+    def retrieve(index, query, **kwargs):
+        if index == 'openfoam_tutorials_structure':
+            return [semantic, wrong_solver, expected]
+        if index == 'openfoam_tutorials_details':
+            return [semantic, expected, wrong_solver]
+        return []
+
+    monkeypatch.setattr(plan, 'retrieve_faiss', retrieve)
+    result = plan.retrieve_references('case', 'icoFoam', 'incompressible', 'laminar')
+    assert result[0] == 'matching-case'

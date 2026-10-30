@@ -210,7 +210,7 @@ def route_after_reviewer(state: GraphState):
         return "restore_best"
 
     print(f"<router>Loop {loop_count}: Continuing to fix errors.</router>")
-    if state.get("repairing_mesh") and not (state.get("rewrite_plan") or {}).get("target_files"):
+    if state.get("repairing_mesh") and state.get("rewrite_plan") is not None and not state["rewrite_plan"].get("target_files"):
         return "meshing"
     return "input_writer"
 
