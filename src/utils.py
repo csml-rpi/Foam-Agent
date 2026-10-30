@@ -1155,6 +1155,7 @@ def run_command(
     max_time_limit: int,
     *,
     openfoam_target: str = "",
+    fail_fast: bool = False,
 ) -> Dict[str, Any]:
     print(f"Executing script {script_path} in {working_dir}")
     script = Path(script_path).expanduser().resolve()
@@ -1193,7 +1194,8 @@ def run_command(
         'active WM_PROJECT_VERSION=${WM_PROJECT_VERSION:-unset}" >&2; exit 64; '
         'fi; '
         'fi; '
-        'exec bash "$foamagent_script"'
+        + ('exec bash -e -o pipefail "$foamagent_script"' if fail_fast
+           else 'exec bash "$foamagent_script"')
     )
 
     timed_out = False

@@ -445,7 +445,7 @@ def run_stage_hpc(state, script, stage, timeout):
     q = lambda p: shlex.quote(str(p))
     wrapper.write_text("#!/bin/bash\n" +
         f"cd {q(case)} || exit 1\n" +
-        f"bash {q(Path(script).resolve())} > {q(out)} 2> {q(err)}\n" +
+        f"bash {'-e -o pipefail ' if stage == 'mesh' else ''}{q(Path(script).resolve())} > {q(out)} 2> {q(err)}\n" +
         "rc=$?\n" + f"printf '%s\\n' \"$rc\" > {q(marker)}.tmp\n" +
         f"mv {q(marker)}.tmp {q(marker)}\nexit \"$rc\"\n")
     wrapper.chmod(0o700)

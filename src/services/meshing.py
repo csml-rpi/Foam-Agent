@@ -216,6 +216,7 @@ def _run_mesh_commands(state, commands):
     result = runner(
         script["allrun_path"], str(case / "Allmesh.out"), str(case / "Allmesh.err"),
         str(case), config.max_time_limit, openfoam_target=runtime_openfoam_target(config),
+        fail_fast=True,
     )
     after, failures = _mesh_log_snapshot(case)
     observations.extend(failures)
