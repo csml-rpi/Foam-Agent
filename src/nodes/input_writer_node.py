@@ -48,6 +48,14 @@ def _rewrite_mode(state):
     out["dir_structure"] = scan_case_directory(state["case_dir"])
     out["foamfiles"] = read_case_foamfiles(state["case_dir"], out["dir_structure"])
 
+    if state.get("error_logs") and not out.get("updated_files") and not state.get("repairing_mesh"):
+        print("Repair made no file changes. Stopping without rerunning the case.")
+        out.update({
+            "error_logs": state["error_logs"],
+            "workflow_status": "failed",
+            "termination_reason": "repair_made_no_progress",
+        })
+
     return out
 
 def _initial_write_mode(state):

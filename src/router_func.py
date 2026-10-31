@@ -157,6 +157,9 @@ def route_after_input_writer(state: GraphState):
     Route after input_writer node based on whether user wants to run on HPC.
     Prefer planner-cached decision to avoid repeated LLM routing jitter.
     """
+    if state.get("termination_reason") == "repair_made_no_progress":
+        return END
+
     if state.get("error_logs"):
         return "reviewer"
 
