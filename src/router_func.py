@@ -202,20 +202,15 @@ def route_after_case_import(state: GraphState):
 
 def route_after_reviewer(state: GraphState):
     """Use the same file-rewrite loop for generated and imported cases."""
-    if state.get("termination_reason") == "repair_made_no_progress":
-        return "restore_best"
     loop_count = state.get("loop_count", 0)
-    if loop_count >= state["config"].max_loop:
-        print(f"<router>Maximum loop count ({state['config'].max_loop}) reached.</router>")
-        return "restore_best"
+    if state.get("termination_reason") == "repair_made_no_progress" or loop_count >= state["config"].max_loop:
+        if loop_count >= state["config"].max_loop:
+            print(f"<router>Maximum loop count ({state['config'].max_loop}) reached.</router>")
+        if state.get("repairing_mesh"):
+            return END
+        return "visualization" if state.get("requires_visualization") else END
 
     print(f"<router>Loop {loop_count}: Continuing to fix errors.</router>")
     if state.get("repairing_mesh") and state.get("rewrite_plan") is not None and not state["rewrite_plan"].get("target_files"):
         return "meshing"
     return "input_writer"
-
-
-def route_after_restore_best(state: GraphState):
-    if state.get("repairing_mesh"):
-        return END
-    return "visualization" if state.get("requires_visualization") else END

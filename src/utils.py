@@ -20,7 +20,6 @@ import random
 from botocore.exceptions import ClientError
 import shutil
 from config import Config
-from dataset_logging import DatasetRecorder
 from openfoam_target import database_path_for_config, require_target_corpus
 from langchain_ollama import ChatOllama
 try:
@@ -451,7 +450,6 @@ class LLMService:
         1) $CODEX_HOME/auth.json (Codex CLI file-based cache)
         2) ~/.codex/auth.json (Codex CLI default)
         3) ~/.clawdbot/agents/main/agent/auth-profiles.json (Clawdbot OpenAI-Codex OAuth cache)
-        4) ~/.openclaw/agents/main/agent/auth-profiles.json (OpenClaw OpenAI-Codex OAuth cache)
 
         Note: These files contain access/refresh tokens. Treat them like passwords.
         """
@@ -471,10 +469,6 @@ class LLMService:
             / "main"
             / "agent"
             / "auth-profiles.json"
-        )
-
-        candidates.append(
-            Path.home() / ".openclaw" / "agents" / "main" / "agent" / "auth-profiles.json"
         )
 
         for p in candidates:
@@ -505,11 +499,6 @@ class LLMService:
         self.temperature = getattr(config, "temperature", 0)
         self.model_provider = getattr(config, "model_provider", "openai")
         self._config = config
-        self.dataset_recorder = DatasetRecorder(
-            getattr(config, "dataset_log_path", ""), getattr(config, "case_id", "")
-        )
-        self.retrieval_top3_scores = []
-        self.retrieval_top3_cases = []
         
         # Initialize statistics
         self.total_calls = 0
@@ -741,8 +730,7 @@ class LLMService:
               user_prompt: str, 
               system_prompt: Optional[str] = None, 
               pydantic_obj: Optional[Type[BaseModel]] = None,
-              max_retries: int = 10,
-              log_context: Optional[dict] = None) -> Any:
+              max_retries: int = 10) -> Any:
         """
         Invoke the LLM with the given prompts and return the response.
         
@@ -755,7 +743,6 @@ class LLMService:
         Returns:
             The LLM response with token usage statistics
         """
-        call_started = time.monotonic()
         self.total_calls += 1
         
         messages = []
@@ -800,7 +787,7 @@ class LLMService:
                     response = response.content
 
                 # Calculate completion tokens
-                response_content = response.model_dump_json() if isinstance(response, BaseModel) else str(response)
+                response_content = str(response)
                 completion_tokens = self.llm.get_num_tokens(response_content)
                 total_tokens = prompt_tokens + completion_tokens
                 
@@ -809,25 +796,8 @@ class LLMService:
                 self.total_completion_tokens += completion_tokens
                 self.total_tokens += total_tokens
                 
-                if self.dataset_recorder.path:
-                    log_context = log_context or {}
-                    self.dataset_recorder.record(
-                        step=log_context.get("step", ""),
-                        substep=log_context.get("substep", ""),
-                        loop_iteration=log_context.get("loop_iteration", 0),
-                        file_target=log_context.get("file_target", ""),
-                        system_prompt=system_prompt or "",
-                        user_prompt=user_prompt,
-                        response=response_content,
-                        model=self.model_version,
-                        duration_seconds=time.monotonic() - call_started,
-                        prompt_tokens=prompt_tokens,
-                        completion_tokens=completion_tokens,
-                        retrieval_top3_scores=list(self.retrieval_top3_scores),
-                        retrieval_top3_cases=list(self.retrieval_top3_cases),
-                    )
                 return response
-
+                
             except Exception as e:
                 if self._is_throttling_error(e):
                     print(f"ThrottlingException occurred: {str(e)}.")
@@ -949,10 +919,6 @@ class GraphState(TypedDict):
     cluster_info: Optional[dict]
     slurm_script_path: Optional[str]
     termination_reason: Optional[str]
-    best_case_snapshot_dir: Optional[str]
-    best_progress_score: Optional[float]
-    best_snapshot_errors: Optional[List[Any]]
-    restored_best_snapshot: bool
     # Existing cases participate in the same planner/writer/runner/reviewer graph.
     workflow_mode: str
     case_origin: str
@@ -1102,7 +1068,7 @@ def scan_case_directory(case_dir: str) -> Dict[str, List[str]]:
         # Do not descend into solver output; a processor* tree holds a full copy of the
         # mesh and every field, and reading it is pure cost.
         if current_depth == base_depth:
-            dirs[:] = [d for d in dirs if d != ".foamagent" and not is_solver_output_dir(d)]
+            dirs[:] = [d for d in dirs if not is_solver_output_dir(d)]
         # Only process directories one level below case_dir
         if current_depth == base_depth + 1:
             folder_name = os.path.relpath(root, case_dir)

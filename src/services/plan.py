@@ -5,7 +5,6 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from utils import retrieve_faiss, parse_directory_structure
 from config import Config
-from dataset_logging import invoke_logged
 from openfoam_target import generation_convention, configured_openfoam_target
 from models import ExistingCasePlan
 from . import global_llm_service
@@ -87,10 +86,7 @@ def parse_requirement_to_case_info(
     )
     parse_user_prompt = f"User requirement: {user_requirement}."
     llm_client = llm_service if llm_service is not None else global_llm_service
-    res = invoke_logged(
-        llm_client, parse_user_prompt, parse_system_prompt, pydantic_obj=CaseSummaryModel,
-        log_context={"step": "plan", "substep": "parse_case_info"},
-    )
+    res = llm_client.invoke(parse_user_prompt, parse_system_prompt, pydantic_obj=CaseSummaryModel)
     raw_case_name = res.case_name.replace(" ", "_")
     try:
         case_name = safe_case_relative_path("", raw_case_name).name
@@ -218,10 +214,7 @@ def _build_advice(
         f"<subtasks>{subtasks}</subtasks>"
     )
     client = llm_service if llm_service is not None else global_llm_service
-    return invoke_logged(
-        client, user_prompt, system_prompt, pydantic_obj=SimilarCaseAdviceModel,
-        log_context={"step": "plan", "substep": "build_advice"},
-    )
+    return client.invoke(user_prompt, system_prompt, pydantic_obj=SimilarCaseAdviceModel)
 
 
 def retrieve_references(case_name: str,
@@ -254,10 +247,6 @@ def retrieve_references(case_name: str,
         **structure_kwargs,
     )
     print(f"Retrieved {len(faiss_structure_all)} candidates from FAISS.")
-    client = llm_service if llm_service is not None else global_llm_service
-    client.retrieval_top3_scores = [float(c["score"]) if c.get("score") is not None else None
-                                   for c in faiss_structure_all[:3]]
-    client.retrieval_top3_cases = [str(c.get("case_name", "")) for c in faiss_structure_all[:3]]
 
     # Hard constraint: domain must match; solver match is a ranking preference.
     domain_matched = [
@@ -357,10 +346,7 @@ def decompose_to_subtasks(
     )
 
     llm_client = llm_service if llm_service is not None else global_llm_service
-    res = invoke_logged(
-        llm_client, decompose_user_prompt, decompose_system_prompt, pydantic_obj=OpenFOAMPlanModel,
-        log_context={"step": "plan", "substep": "decompose_subtasks"},
-    )
+    res = llm_client.invoke(decompose_user_prompt, decompose_system_prompt, pydantic_obj=OpenFOAMPlanModel)
     return [{"file_name": s.file_name, "folder_name": s.folder_name} for s in res.subtasks]
 
 
@@ -568,11 +554,10 @@ def plan_imported_case(state: dict[str, Any]) -> dict[str, Any]:
         f"<openfoam_target>{target}</openfoam_target>"
     )
     llm = state.get("llm_service")
-    response = invoke_logged(llm,
+    response = llm.invoke(
         prompt,
         "Plan the minimum work required for this existing case.",
         pydantic_obj=ExistingCasePlan,
-        log_context={"step": "plan", "substep": "plan_existing_case"},
     )
     plan = _model_dump(response)
     status = plan.get("status", "failed")

@@ -56,8 +56,6 @@ def parse_args():
         action='store_true',
         help="Explicitly allow replacing an existing non-empty output directory."
     )
-    parser.add_argument('--dataset_log_path', default="", help="Path to per-case training JSONL.")
-    parser.add_argument('--case_id', default="", help="Case identifier recorded in the training JSONL.")
     args = parser.parse_args()
     if args.case_subdir and not args.case_path:
         parser.error("--case_subdir requires --case_path.")
@@ -115,10 +113,6 @@ def main():
         main_cmd.extend(["--prompt_path", prompt_path])
     if args.custom_mesh_path:
         main_cmd.extend(["--custom_mesh_path", args.custom_mesh_path])
-    if args.dataset_log_path:
-        main_cmd.extend(["--dataset_log_path", args.dataset_log_path])
-    if args.case_id:
-        main_cmd.extend(["--case_id", args.case_id])
     if args.overwrite_output:
         main_cmd.append("--overwrite_output")
     

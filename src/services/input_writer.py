@@ -5,7 +5,6 @@ from typing import Dict, List, Any, Optional, Callable
 import shutil
 from utils import save_file, parse_context, retrieve_faiss, FoamPydantic, FoamfilePydantic, scan_case_directory, read_case_foamfiles, read_file
 from config import Config
-from dataset_logging import invoke_logged
 from openfoam_target import database_path_for_config
 from . import global_llm_service
 from .case_paths import (
@@ -233,11 +232,7 @@ def initial_write(
                     content=read_file(str(reuse_src)),
                 )
         code_user_prompt, code_system_prompt = _build_prompts(file_name, folder_name, written_files_ctx)
-        generation_response = invoke_logged(
-            llm_client, code_user_prompt, code_system_prompt,
-            log_context={"step": "initial_write", "substep": "generate_file",
-                         "file_target": "/".join(part for part in (folder_name, file_name) if part)},
-        )
+        generation_response = llm_client.invoke(code_user_prompt, code_system_prompt)
         code_context = parse_context(generation_response)
         save_file(str(file_path), code_context)
         return FoamfilePydantic(file_name=file_name, folder_name=folder_name, content=code_context)
@@ -448,10 +443,7 @@ def build_allrun(
 
     if pre_solver_steps:
         command_user_prompt += f"\nRequired pre-solver steps in order: {pre_solver_steps}\n"
-    command_response = invoke_logged(
-        llm_client, command_user_prompt, command_system_prompt, pydantic_obj=CommandsPydantic,
-        log_context={"step": "initial_write", "substep": "allrun_commands"},
-    )
+    command_response = llm_client.invoke(command_user_prompt, command_system_prompt, pydantic_obj=CommandsPydantic)
 
     if progress_callback:
         try:
@@ -508,10 +500,7 @@ def build_allrun(
 
     if pre_solver_steps:
         allrun_user_prompt += f"\nRequired pre-solver steps in order: {pre_solver_steps}\n"
-    allrun_response = invoke_logged(
-        llm_client, allrun_user_prompt, allrun_system_prompt,
-        log_context={"step": "initial_write", "substep": "allrun_script"},
-    )
+    allrun_response = llm_client.invoke(allrun_user_prompt, allrun_system_prompt)
 
     if progress_callback:
         try:
@@ -540,7 +529,6 @@ def rewrite_files(
     openfoam_fork: str = "foundation",
     case_solver: str = "",
     llm_service: Optional[Any] = None,
-    loop_count: int = 0,
 ) -> Dict[str, Any]:
     """
     Rewrite OpenFOAM files based on error analysis and reviewer suggestions.
@@ -668,11 +656,10 @@ def rewrite_files(
         }
 
     llm_client = llm_service if llm_service is not None else global_llm_service
-    response = invoke_logged(llm_client,
+    response = llm_client.invoke(
         rewrite_user_prompt,
         rewrite_system_prompt,
         pydantic_obj=FoamPydantic,
-        log_context={"step": "rewrite", "substep": "rewrite_files", "loop_iteration": loop_count},
     )
 
     updated_dir = {folder: list(files) for folder, files in dir_structure.items()}

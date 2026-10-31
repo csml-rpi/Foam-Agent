@@ -1,6 +1,4 @@
 from utils import save_file
-from dataset_logging import defer_dataset_logging
-from services import global_llm_service
 from services.plan import generate_simulation_plan, plan_imported_case
 from services.output_safety import (
     OutputDirectorySafetyError,
@@ -64,45 +62,43 @@ def planner_node(state):
         except OutputDirectorySafetyError as exc:
             raise ValueError(str(exc)) from exc
 
-    client = state.get("llm_service") or global_llm_service
-    with defer_dataset_logging(client):
-        # Generate simulation plan using the core planning logic
-        plan_data = generate_simulation_plan(
-            user_requirement=user_requirement,
-            case_stats=state["case_stats"],
-            case_dir=getattr(config, "case_dir", ""),
-            searchdocs=getattr(config, "searchdocs", 2),
-            run_directory=getattr(config, "run_directory", None),
-            run_times=getattr(config, "run_times", 1),
-            config=config,
-            llm_service=state.get("llm_service"),
-        )
+    # Generate simulation plan using the core planning logic
+    plan_data = generate_simulation_plan(
+        user_requirement=user_requirement,
+        case_stats=state["case_stats"],
+        case_dir=getattr(config, "case_dir", ""),
+        searchdocs=getattr(config, "searchdocs", 2),
+        run_directory=getattr(config, "run_directory", None),
+        run_times=getattr(config, "run_times", 1),
+        config=config,
+        llm_service=state.get("llm_service"),
+    )
     
-        # Extract plan data
-        case_name = plan_data["case_name"]
-        case_domain = plan_data["case_domain"]
-        case_category = plan_data["case_category"]
-        case_solver = plan_data["case_solver"]
-        case_dir = plan_data["case_dir"]
-        faiss_detailed = plan_data["tutorial_reference"]
-        case_path_reference = plan_data["case_path_reference"]
-        dir_structure_reference = plan_data["dir_structure_reference"]
-        allrun_reference = plan_data["allrun_reference"]
-        subtasks = plan_data["subtasks"]
-        similar_case_advice = plan_data.get("similar_case_advice")
+    # Extract plan data
+    case_name = plan_data["case_name"]
+    case_domain = plan_data["case_domain"]
+    case_category = plan_data["case_category"]
+    case_solver = plan_data["case_solver"]
+    case_dir = plan_data["case_dir"]
+    faiss_detailed = plan_data["tutorial_reference"]
+    case_path_reference = plan_data["case_path_reference"]
+    dir_structure_reference = plan_data["dir_structure_reference"]
+    allrun_reference = plan_data["allrun_reference"]
+    subtasks = plan_data["subtasks"]
+    similar_case_advice = plan_data.get("similar_case_advice")
     
-        # Prepare the known Foam-Agent-owned case directory only after planning.
-        # The preflight above avoids expensive LLM/RAG work when an explicit target
-        # is already unsafe; this call also covers a planner-derived default path.
-        try:
-            case_dir = str(
-                prepare_output_directory(
-                    case_dir,
-                    overwrite=getattr(config, "overwrite_case_dir", False),
-                )
+    # Prepare the known Foam-Agent-owned case directory only after planning.
+    # The preflight above avoids expensive LLM/RAG work when an explicit target
+    # is already unsafe; this call also covers a planner-derived default path.
+    try:
+        case_dir = str(
+            prepare_output_directory(
+                case_dir,
+                overwrite=getattr(config, "overwrite_case_dir", False),
             )
-        except OutputDirectorySafetyError as exc:
-            raise ValueError(str(exc)) from exc
+        )
+    except OutputDirectorySafetyError as exc:
+        raise ValueError(str(exc)) from exc
 
     # Initialize logging now that case_dir exists
     setup_logging(case_dir)

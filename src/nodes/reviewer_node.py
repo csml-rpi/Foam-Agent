@@ -1,5 +1,4 @@
 # reviewer_node.py
-from services.best_snapshot import save_best_snapshot
 from services.review import review_error_logs, error_fingerprint
 from logger import log_review
 from openfoam_target import generation_convention
@@ -19,7 +18,6 @@ def reviewer_node(state):
     # Log error logs to review.log
     log_review(str(state["error_logs"]), "error_logs")
 
-    snapshot_updates = save_best_snapshot(state)
     fingerprint = error_fingerprint(state)
     fingerprints = list(state.get("error_fingerprints") or [])
     repeated = bool(fingerprints and fingerprint == fingerprints[-1])
@@ -28,7 +26,6 @@ def reviewer_node(state):
         print("Repair made no progress: errors and case inputs are unchanged.")
         print("</reviewer>")
         return {
-            **snapshot_updates,
             "error_fingerprints": fingerprints,
             "workflow_status": "failed",
             "termination_reason": "repair_made_no_progress",
@@ -43,7 +40,6 @@ def reviewer_node(state):
         user_requirement=state.get('user_requirement', ''),
         similar_case_advice=state.get('similar_case_advice'),
         history_text=history_text,
-        loop_count=state.get("loop_count", 0),
         llm_service=state.get("llm_service"),
         openfoam_target=generation_convention(state["config"]),
     )
@@ -62,7 +58,6 @@ def reviewer_node(state):
 
     next_loop_count = state.get("loop_count", 0) + 1
     result = {
-        **snapshot_updates,
         "error_fingerprints": fingerprints,
         "history_text": updated_history,
         "review_analysis": review_content,

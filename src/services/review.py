@@ -6,7 +6,6 @@ from typing import List, Optional, Tuple, Any
 from pydantic import BaseModel, Field
 from models import PlannedFileChange
 from . import global_llm_service
-from dataset_logging import invoke_logged
 
 
 class RewritePlan(BaseModel):
@@ -34,7 +33,6 @@ def review_error_logs(
     history_text: Optional[List[str]] = None,
     llm_service: Optional[Any] = None,
     openfoam_target: str = "",
-    loop_count: int = 0,
 ) -> Tuple[str, List[str]]:
     """Stateless reviewer: returns (review_analysis, updated_history)."""
     advice_text = ""
@@ -63,10 +61,9 @@ def review_error_logs(
         )
 
     llm_client = llm_service if llm_service is not None else global_llm_service
-    review_response = invoke_logged(llm_client,
+    review_response = llm_client.invoke(
         reviewer_user_prompt,
         _reviewer_system_prompt(openfoam_target),
-        log_context={"step": "review_analysis", "substep": "error_analysis", "loop_iteration": loop_count},
     )
     review_content = review_response
 
@@ -118,11 +115,10 @@ def generate_rewrite_plan(
     )
 
     llm_client = llm_service if llm_service is not None else global_llm_service
-    response = invoke_logged(llm_client,
+    response = llm_client.invoke(
         planner_user_prompt,
         planner_system_prompt,
         pydantic_obj=RewritePlan,
-        log_context={"step": "review_analysis", "substep": "rewrite_plan"},
     )
     return response.model_dump()
 
@@ -130,17 +126,10 @@ def generate_rewrite_plan(
 def error_fingerprint(state: dict[str, Any]) -> str:
     """Compare errors and case inputs, excluding changing runtime outputs."""
     case = Path(state.get("case_dir") or "").resolve()
-    dataset_path = getattr(state.get("config"), "dataset_log_path", "")
-    dataset_relative = None
-    if dataset_path:
-        try:
-            dataset_relative = Path(dataset_path).expanduser().resolve().relative_to(case).as_posix()
-        except ValueError:
-            pass
     files = snapshot_files(case, exclude_runtime=True)
     inputs = {
         name: digest for name, digest in files.items()
-        if name != dataset_relative and not _is_runtime_artifact(name)
+        if not _is_runtime_artifact(name)
     }
     payload = {
         "errors": state.get("error_logs") or [],

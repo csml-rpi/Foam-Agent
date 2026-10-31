@@ -13,7 +13,6 @@ from nodes.meshing_node import meshing_node
 from nodes.input_writer_node import input_writer_node
 from nodes.local_runner_node import local_runner_node
 from nodes.reviewer_node import reviewer_node
-from nodes.restore_best_node import restore_best_node
 from nodes.visualization_node import visualization_node
 from nodes.hpc_runner_node import hpc_runner_node
 from nodes.imported_case_node import case_import_node
@@ -24,7 +23,6 @@ from router_func import (
     route_after_input_writer,
     route_after_runner,
     route_after_reviewer,
-    route_after_restore_best,
     route_workflow_entry,
 )
 from logger import close_logging
@@ -50,7 +48,6 @@ def create_foam_agent_graph() -> StateGraph:
     workflow.add_node("local_runner", local_runner_node)
     workflow.add_node("hpc_runner", hpc_runner_node)
     workflow.add_node("reviewer", reviewer_node)
-    workflow.add_node("restore_best", restore_best_node)
     workflow.add_node("visualization", visualization_node)
     workflow.add_node("case_import", case_import_node)
     
@@ -62,7 +59,6 @@ def create_foam_agent_graph() -> StateGraph:
     workflow.add_conditional_edges("hpc_runner", route_after_runner)
     workflow.add_conditional_edges("local_runner", route_after_runner)
     workflow.add_conditional_edges("reviewer", route_after_reviewer)
-    workflow.add_conditional_edges("restore_best", route_after_restore_best)
     workflow.add_conditional_edges("case_import", route_after_case_import)
     workflow.add_edge("visualization", END)
     
@@ -121,10 +117,6 @@ def initialize_state(
         cluster_info=None,
         slurm_script_path=None,
         termination_reason=None,
-        best_case_snapshot_dir=None,
-        best_progress_score=None,
-        best_snapshot_errors=None,
-        restored_best_snapshot=False,
         workflow_mode=workflow_mode,
         case_origin="generated" if workflow_mode == "prompt" else "imported",
         user_requirement_explicit=user_requirement_explicit,
@@ -267,8 +259,6 @@ if __name__ == "__main__":
         help="Explicitly allow replacing an existing non-empty output directory.",
     )
     
-    parser.add_argument("--dataset_log_path", default="", help="Path to per-case training JSONL.")
-    parser.add_argument("--case_id", default="", help="Case identifier recorded in the training JSONL.")
     args = parser.parse_args()
     print(f"args: {args}")
     
@@ -291,8 +281,6 @@ if __name__ == "__main__":
         config.reuse_generated_dir = args.reuse_generated_dir
     
     config.overwrite_case_dir = args.overwrite_output
-    config.dataset_log_path = args.dataset_log_path
-    config.case_id = args.case_id
 
     if args.case_path:
         if args.reuse_generated_dir:

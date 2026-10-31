@@ -91,7 +91,7 @@ The task directory contains `original/`, `work/`, and `report/`. `report/case_co
 
 Generated and imported cases use the same Reviewer → Input Writer → Runner repair loop, with analysis history and the configured retry limit. Reviewer diagnoses the current error once, then Input Writer selects and rewrites the necessary files without a separate rewrite-plan call. Meshing failures follow the same analysis and rewrite steps, then return to Meshing before the solver runs. Successful mesh repair resumes the pending workflow. Reviewer records error fingerprints and stops when consecutive fingerprints of the errors, filtered case files, and user requirement are identical. The graph recursion limit also bounds execution. There is no interactive clarification or task-resume step. If import planning cannot proceed, correct the inputs indicated by the failure reason and start a new run.
 
-When repair reaches its retry limit or makes no progress, the workflow restores the furthest recorded attempt and still reports failure.
+When repair reaches its retry limit or makes no progress, the workflow reports failure and leaves the last attempt's files and logs in place.
 
 If simulation succeeds but requested visualization fails, the workflow reports `partial_success`, `termination_reason=visualization_failed`, and `Simulation completed successfully, but visualization failed.` The CLI exits nonzero; MCP `run_case` returns the message and `visualization_error` separately from execution errors.
 

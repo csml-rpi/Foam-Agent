@@ -28,7 +28,6 @@ def _rewrite_mode(state):
         print("</input_writer>")
         return state
     out = rewrite_files(
-        loop_count=state.get("loop_count", 0),
         case_dir=state["case_dir"],
         error_logs=state.get("error_logs", []),
         review_analysis=state.get("review_analysis", ""),

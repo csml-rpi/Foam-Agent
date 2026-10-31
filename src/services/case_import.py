@@ -280,8 +280,7 @@ def snapshot_files(root: str | Path, *, exclude_runtime: bool = False) -> dict[s
         paths = []
         for directory, names, files in os.walk(root, followlinks=False):
             if Path(directory) == root:
-                names[:] = [name for name in names
-                            if name != ".foamagent" and not is_solver_output_dir(name)]
+                names[:] = [name for name in names if not is_solver_output_dir(name)]
             paths.extend(Path(directory) / name for name in files)
     else:
         paths = root.rglob("*")
