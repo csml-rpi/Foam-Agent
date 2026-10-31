@@ -10,18 +10,21 @@ from langchain.chat_models import init_chat_model
 from langchain_community.vectorstores import FAISS
 from langchain_openai.embeddings import OpenAIEmbeddings
 import tiktoken
-from langchain_aws import ChatBedrockConverse
 from langchain_anthropic import ChatAnthropic
 from pathlib import Path
-import tracking_aws
 import requests
 import time
 import random
-from botocore.exceptions import ClientError
 import shutil
 from config import Config
 from openfoam_target import database_path_for_config, require_target_corpus
-from langchain_ollama import ChatOllama
+try:
+    from botocore.exceptions import ClientError
+except ImportError:
+    _AWS_CLIENT_ERRORS = ()
+else:
+    _AWS_CLIENT_ERRORS = (ClientError,)
+
 try:
     from langchain_huggingface import HuggingFaceEmbeddings
 except ImportError:
@@ -510,6 +513,9 @@ class LLMService:
         
         # Initialize the LLM
         if self.model_provider.lower() == "bedrock":
+            from langchain_aws import ChatBedrockConverse
+            import tracking_aws
+
             bedrock_runtime = tracking_aws.new_default_client()
             self.llm = ChatBedrockConverse(
                 client=bedrock_runtime, 
@@ -552,6 +558,8 @@ class LLMService:
                 stream=True,
             )
         elif self.model_provider.lower() == "ollama":
+            from langchain_ollama import ChatOllama
+
             try:
                 requests.get("http://localhost:11434/api/version", timeout=2)
                 # If request successful, service is running
@@ -598,7 +606,7 @@ class LLMService:
             True if it's a throttling error, False otherwise
         """
         # Check ClientError with specific error codes
-        if isinstance(error, ClientError):
+        if isinstance(error, _AWS_CLIENT_ERRORS):
             error_code = error.response.get('Error', {}).get('Code', '')
             return error_code in ('Throttling', 'TooManyRequestsException', 'ThrottlingException')
         
@@ -825,7 +833,7 @@ class LLMService:
 
                     # Non-throttling error: log and raise
                     print(f"Error occurred in LLM service: {str(e)}")
-                    if isinstance(e, ClientError):
+                    if isinstance(e, _AWS_CLIENT_ERRORS):
                         print(e.response)
                     self.failed_calls += 1
                     raise e

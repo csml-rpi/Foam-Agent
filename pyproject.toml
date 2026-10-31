@@ -59,6 +59,7 @@ namespaces = true
 
 [tool.setuptools.package-data]
 "*" = ["*.json", "*.md"]
+"src" = ["codex_instructions_default.txt"]
 
 [tool.pytest.ini_options]
 markers = [

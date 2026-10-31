@@ -729,36 +729,6 @@ async def visualization(
 
 
 if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="FastMCP OpenFOAM Agent Server")
-    parser.add_argument(
-        "--transport",
-        choices=["stdio", "http"],
-        default="http",
-        help="Transport method (default: http)"
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=7860,
-        help="Port for HTTP transport (default: 7860)"
-    )
-    parser.add_argument(
-        "--host",
-        default="localhost",
-        help="Host for HTTP transport (default: localhost)"
-    )
-    
-    args = parser.parse_args()
-    
-    if args.transport == "stdio":
-        mcp.run("stdio")
-    else:
-        # Configure uvicorn with correct websockets setting
-        uvicorn_config = {"ws": "websockets"}
-        mcp.run("http", host=args.host, port=args.port, uvicorn_config=uvicorn_config)
+    from src.mcp.cli import main
 
-
-# run the server:
-# python -m src.mcp.fastmcp_server --transport http --host 0.0.0.0 --port 7860
+    main(server=mcp, default_transport="http", default_host="localhost")

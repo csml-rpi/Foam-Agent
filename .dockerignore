@@ -6,12 +6,30 @@ output/
 logs/
 .venv/
 
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+CLAUDE.md
+PR_DESCRIPTION.md
+usage_nrel_aws.json
+.claude/settings.local.json
+.claude/memory/
+
 # Exclude Python cache files
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.coverage*
+htmlcov/
 
 # Exclude git files
 .git/
@@ -30,8 +48,4 @@ __pycache__/
 *.tmp
 *.bak
 
-# Exclude database files (will be generated in container)
-# Uncomment if you want to exclude pre-built database files
-# database/faiss/
-# database/raw/
-
+# Target corpora under database/ are required in the build context.
