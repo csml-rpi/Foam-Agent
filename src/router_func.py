@@ -157,6 +157,9 @@ def route_after_input_writer(state: GraphState):
     Route after input_writer node based on whether user wants to run on HPC.
     Prefer planner-cached decision to avoid repeated LLM routing jitter.
     """
+    if state.get("termination_reason") == "repair_made_no_progress":
+        return END
+
     if state.get("error_logs"):
         return "reviewer"
 
@@ -202,20 +205,15 @@ def route_after_case_import(state: GraphState):
 
 def route_after_reviewer(state: GraphState):
     """Use the same file-rewrite loop for generated and imported cases."""
-    if state.get("termination_reason") == "repair_made_no_progress":
-        return END
     loop_count = state.get("loop_count", 0)
-    if loop_count >= state["config"].max_loop:
-        print(f"<router>Maximum loop count ({state['config'].max_loop}) reached. Ending workflow.</router>")
+    if state.get("termination_reason") == "repair_made_no_progress" or loop_count >= state["config"].max_loop:
+        if loop_count >= state["config"].max_loop:
+            print(f"<router>Maximum loop count ({state['config'].max_loop}) reached.</router>")
         if state.get("repairing_mesh"):
             return END
-        requires_visualization = state.get("requires_visualization")
-        if requires_visualization is None:
-            requires_visualization = llm_requires_visualization(state)
-            state["requires_visualization"] = requires_visualization
-        return "visualization" if requires_visualization else END
+        return "visualization" if state.get("requires_visualization") else END
 
     print(f"<router>Loop {loop_count}: Continuing to fix errors.</router>")
-    if state.get("repairing_mesh") and not (state.get("rewrite_plan") or {}).get("target_files"):
+    if state.get("repairing_mesh") and state.get("rewrite_plan") is not None and not state["rewrite_plan"].get("target_files"):
         return "meshing"
     return "input_writer"

@@ -1,5 +1,5 @@
 # reviewer_node.py
-from services.review import review_error_logs, generate_rewrite_plan, error_fingerprint
+from services.review import review_error_logs, error_fingerprint
 from logger import log_review
 from openfoam_target import generation_convention
 
@@ -50,19 +50,9 @@ def reviewer_node(state):
         review_content = (
             "Mesh preprocessing failed. After any file edits, the workflow will retry "
             "meshing with this feedback before running the solver. "
-            "Return an empty target_files list if only mesh regeneration is needed.\n"
+            "Preserve all user-specified physical conditions.\n"
             + review_content
         )
-
-    rewrite_plan = generate_rewrite_plan(
-        foamfiles=state.get('foamfiles'),
-        error_logs=state.get('error_logs', []),
-        review_analysis=review_content,
-        llm_service=state.get("llm_service"),
-        openfoam_target=generation_convention(state["config"]),
-        user_requirement=state.get('user_requirement', ''),
-    )
-    log_review(str(rewrite_plan), "rewrite_plan")
 
     print("</reviewer>")
 
@@ -71,7 +61,8 @@ def reviewer_node(state):
         "error_fingerprints": fingerprints,
         "history_text": updated_history,
         "review_analysis": review_content,
-        "rewrite_plan": rewrite_plan,
+        # Clear any initial import plan so repair can address the current error.
+        "rewrite_plan": None,
         "loop_count": next_loop_count,
         "input_writer_mode": "rewrite",
     }

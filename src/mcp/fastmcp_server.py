@@ -195,16 +195,6 @@ async def input_writer(
 
         await ctx.info(f"Case info: {case_info}")
 
-        # Retrieve references
-        tutorial_reference, _, _, allrun_reference, similar_case_advice = retrieve_references(
-            case_name=case_info["case_name"],
-            case_solver=case_info["case_solver"],
-            case_domain=case_info["case_domain"],
-            case_category=case_info["case_category"],
-            searchdocs=global_config.searchdocs,
-            config=global_config,
-        )
-
         # Convert subtasks format from {file, folder} to {file_name, folder_name}
         converted_subtasks = []
         for st in request.subtasks:
@@ -221,6 +211,18 @@ async def input_writer(
                     raise ValueError(f"Invalid subtask format: {st}. Must have 'file'/'file_name' and 'folder'/'folder_name'")
             else:
                 raise ValueError(f"Invalid subtask type: {type(st)}. Expected dict, got {st}")
+
+        # Retrieve references
+        tutorial_reference, _, _, allrun_reference, similar_case_advice = retrieve_references(
+            case_name=case_info["case_name"],
+            case_solver=case_info["case_solver"],
+            case_domain=case_info["case_domain"],
+            case_category=case_info["case_category"],
+            searchdocs=global_config.searchdocs,
+            config=global_config,
+            user_requirement=request.user_requirement,
+            subtasks=converted_subtasks,
+        )
 
         await ctx.info(f"converted_subtasks: {converted_subtasks}")
 
@@ -534,7 +536,7 @@ async def apply_fixes(
         
         await ctx.info("Rewriting OpenFOAM files based on review analysis...")
         
-        # Build the same explicit, file-scoped repair plan used by the graph.
+        # This standalone tool retains an explicit, file-scoped repair plan.
         from services.input_writer import rewrite_files
 
         foamfiles = read_case_foamfiles(request.case_dir)

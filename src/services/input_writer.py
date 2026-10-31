@@ -142,6 +142,8 @@ def initial_write(
     written_files = []
     dir_structure = {}
     generation_contract = _generation_contract(openfoam_fork)
+    advice = similar_case_advice.model_dump() if hasattr(similar_case_advice, "model_dump") else similar_case_advice
+    pre_solver_steps = advice.get("pre_solver_steps", []) if isinstance(advice, dict) else []
     INITIAL_WRITE_SYSTEM_PROMPT = (
         "You are an expert in OpenFOAM simulation and numerical modeling."
         "Your task is to generate a complete and functional file named: <file_name>{file_name}</file_name> within the <folder_name>{folder_name}</folder_name> directory. "
@@ -163,17 +165,21 @@ def initial_write(
             case_solver=case_solver,
             generation_contract=generation_contract,
         )
-        if isinstance(similar_case_advice, dict):
-            advice_text = (
-                f"Similar case match level: {similar_case_advice.get('match_level')}\n"
-                f"Use scope: {similar_case_advice.get('use_scope')}\n"
-                f"Advice: {similar_case_advice.get('advice')}\n"
-            )
-        else:
-            advice_text = str(similar_case_advice or "")
+        advice_text = ""
+        file_reference = tutorial_reference
+        if isinstance(advice, dict) and "per_file" in advice:
+            file_advice = next((item for item in advice["per_file"]
+                                if item.get("folder_name", "").strip("/.") == folder_name.strip("/.")
+                                and item.get("file_name") == file_name), None)
+            if file_advice:
+                advice_text = f"<file_advice>{file_advice}</file_advice>\n"
+                if file_advice.get("classification") in {"present_but_unused", "write_fresh"}:
+                    file_reference = ""
+        elif advice:
+            advice_text = f"<similar_case_advice>{advice}</similar_case_advice>\n"
         similar_ref_block = (
-            f"Refer to the following similar case file content if helpful:\n<similar_case_reference>{tutorial_reference}</similar_case_reference>\n"
-            if tutorial_reference else "No suitable similar case was found for this domain.\n"
+            f"<similar_case_reference>{file_reference}</similar_case_reference>\n"
+            if file_reference else "Generate this file from the user requirement and compatibility contract.\n"
         )
 
         code_user_prompt = (
@@ -289,6 +295,7 @@ def initial_write(
             llm_service=llm_client,
             config=config,
             openfoam_fork=openfoam_fork,
+            pre_solver_steps=pre_solver_steps,
         )
         # ``FoamfilePydantic`` stores paths relative to ``case_dir``.  Keeping
         # Allrun at the case root makes this entry safe to reuse in a later
@@ -322,6 +329,7 @@ def build_allrun(
     llm_service: Optional[Any] = None,
     config: Optional[Config] = None,
     openfoam_fork: str = "foundation",
+    pre_solver_steps: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Build an Allrun script for automated OpenFOAM simulation execution.
@@ -433,6 +441,8 @@ def build_allrun(
     
     command_system_prompt += "\n" + _generation_contract(openfoam_fork)
 
+    if pre_solver_steps:
+        command_user_prompt += f"\nRequired pre-solver steps in order: {pre_solver_steps}\n"
     command_response = llm_client.invoke(command_user_prompt, command_system_prompt, pydantic_obj=CommandsPydantic)
 
     if progress_callback:
@@ -488,6 +498,8 @@ def build_allrun(
 
     allrun_system_prompt += "\n" + _generation_contract(openfoam_fork)
 
+    if pre_solver_steps:
+        allrun_user_prompt += f"\nRequired pre-solver steps in order: {pre_solver_steps}\n"
     allrun_response = llm_client.invoke(allrun_user_prompt, allrun_system_prompt)
 
     if progress_callback:
@@ -594,14 +606,18 @@ def rewrite_files(
             case_solver = application.group(1) if application else ""
             break
     generation_contract = _generation_contract(openfoam_fork)
+    plan_instruction = (
+        "Follow rewrite_plan strictly: only modify its target_files and apply only the requested changes. "
+        if rewrite_plan is not None else
+        "Return only files that require a change or addition to resolve the review analysis; preserve all other files. "
+    )
     rewrite_system_prompt = (
         "You are an expert in OpenFOAM simulation and numerical modeling. "
         "Modify files only as required by the repair context and user requirement. "
         "Changes explicitly requested by the user are allowed; preserve every other existing "
         "physical condition unless the plan explicitly requires a technical correction. "
-        "You will receive a rewrite_plan. Follow it strictly: only modify files listed in rewrite_plan.target_files and apply only the requested changes. "
-        "Do not modify files outside the plan. "
-        f"The selected solver is {case_solver or 'not specified'}. "
+        + plan_instruction
+        + f"The selected solver is {case_solver or 'not specified'}. "
         "Apply this OpenFOAM compatibility contract to every rewritten file:\n"
         f"{generation_contract}\n"
         "Return complete corrected files as JSON: "
@@ -616,8 +632,7 @@ def rewrite_files(
         f"<user_requirement>{user_requirement}</user_requirement>\n"
         f"<openfoam_fork>{openfoam_fork}</openfoam_fork>\n"
         f"<case_solver>{case_solver}</case_solver>\n"
-        "Please update OpenFOAM files according to rewrite_plan only. "
-        "Only include files from rewrite_plan.target_files in your output."
+        + plan_instruction
     )
 
     allowed_files: set[str] = set()
@@ -630,7 +645,7 @@ def rewrite_files(
                 allowed_files.add(safe_case_relative_from_text(file_path).as_posix())
             except CasePathSafetyError as exc:
                 raise ValueError(f"Unsafe rewrite target in plan: {file_path!r}") from exc
-    if not allowed_files:
+    if rewrite_plan is not None and not allowed_files:
         print("Warning: rewrite_plan.target_files is empty; no files to rewrite, leaving case unchanged.")
         return {
             "dir_structure": dir_structure,
@@ -664,7 +679,7 @@ def rewrite_files(
                 f"{foamfile.folder_name!r}/{foamfile.file_name!r}"
             ) from exc
         relative_path = relative.as_posix()
-        if relative_path not in allowed_files:
+        if rewrite_plan is not None and relative_path not in allowed_files:
             print(f"Warning: Skipping unplanned rewrite file: {relative_path}")
             continue
         folder_name = "" if relative.parent.as_posix() == "." else relative.parent.as_posix()

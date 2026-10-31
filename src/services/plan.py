@@ -1,6 +1,6 @@
 import os
 import re
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, Literal
 from pathlib import Path
 from pydantic import BaseModel, Field
 from utils import retrieve_faiss, parse_directory_structure
@@ -149,10 +149,17 @@ def resolve_case_dir(
     return os.path.join(base_dir, case_name)
 
 
+class PerFileAdvice(BaseModel):
+    folder_name: str = Field(description="Directory of the file relative to the case")
+    file_name: str = Field(description="Basename of the input file")
+    classification: Literal["reuse", "modify", "present_but_unused", "write_fresh"]
+    delta: Optional[str] = Field(default=None, description="Specific user-required changes when classification is modify")
+
+
 class SimilarCaseAdviceModel(BaseModel):
-    match_level: str = Field(description="high/medium/low/none")
-    use_scope: str = Field(description="short guidance about which files can use the reference")
-    advice: str = Field(description="one-sentence advice to include in prompts")
+    pre_solver_steps: List[str] = Field(default_factory=list)
+    solver: str = ""
+    per_file: List[PerFileAdvice] = Field(default_factory=list)
 
 
 _DETAIL_RECALL_FLOOR = 50
@@ -183,36 +190,31 @@ def _rerank_candidates(
 def _build_advice(
     user_requirement: str,
     case_info: str,
-    selected: Optional[Dict[str, Any]],
-    candidates: List[Dict[str, Any]],
+    faiss_detailed: str,
+    subtasks: List[Dict[str, str]],
     llm_service: Optional[Any] = None,
 ) -> SimilarCaseAdviceModel:
-    cand_lines = [
-        f"- {c.get('case_name')} | {c.get('case_domain')} | {c.get('case_category')} | {c.get('case_solver')} | score={c.get('score')}"
-        for c in candidates[:5]
-    ]
-    cand_block = "\n".join(cand_lines) if cand_lines else "(none)"
-
-    selected_line = (
-        f"{selected.get('case_name')} | {selected.get('case_domain')} | {selected.get('case_category')} | {selected.get('case_solver')} | score={selected.get('score')}"
-        if selected else "(none)"
-    )
-
-    sys_prompt = (
-        "You are a CFD expert. Based on the user requirement and the retrieved similar cases, "
-        "produce a concise usage guidance. If no suitable case is available, set match_level to 'none' "
-        "and advise not to rely on similar case templates."
+    if not faiss_detailed or not subtasks:
+        return SimilarCaseAdviceModel(per_file=[
+            PerFileAdvice(**task, classification="write_fresh") for task in subtasks
+        ])
+    system_prompt = (
+        "You are a CFD expert. Classify how each reference file should be used to meet the user requirement. "
+        "reuse: use its structure with only user-required changes; "
+        "modify: retain its structure and describe required changes in delta; "
+        "present_but_unused: the reference file does not apply, generate from scratch; "
+        "write_fresh: no useful reference exists, generate from scratch. "
+        "Identify required pre_solver_steps in execution order and the requested solver. "
+        "User requirements and the configured OpenFOAM target take precedence over the tutorial."
     )
     user_prompt = (
-        f"User requirement:\n{user_requirement}\n\n"
-        f"Case info:\n{case_info}\n\n"
-        f"Selected similar case:\n{selected_line}\n\n"
-        f"Top candidates:\n{cand_block}\n\n"
-        "Return JSON with keys: match_level (high/medium/low/none), use_scope, advice."
+        f"<user_requirement>{user_requirement}</user_requirement>\n"
+        f"<case_info>{case_info}</case_info>\n"
+        f"<tutorial_reference>{faiss_detailed}</tutorial_reference>\n"
+        f"<subtasks>{subtasks}</subtasks>"
     )
-
-    llm_client = llm_service if llm_service is not None else global_llm_service
-    return llm_client.invoke(user_prompt, sys_prompt, pydantic_obj=SimilarCaseAdviceModel)
+    client = llm_service if llm_service is not None else global_llm_service
+    return client.invoke(user_prompt, system_prompt, pydantic_obj=SimilarCaseAdviceModel)
 
 
 def retrieve_references(case_name: str,
@@ -222,7 +224,8 @@ def retrieve_references(case_name: str,
                         searchdocs: int = 2,
                         user_requirement: str = "",
                         config: Optional[Config] = None,
-                        llm_service: Optional[Any] = None) -> Tuple[str, str, str, str, SimilarCaseAdviceModel]:
+                        llm_service: Optional[Any] = None,
+                        subtasks: Optional[List[Dict[str, str]]] = None) -> Tuple[str, str, str, str, SimilarCaseAdviceModel]:
     # Build case_info
     case_info = f"case name: {case_name}\ncase domain: {case_domain}\ncase category: {case_category}\ncase solver: {case_solver}"
     print("Retrieval query:\n" + case_info)
@@ -254,8 +257,7 @@ def retrieve_references(case_name: str,
 
     if not domain_matched:
         print(f"No suitable similar case found under domain={case_domain}.")
-        advice = _build_advice(user_requirement, case_info, None, faiss_structure_all, llm_service)
-        return "", "", "", "", advice
+        return "", "", "", "", _build_advice(user_requirement, case_info, "", subtasks or [], llm_service)
 
     # Rerank by solver match, then semantic score.
     ranked = _rerank_candidates(domain_matched, case_solver)
@@ -263,8 +265,7 @@ def retrieve_references(case_name: str,
     dir_structure = _extract_directory_structure(selected)
     if not dir_structure:
         print("Warning: No directory_structure found in selected similar case.")
-        advice = _build_advice(user_requirement, case_info, selected, ranked, llm_service)
-        return "", "", "", "", advice
+        return "", "", "", "", _build_advice(user_requirement, case_info, "", subtasks or [], llm_service)
 
     # The structure index only contains the file tree.  Fetch the exact same
     # metadata identity from the details index before exposing file contents.
@@ -307,7 +308,7 @@ def retrieve_references(case_name: str,
     for idx, item in enumerate(faiss_allrun):
         allrun_reference += f"<similar_case_{idx + 1}>{item['full_content']}</similar_case_{idx + 1}>\n\n\n"
 
-    advice = _build_advice(user_requirement, case_info, selected, ranked, llm_service)
+    advice = _build_advice(user_requirement, case_info, faiss_detailed, subtasks or [], llm_service)
     return faiss_detailed, dir_structure, dir_counts_str, allrun_reference, advice
 
 
@@ -414,7 +415,7 @@ def generate_simulation_plan(
     )
     
     # Step 3: Retrieve references
-    faiss_detailed, dir_structure, dir_counts_str, allrun_reference, advice = retrieve_references(
+    faiss_detailed, dir_structure, dir_counts_str, allrun_reference, _ = retrieve_references(
         case_name=case_name,
         case_solver=case_solver,
         case_domain=case_domain,
@@ -437,6 +438,14 @@ def generate_simulation_plan(
     if len(subtasks) == 0:
         raise ValueError("Failed to generate subtasks.")
     
+    advice = _build_advice(
+        user_requirement,
+        f"{case_info}; OpenFOAM target: {target_convention}",
+        faiss_detailed,
+        subtasks,
+        llm_service,
+    )
+
     # Prepare reference file path
     case_path_reference = os.path.join(resolved_case_dir, "similar_case.txt")
     

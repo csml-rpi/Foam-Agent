@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
@@ -269,13 +270,22 @@ def _discovery_issues(case_root: Path) -> list[str]:
     return issues
 
 
-def snapshot_files(root: str | Path) -> dict[str, str]:
+def snapshot_files(root: str | Path, *, exclude_runtime: bool = False) -> dict[str, str]:
     root = Path(root)
     snapshot: dict[str, str] = {}
     if not root.is_dir():
         return snapshot
-    for path in sorted(root.rglob("*")):
-        if path.is_file():
+    if exclude_runtime:
+        from utils import is_solver_output_dir
+        paths = []
+        for directory, names, files in os.walk(root, followlinks=False):
+            if Path(directory) == root:
+                names[:] = [name for name in names if not is_solver_output_dir(name)]
+            paths.extend(Path(directory) / name for name in files)
+    else:
+        paths = root.rglob("*")
+    for path in sorted(paths):
+        if path.is_file() and not path.is_symlink():
             try:
                 snapshot[path.relative_to(root).as_posix()] = hashlib.sha256(
                     path.read_bytes()

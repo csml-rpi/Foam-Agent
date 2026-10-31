@@ -48,6 +48,14 @@ def _rewrite_mode(state):
     out["dir_structure"] = scan_case_directory(state["case_dir"])
     out["foamfiles"] = read_case_foamfiles(state["case_dir"], out["dir_structure"])
 
+    if state.get("error_logs") and not out.get("updated_files") and not state.get("repairing_mesh"):
+        print("Repair made no file changes. Stopping without rerunning the case.")
+        out.update({
+            "error_logs": state["error_logs"],
+            "workflow_status": "failed",
+            "termination_reason": "repair_made_no_progress",
+        })
+
     return out
 
 def _initial_write_mode(state):
@@ -77,7 +85,10 @@ def _initial_write_mode(state):
     # Build Allrun via service
     mesh_type = state.get("mesh_type")
     mesh_commands = state.get("mesh_commands") or []
+    advice = state.get("similar_case_advice") or {}
+    advice = advice.model_dump() if hasattr(advice, "model_dump") else advice
     build_allrun(
+        pre_solver_steps=advice.get("pre_solver_steps", []) if isinstance(advice, dict) else [],
         case_dir=state["case_dir"],
         database_path=str(database_path_for_config(config)),
         searchdocs=config.searchdocs,

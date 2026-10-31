@@ -36,16 +36,9 @@ def review_error_logs(
 ) -> Tuple[str, List[str]]:
     """Stateless reviewer: returns (review_analysis, updated_history)."""
     advice_text = ""
-    if isinstance(similar_case_advice, dict):
-        advice_text = (
-            f"<similar_case_advice>\n"
-            f"match_level: {similar_case_advice.get('match_level')}\n"
-            f"use_scope: {similar_case_advice.get('use_scope')}\n"
-            f"advice: {similar_case_advice.get('advice')}\n"
-            f"</similar_case_advice>\n"
-        )
-    elif similar_case_advice:
-        advice_text = f"<similar_case_advice>{similar_case_advice}</similar_case_advice>\n"
+    if similar_case_advice:
+        advice = similar_case_advice.model_dump() if hasattr(similar_case_advice, "model_dump") else similar_case_advice
+        advice_text = f"<similar_case_advice>{advice}</similar_case_advice>\n"
 
     if history_text:
         reviewer_user_prompt = (
@@ -75,8 +68,9 @@ def review_error_logs(
     review_content = review_response
 
     updated_history = list(history_text) if history_text else []
+    attempt_num = sum(item.startswith("<Attempt ") for item in updated_history) + 1
     current_attempt = [
-        f"<Attempt {len(updated_history)//4 + 1}>\n",
+        f"<Attempt {attempt_num}>\n",
         f"<Error_Logs>\n{error_logs}\n</Error_Logs>",
         f"<Review_Analysis>\n{review_content}\n</Review_Analysis>",
         "</Attempt>\n",
@@ -131,7 +125,8 @@ def generate_rewrite_plan(
 
 def error_fingerprint(state: dict[str, Any]) -> str:
     """Compare errors and case inputs, excluding changing runtime outputs."""
-    files = snapshot_files(state.get("case_dir") or "")
+    case = Path(state.get("case_dir") or "").resolve()
+    files = snapshot_files(case, exclude_runtime=True)
     inputs = {
         name: digest for name, digest in files.items()
         if not _is_runtime_artifact(name)
