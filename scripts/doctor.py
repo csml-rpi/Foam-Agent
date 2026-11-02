@@ -78,7 +78,12 @@ def main(argv=None) -> int:
 
     target = configured_openfoam_target(cfg) or "foundation-v10"
     report(sys.version_info >= (3, 10), f"Python {sys.version.split()[0]} (release environment: 3.12)")
-    for package in ("langchain", "langchain-openai", "langchain-anthropic", "langchain-community", "langchain-huggingface", "langgraph", "fastmcp", "pydantic", "faiss-cpu", "sentence-transformers", "pyvista", "requests", "tiktoken", "Pillow"):
+    for package in (
+        "langchain", "langchain-openai", "langchain-anthropic", "langchain-community",
+        "langchain-huggingface", "langgraph", "fastmcp", "pydantic", "faiss-cpu",
+        "sentence-transformers", "torch", "transformers", "huggingface-hub",
+        "pyvista", "requests", "tiktoken", "Pillow",
+    ):
         try:
             version = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:

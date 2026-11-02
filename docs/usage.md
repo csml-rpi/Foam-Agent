@@ -7,10 +7,10 @@ OpenFOAM installation. Python 3.12 is the release environment; the package suppo
 Python 3.10 and later. A GPU is optional.
 
 ```bash
-git clone https://github.com/csml-rpi/Foam-Agent.git
+GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/csml-rpi/Foam-Agent.git
 cd Foam-Agent
 git lfs install
-git lfs pull --include="database/foundation-v10/raw/*,database/foundation-v10/faiss/Qwen_Qwen3-Embedding-0.6B/**"
+git lfs pull --include="database/foundation-v10/raw/*,database/foundation-v10/faiss/Qwen_Qwen3-Embedding-0.6B/**,examples/tandem-wing/*.msh"
 python3 scripts/verify_target_corpus.py --target foundation-v10
 python3.12 -m venv .venv
 source .venv/bin/activate
@@ -219,17 +219,17 @@ starting a workflow. JSON validation checks response structure, not CFD correctn
 
 Build from the repository root. These Dockerfiles target Linux amd64 and bundle
 the selected OpenFOAM runtime/corpus, CPU Torch, Gmsh and pinned default Qwen 0.6B
-weights. Build-time downloads require a connection; starting the built image does
+weights and client tokenizer caches. Build-time downloads require a connection; starting the built image does
 not update code, resolve dependencies, or download default embedding weights.
 LLM requests still require access to your selected provider.
 
 ```bash
-git lfs pull --include="database/foundation-v10/raw/*,database/foundation-v10/faiss/Qwen_Qwen3-Embedding-0.6B/**"
-docker build -f docker/Dockerfile -t foamagent:local .
+git lfs pull --include="database/foundation-v10/raw/*,database/foundation-v10/faiss/Qwen_Qwen3-Embedding-0.6B/**,examples/tandem-wing/*.msh"
+docker build --platform linux/amd64 -f docker/Dockerfile -t foamagent:local .
 
 # Native ESI v2006 is compiled from source and can take substantially longer.
-git lfs pull --include="database/esi-v2006/raw/*,database/esi-v2006/faiss/Qwen_Qwen3-Embedding-0.6B/**"
-docker build -f docker/Dockerfile.esi-v2006 -t foamagent:esi-v2006 .
+git lfs pull --include="database/esi-v2006/raw/*,database/esi-v2006/faiss/Qwen_Qwen3-Embedding-0.6B/**,examples/tandem-wing/*.msh"
+docker build --platform linux/amd64 -f docker/Dockerfile.esi-v2006 -t foamagent:esi-v2006 .
 ```
 
 Both images work in `/home/openfoam/Foam-Agent`. Mount input directories read-only

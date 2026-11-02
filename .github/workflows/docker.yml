@@ -71,7 +71,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           git lfs install --local
-          git lfs pull --include="database/$TARGET/raw/*,database/$TARGET/faiss/Qwen_Qwen3-Embedding-0.6B/**"
+          git lfs pull --include="database/$TARGET/raw/*,database/$TARGET/faiss/Qwen_Qwen3-Embedding-0.6B/**,examples/tandem-wing/*.msh"
       - name: Verify corpus before installing dependencies
         run: python3 scripts/verify_target_corpus.py --target '${{ matrix.target }}'
       - uses: docker/setup-buildx-action@v4
@@ -123,7 +123,7 @@ jobs:
           IMAGE: foamagent:check-${{ matrix.target }}
         run: |
           docker run --rm --network none -e FOAMAGENT_MODEL_PROVIDER=openai -e OPENAI_API_KEY=installation-check "$IMAGE" python scripts/doctor.py --check-embedding
-          docker run --rm --network none -e FOAMAGENT_MODEL_PROVIDER=openai -e OPENAI_API_KEY=installation-check "$IMAGE" python -c 'import torch; assert torch.version.cuda is None; import gmsh, pyvista; from src.mcp.fastmcp_server import mcp'
+          docker run --rm --network none -e FOAMAGENT_MODEL_PROVIDER=openai -e OPENAI_API_KEY=installation-check -e HF_HUB_OFFLINE=1 "$IMAGE" python -c 'import torch; assert torch.version.cuda is None; import gmsh, pyvista; import tiktoken; tiktoken.get_encoding("o200k_base"); tiktoken.get_encoding("cl100k_base"); from langchain_core.language_models.base import get_tokenizer; assert get_tokenizer().encode("installation check"); from src.mcp.fastmcp_server import mcp'
           docker run --rm --network none "$IMAGE" python foambench_main.py --help
           docker run --rm --network none "$IMAGE" foamagent-mcp --help
       - name: Log in to GHCR

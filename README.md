@@ -1,9 +1,5 @@
 # Foam-Agent <a href="https://arxiv.org/abs/2505.04997"><img src="https://img.shields.io/badge/arXiv-2505.04997-b31b1b.svg" alt="Paper"></a>
 
-<p align="center">
-  <img src="docs/assets/overview.png" alt="Foam-Agent System Architecture" width="800">
-</p>
-
 Foam-Agent automates OpenFOAM simulations from a natural language prompt or an existing case. Its agents plan the case, prepare meshes and input files, run locally or through Slurm, repair errors, and optionally visualize results.
 
 - **OpenFOAM targets:** Foundation v10 by default, with a separate native ESI/OpenCFD v2006 target.
@@ -11,11 +7,14 @@ Foam-Agent automates OpenFOAM simulations from a natural language prompt or an e
 - **Model choice:** OpenAI, Codex subscription, Anthropic, Bedrock, Ollama, and DeepSeek backends.
 - **MCP integration:** Tools for Claude Code, Cursor, and other MCP clients.
 
+<a id="quick-start"></a>
+
 ## Quick Start (Recommended: Docker)
 
 Docker bundles Foundation OpenFOAM v10, Python dependencies, tutorial indices,
 and the default Qwen 0.6B embedding weights. No host Conda, OpenFOAM, or GPU is
-needed. An LLM account and credentials are still required.
+needed. Configure your LLM backend with API credentials, subscription login,
+or a local Ollama model.
 
 | Your environment | Installation |
 |---|---|
@@ -26,11 +25,11 @@ needed. An LLM account and credentials are still required.
 Build the current source on Linux amd64 (or an amd64 Docker VM):
 
 ```bash
-git clone https://github.com/csml-rpi/Foam-Agent.git
+GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/csml-rpi/Foam-Agent.git
 cd Foam-Agent
 git lfs install
-git lfs pull --include="database/foundation-v10/raw/*,database/foundation-v10/faiss/Qwen_Qwen3-Embedding-0.6B/**"
-docker build -f docker/Dockerfile -t foamagent:local .
+git lfs pull --include="database/foundation-v10/raw/*,database/foundation-v10/faiss/Qwen_Qwen3-Embedding-0.6B/**,examples/tandem-wing/*.msh"
+docker build --platform linux/amd64 -f docker/Dockerfile -t foamagent:local .
 cp .env.example .env
 ```
 
@@ -110,6 +109,10 @@ The repository also includes the `/foam` Claude Code skill. See the [MCP guide](
 | `scripts/` | Corpus checks and translation verification tools |
 | `tests/` | Automated regression tests |
 | `docker/` | Runtime images and entrypoints |
+
+<p align="center">
+  <img src="docs/assets/overview.png" alt="Foam-Agent System Architecture" width="800">
+</p>
 
 ## Reported Benchmark Results
 
