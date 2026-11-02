@@ -204,7 +204,7 @@ Local model loading uses `local_files_only=True`; it continues using the existin
 `Qwen_Qwen3-Embedding-0.6B` index directory. No symlink or index rebuild is needed.
 With Docker, mount the model directory read-only and use its **container** path.
 Alternative online models can share a persistent Hugging Face cache with
-`-v foamagent-hf:/root/.cache/huggingface`.
+`-v foamagent-hf:/opt/foamagent-hf-cache`.
 
 For an OpenAI-compatible endpoint, set `OPENAI_BASE_URL` together with the provider,
 model and credentials. Keep `auto` for the existing provider behavior. If your

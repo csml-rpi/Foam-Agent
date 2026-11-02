@@ -12,7 +12,8 @@ COPY environment.yml pyproject.toml constraints.txt ./
 COPY docker/install-python.sh /tmp/install-python.sh
 RUN bash /tmp/install-python.sh
 # Prepare client tokenizers too, so the first LLM request needs no asset download.
-ENV TIKTOKEN_CACHE_DIR=/opt/foamagent-tokenizers
+ENV TIKTOKEN_CACHE_DIR=/opt/foamagent-tokenizers \
+    HF_HOME=/opt/foamagent-hf-cache
 RUN /opt/conda/envs/FoamAgent/bin/python -c "import tiktoken; tiktoken.get_encoding('cl100k_base'); tiktoken.get_encoding('o200k_base'); from langchain_core.language_models.base import get_tokenizer; get_tokenizer()"
 
 # Pin model assets independently of the location used to load them.
@@ -32,6 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 ENV CONDA_DIR=/opt/conda \
     FoamAgent_PATH=/home/openfoam/Foam-Agent \
     TIKTOKEN_CACHE_DIR=/opt/foamagent-tokenizers \
+    HF_HOME=/opt/foamagent-hf-cache \
     PATH=/opt/conda/envs/FoamAgent/bin:/opt/conda/bin:$PATH \
     FOAMAGENT_IMAGE_OPENFOAM_TARGET=foundation-v10 \
     FOAMAGENT_BUNDLED_EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B \
@@ -39,7 +41,7 @@ ENV CONDA_DIR=/opt/conda \
 COPY --from=builder /opt/conda /opt/conda
 COPY --from=builder /opt/foamagent-model /opt/foamagent-model
 COPY --from=builder /opt/foamagent-tokenizers /opt/foamagent-tokenizers
-COPY --from=builder /root/.cache/huggingface/hub /root/.cache/huggingface/hub
+COPY --from=builder /opt/foamagent-hf-cache/hub /opt/foamagent-hf-cache/hub
 COPY --from=builder /home/openfoam/Foam-Agent /home/openfoam/Foam-Agent
 COPY docker/foamagent-entrypoint.sh /usr/local/bin/foamagent-entrypoint.sh
 ARG VCS_REF=local
