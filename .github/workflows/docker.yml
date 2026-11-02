@@ -1,0 +1,154 @@
+name: Docker images
+
+on:
+  pull_request:
+    paths:
+      - 'docker/**'
+      - 'src/**'
+      - 'database/**'
+      - 'examples/**'
+      - 'foambench_main.py'
+      - 'user_requirement.txt'
+      - 'scripts/doctor.py'
+      - 'scripts/verify_target_corpus.py'
+      - 'pyproject.toml'
+      - 'constraints.txt'
+      - 'environment.yml'
+      - '.github/workflows/docker.yml'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: OpenFOAM image to build
+        type: choice
+        options: [foundation-v10, esi-v2006, all]
+        default: foundation-v10
+      publish:
+        description: Publish images after installation checks pass
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  targets:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - id: select
+        env:
+          EVENT: ${{ github.event_name }}
+          TARGET: ${{ inputs.target }}
+        run: |
+          if [[ "$EVENT" == release || "$TARGET" == all ]]; then
+            echo 'matrix=["foundation-v10","esi-v2006"]' >> "$GITHUB_OUTPUT"
+          elif [[ "$TARGET" == esi-v2006 ]]; then
+            echo 'matrix=["esi-v2006"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'matrix=["foundation-v10"]' >> "$GITHUB_OUTPUT"
+          fi
+
+  image:
+    needs: targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.targets.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+      - name: Hydrate selected target and default model indices
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          git lfs install --local
+          git lfs pull --include="database/$TARGET/raw/*,database/$TARGET/faiss/Qwen_Qwen3-Embedding-0.6B/**"
+      - name: Verify corpus before installing dependencies
+        run: python3 scripts/verify_target_corpus.py --target '${{ matrix.target }}'
+      - uses: docker/setup-buildx-action@v4
+      - name: Image metadata
+        id: meta
+        env:
+          REPOSITORY: ${{ github.repository }}
+          DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+          TARGET: ${{ matrix.target }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          STABLE_RELEASE: ${{ github.event_name == 'release' && !github.event.release.prerelease }}
+        run: |
+          file=docker/Dockerfile
+          if [[ "$TARGET" == esi-v2006 ]]; then file=docker/Dockerfile.esi-v2006; fi
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+          echo "version=${RELEASE_TAG:-sha-${GITHUB_SHA:0:12}}" >> "$GITHUB_OUTPUT"
+          images=("ghcr.io/${REPOSITORY,,}")
+          if [[ -n "$DOCKERHUB_IMAGE" ]]; then images+=("$DOCKERHUB_IMAGE"); fi
+          {
+            echo 'tags<<TAGS'
+            for image in "${images[@]}"; do
+              echo "$image:sha-${GITHUB_SHA:0:12}-$TARGET"
+              if [[ -n "$RELEASE_TAG" ]]; then echo "$image:$RELEASE_TAG-$TARGET"; fi
+              if [[ "$STABLE_RELEASE" == true ]]; then
+                echo "$image:$TARGET"
+                if [[ "$TARGET" == foundation-v10 ]]; then
+                  echo "$image:$RELEASE_TAG"
+                  echo "$image:latest"
+                fi
+              fi
+            done
+            echo TAGS
+          } >> "$GITHUB_OUTPUT"
+      - name: Build candidate
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ steps.meta.outputs.file }}
+          platforms: linux/amd64
+          load: true
+          tags: foamagent:check-${{ matrix.target }}
+          build-args: |
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ steps.meta.outputs.version }}
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
+      - name: Verify offline installation without LLM requests
+        env:
+          IMAGE: foamagent:check-${{ matrix.target }}
+        run: |
+          docker run --rm --network none -e FOAMAGENT_MODEL_PROVIDER=openai -e OPENAI_API_KEY=installation-check "$IMAGE" python scripts/doctor.py --check-embedding
+          docker run --rm --network none -e FOAMAGENT_MODEL_PROVIDER=openai -e OPENAI_API_KEY=installation-check "$IMAGE" python -c 'import torch; assert torch.version.cuda is None; import gmsh, pyvista; from src.mcp.fastmcp_server import mcp'
+          docker run --rm --network none "$IMAGE" python foambench_main.py --help
+          docker run --rm --network none "$IMAGE" foamagent-mcp --help
+      - name: Log in to GHCR
+        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish)
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log in to Docker Hub
+        if: vars.DOCKERHUB_IMAGE != '' && (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish))
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Publish verified image
+        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ steps.meta.outputs.file }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ steps.meta.outputs.version }}
+          cache-from: type=gha,scope=${{ matrix.target }}

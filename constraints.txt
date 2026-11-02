@@ -1,0 +1,26 @@
+# Compatible Python package versions for the supported Python 3.12 environment.
+# Install with: python -m pip install -c constraints.txt -e '.[mesh]'
+# Torch CPU wheels are selected separately; this is not a full transitive lock.
+fastmcp==2.13.0.1
+pydantic==2.12.3
+langchain==0.3.18
+langchain-core==0.3.83
+langchain-openai==0.2.14
+langchain-anthropic==0.2.4
+langchain-community==0.3.17
+langchain-huggingface==0.3.1
+langgraph==0.2.71
+sentence-transformers==5.2.2
+transformers==4.51.3
+huggingface-hub==0.36.0
+faiss-cpu==1.10.0
+torch==2.5.1
+numpy==1.26.4
+openai==1.61.1
+anthropic==0.45.2
+uvicorn==0.34.1
+pyvista==0.44.2
+requests==2.32.3
+tiktoken==0.8.0
+Pillow==11.1.0
+gmsh==4.13.1

@@ -42,7 +42,8 @@ def _model_dir(model: str) -> str:
 
 def _is_lfs_pointer(path: Path) -> bool:
     try:
-        return path.read_bytes().startswith(b"version https://git-lfs.github.com/spec/")
+        with path.open("rb") as stream:
+            return stream.read(128).startswith(b"version https://git-lfs.github.com/spec/")
     except OSError:
         return False
 
@@ -50,6 +51,8 @@ def _is_lfs_pointer(path: Path) -> bool:
 def _validate_file(path: Path, errors: list[str]) -> None:
     if not path.is_file():
         errors.append(f"missing: {path}")
+    elif path.stat().st_size == 0:
+        errors.append(f"empty: {path}")
     elif _is_lfs_pointer(path):
         errors.append(f"Git LFS object was not hydrated: {path}")
 
@@ -71,6 +74,9 @@ def validate(target: str, root: Path, models: tuple[str, ...]) -> list[str]:
         except (OSError, json.JSONDecodeError) as exc:
             errors.append(f"invalid manifest {manifest_path}: {exc}")
         else:
+            if not isinstance(manifest, dict):
+                errors.append(f"invalid manifest {manifest_path}: expected a JSON object")
+                manifest = {}
             if manifest.get("openfoam_target") != target:
                 errors.append(
                     f"{target} corpus manifest does not declare openfoam_target={target}"

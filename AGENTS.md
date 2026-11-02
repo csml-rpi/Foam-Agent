@@ -7,13 +7,14 @@ Foam-Agent automates CFD simulation through LangGraph, OpenFOAM tutorial retriev
 ```bash
 conda env create -f environment.yml
 conda activate FoamAgent
-pip install --no-deps -e .
+python -m pip install -c constraints.txt -e '.[mesh]'
+python scripts/doctor.py
 python foambench_main.py --output ./output --prompt_path ./user_requirement.txt
 pytest tests/ -v
 foamagent-mcp --transport http --host 0.0.0.0 --port 7860
 ```
 
-The Conda environment uses Python 3.12.9. Source the intended OpenFOAM runtime before execution.
+The Conda file bootstraps Python 3.12.9 and pip; application dependencies are installed from pyproject.toml using constraints.txt. Docker builds install CPU Torch and bundle the default embedding weights. Source the intended OpenFOAM runtime before local execution.
 
 ## Code Map
 

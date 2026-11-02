@@ -11,40 +11,64 @@ Foam-Agent automates OpenFOAM simulations from a natural language prompt or an e
 - **Model choice:** OpenAI, Codex subscription, Anthropic, Bedrock, Ollama, and DeepSeek backends.
 - **MCP integration:** Tools for Claude Code, Cursor, and other MCP clients.
 
-## Quick Start
+## Quick Start (Recommended: Docker)
 
-Use Docker for the bundled OpenFOAM/Python runtime, or follow [local installation](docs/usage.md#local-installation) with Conda, Git LFS, and a matching OpenFOAM installation. Both paths require credentials for the selected LLM provider.
+Docker bundles Foundation OpenFOAM v10, Python dependencies, tutorial indices,
+and the default Qwen 0.6B embedding weights. No host Conda, OpenFOAM, or GPU is
+needed. An LLM account and credentials are still required.
 
-Run the Docker image with an explicitly selected model and save results on the host:
+| Your environment | Installation |
+|---|---|
+| A host with Docker | Use the Docker steps below |
+| An existing container or OpenFOAM installation | [Local Python installation](docs/usage.md#local-installation) |
+| Native ESI/OpenCFD v2006 | [Build its matching image](docs/usage.md#docker-builds) |
+
+Build the current source on Linux amd64 (or an amd64 Docker VM):
+
+```bash
+git clone https://github.com/csml-rpi/Foam-Agent.git
+cd Foam-Agent
+git lfs install
+git lfs pull --include="database/foundation-v10/raw/*,database/foundation-v10/faiss/Qwen_Qwen3-Embedding-0.6B/**"
+docker build -f docker/Dockerfile -t foamagent:local .
+cp .env.example .env
+```
+
+Edit `.env` with your provider, model and API key. Then check the installation
+and run the bundled example, keeping results on the host:
 
 ```bash
 mkdir -p output
-docker run -it \
-  -e FOAMAGENT_MODEL_PROVIDER=openai \
-  -e FOAMAGENT_MODEL_VERSION=gpt-5-mini \
-  -e OPENAI_API_KEY=your-key-here \
+docker run --rm --env-file .env foamagent:local \
+  python scripts/doctor.py --check-embedding --check-llm
+docker run --rm --env-file .env \
   -v "$PWD/output:/home/openfoam/Foam-Agent/output" \
-  --name foamagent \
-  leoyue123/foamagent
+  foamagent:local bash examples/quickstart/run.sh
 ```
 
-Inside the container, edit `user_requirement.txt` to describe the geometry, boundary conditions, physical properties, and time settings, then run:
+The diagnostic sends one small LLM request; the example uses the existing
+`user_requirement.txt`. Files and logs are saved to `output/quickstart/`.
+Use a fresh output directory for another run. See [authentication](docs/usage.md#authentication)
+for a Codex subscription or another provider.
+
+Images built from this source use their bundled code and assets without startup
+updates. Published version/digest selection and the release workflow are documented
+under [Docker builds and releases](docs/usage.md#docker-builds). The older
+`leoyue123/foamagent:latest` image predates this setup; do not assume it includes
+these commands or assets.
+
+To use your own prompt, mount its directory read-only and pass the container path:
 
 ```bash
-python foambench_main.py --output ./output/my-case --prompt_path ./user_requirement.txt
+docker run --rm --env-file .env \
+  -v "$PWD/inputs:/inputs:ro" \
+  -v "$PWD/output:/home/openfoam/Foam-Agent/output" \
+  foamagent:local python foambench_main.py \
+  --prompt_path /inputs/requirements.txt --output ./output/my-case
 ```
 
-Input files, meshes, solver results, and logs are written to the host's `./output/my-case/`. Choose a fresh task directory for each run; replacing an existing managed output requires `--overwrite_output`.
-
-The image includes Foundation OpenFOAM v10. It updates code at startup by default; to keep the code bundled in a release such as `leoyue123/foamagent:v2.0.0`, add `-e FOAMAGENT_SKIP_UPDATE=1`. See [authentication](docs/usage.md#authentication) for a Codex subscription or another provider.
-
-An existing directory or ZIP can be used as input:
-
-```bash
-python foambench_main.py --output ./output/imported-case --case_path /path/to/case
-```
-
-Foam-Agent keeps an `original/` copy and runs in `work/`. Local execution clears previous results in `work/`; see [existing cases](docs/usage.md#existing-cases) for modification, archive selection, and output handling.
+An [existing directory or ZIP](docs/usage.md#existing-cases) is also supported with
+`--case_path`. Foam-Agent keeps an `original/` copy and runs in `work/`.
 
 ## Configuration
 
@@ -53,10 +77,11 @@ Foam-Agent keeps an `original/` copy and runs in `work/`. Local execution clears
 | `FOAMAGENT_MODEL_PROVIDER` | LLM backend | `openai-codex` |
 | `FOAMAGENT_MODEL_VERSION` | Model identifier for that backend | `gpt-5.3-codex` |
 | `FOAMAGENT_EMBEDDING_PROVIDER` | Tutorial embedding backend | `huggingface` |
-| `FOAMAGENT_EMBEDDING_MODEL` | Model matching the FAISS indices | `Qwen/Qwen3-Embedding-0.6B` |
+| `FOAMAGENT_EMBEDDING_MODEL` | Model identity matching the FAISS indices | `Qwen/Qwen3-Embedding-0.6B` |
+| `FOAMAGENT_EMBEDDING_MODEL_PATH` | Optional local copy of that Hugging Face model | Unset |
 | `FOAMAGENT_OPENFOAM_TARGET` | Native target: `foundation-v10` or `esi-v2006` | Unset; Foundation v10 |
 
-The default LLM uses a Codex OAuth cache. An API key requires selecting its provider and model explicitly, as in Quick Start. Default embeddings run locally without an API key; the first use may download model weights. Prebuilt tutorial indices come through Git LFS and must match the embedding model.
+The default LLM uses a Codex OAuth cache. An API key requires selecting its provider and model explicitly, as in Quick Start. Docker builds bundle the default embedding weights. Local Python installations may download them on first use; prebuilt tutorial indices come through Git LFS and must match the embedding model. See [installation checks and offline setup](docs/usage.md#installation-checks-and-offline-use).
 
 Settings live in `src/config.py`; see [configuration](docs/usage.md#configuration) for credentials, the legacy ESI translation switch, generation modes, and retry limits. Native ESI v2006 requires its matching runtime/image and corpus.
 

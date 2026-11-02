@@ -31,7 +31,7 @@ except ImportError:
     HuggingFaceEmbeddings = None
 
 
-FAISSCacheKey = tuple[str, str, str]
+FAISSCacheKey = tuple[str, str, str, str]
 FAISS_DB_CACHE: Dict[FAISSCacheKey, Dict[str, Any]] = {}
 
 
@@ -39,7 +39,8 @@ def _faiss_cache_key(config: Config) -> FAISSCacheKey:
     """Return the cache identity for one embedding/index configuration."""
     provider = str(getattr(config, "embedding_provider", "openai") or "openai").casefold()
     model = str(getattr(config, "embedding_model", "") or "")
-    return (str(database_path_for_config(config)), provider, model)
+    model_path = str(getattr(config, "embedding_model_path", "") or "")
+    return (str(database_path_for_config(config)), provider, model, model_path)
 
 def get_embedding_model(config: Optional[Config] = None):
     """Return an embedding model based on the provided config.
@@ -59,7 +60,9 @@ def get_embedding_model(config: Optional[Config] = None):
             raise ImportError(
                 "langchain-huggingface is not installed. Please install it to use HuggingFace embeddings."
             )
-        return HuggingFaceEmbeddings(model_name=model)
+        model_path = getattr(cfg, "embedding_model_path", "")
+        kwargs = {"model_kwargs": {"local_files_only": True}} if model_path else {}
+        return HuggingFaceEmbeddings(model_name=model_path or model, **kwargs)
     if provider == "ollama":
         from langchain_ollama import OllamaEmbeddings
         return OllamaEmbeddings(model=model)
@@ -769,9 +772,10 @@ class LLMService:
         while True:
             try:
                 if pydantic_obj:
-                    if self.model_provider.lower() == "deepseek":
-                        # DeepSeek thinking mode does not support response_format,
-                        # so with_structured_output fails. Use JSON prompt fallback.
+                    method = getattr(self._config, "structured_output_method", "auto")
+                    if method == "json_prompt" or (method == "auto" and self.model_provider.lower() == "deepseek"):
+                        # Explicit compatibility mode, also preserving DeepSeek's
+                        # existing thinking-mode fallback without response_format.
                         schema = pydantic_obj.model_json_schema()
                         json_instruction = (
                             "Return ONLY valid JSON (no markdown, no extra text) matching this schema:\n"
@@ -788,8 +792,16 @@ class LLMService:
                             t = re.sub(r"\n?```\s*$", "", t).strip()
                         response = pydantic_obj.model_validate_json(t)
                     else:
-                        structured_llm = self.llm.with_structured_output(pydantic_obj)
-                        response = structured_llm.invoke(messages)
+                        structured_messages = list(messages)
+                        if method == "json_mode":
+                            structured_messages.append({
+                                "role": "user",
+                                "content": "Return JSON matching this schema: "
+                                + json.dumps(pydantic_obj.model_json_schema()),
+                            })
+                        kwargs = {} if method == "auto" else {"method": method}
+                        structured_llm = self.llm.with_structured_output(pydantic_obj, **kwargs)
+                        response = structured_llm.invoke(structured_messages)
                 else:
                     response = self.llm.invoke(messages)
                     response = response.content
