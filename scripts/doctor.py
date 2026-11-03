@@ -178,7 +178,8 @@ def main(argv=None) -> int:
             # SDK/service errors may echo request headers or credentials. Keep
             # their raw output out of this diagnostic's user-facing report.
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                LLMService(cfg).invoke('Return {"status":"ok"}.', pydantic_obj=Probe, max_retries=0)
+                response = LLMService(cfg).invoke('Return {"status":"ok"}.', pydantic_obj=Probe, max_retries=0)
+                Probe.model_validate(response)
             report(True, f"LLM authentication, model and structured output ({cfg.structured_output_method})")
         except Exception as exc:
             status = getattr(exc, "status_code", None)

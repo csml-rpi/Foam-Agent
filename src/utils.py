@@ -500,11 +500,25 @@ class LLMService:
             "FOAMAGENT_MODEL_PROVIDER=openai along with OPENAI_API_KEY."
         )
 
+    def _structured_output_method(self) -> str:
+        """Return the configured mode, rejecting unsupported Codex native modes."""
+        method = getattr(self._config, "structured_output_method", "auto")
+        is_codex = self.model_provider.lower() in {"openai-codex", "codex", "chatgpt-oauth"}
+        if is_codex and method not in {"auto", "json_prompt"}:
+            raise ValueError(
+                "The Codex subscription backend supports only auto or json_prompt "
+                "for FOAMAGENT_STRUCTURED_OUTPUT_METHOD; "
+                f"{method!r} requires a backend with native structured-output support."
+            )
+        return method
+
     def __init__(self, config: object):
         self.model_version = getattr(config, "model_version", "gpt-4o")
         self.temperature = getattr(config, "temperature", 0)
         self.model_provider = getattr(config, "model_provider", "openai")
         self._config = config
+        # Reject unsupported modes before reading credentials or creating clients.
+        self._structured_output_method()
         
         # Initialize statistics
         self.total_calls = 0
@@ -772,7 +786,7 @@ class LLMService:
         while True:
             try:
                 if pydantic_obj:
-                    method = getattr(self._config, "structured_output_method", "auto")
+                    method = self._structured_output_method()
                     if method == "json_prompt" or (method == "auto" and self.model_provider.lower() == "deepseek"):
                         # Explicit compatibility mode, also preserving DeepSeek's
                         # existing thinking-mode fallback without response_format.

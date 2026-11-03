@@ -35,3 +35,26 @@ jobs:
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
           call: check
+
+  esi-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+      - uses: docker/setup-buildx-action@v4
+      - name: Build ESI runtime dependencies
+        run: docker build --platform linux/amd64 --target runtime-deps -f docker/Dockerfile.esi-v2006 -t foamagent:esi-runtime-deps .
+      - name: Verify Gmsh loads with the runtime libraries
+        run: |
+          docker run --rm --platform linux/amd64 \
+            -v "$PWD/constraints.txt:/tmp/constraints.txt:ro" \
+            foamagent:esi-runtime-deps bash -c '
+              set -e
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 python3-pip
+              python3 -m pip install --no-cache-dir --upgrade pip
+              python3 -m pip install --no-cache-dir -c /tmp/constraints.txt gmsh
+              python3 -c "import gmsh; gmsh.initialize(); gmsh.finalize()"
+            '

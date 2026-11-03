@@ -234,6 +234,11 @@ Pydantic validation, or explicitly select another method supported by that backe
 authentication errors are not silently downgraded. Test with `--check-llm` before
 starting a workflow. JSON validation checks response structure, not CFD correctness.
 
+The Codex subscription backend uses schema-in-prompt validation and supports
+`auto` and `json_prompt`. Native `json_schema`, `function_calling` and `json_mode`
+settings are rejected during client initialization; use a backend that supports
+the requested native method instead.
+
 ## Docker Builds
 
 Build from the repository root. These Dockerfiles target Linux amd64 and bundle

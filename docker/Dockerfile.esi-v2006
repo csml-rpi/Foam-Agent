@@ -69,10 +69,17 @@ COPY examples/ examples/
 COPY foambench_main.py user_requirement.txt LICENSE README.md ./
 RUN /opt/conda/envs/FoamAgent/bin/python -m pip install --no-cache-dir --no-deps -e .
 
-FROM ubuntu:20.04
-COPY --from=openfoam-builder /opt/OpenFOAM /opt/OpenFOAM
+FROM ubuntu:20.04 AS runtime-deps
 USER root
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates xvfb libgl1 libglu1-mesa libgomp1 libopenmpi-dev openmpi-bin libboost-system1.71.0 libxrender1 libxext6 libsm6 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates xvfb libgl1 libglu1-mesa libgomp1 libopenmpi-dev openmpi-bin \
+        libboost-system1.71.0 libxrender1 libxext6 libsm6 libxcursor1 libxft2 \
+        libfontconfig1 libxinerama1 \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM runtime-deps
+COPY --from=openfoam-builder /opt/OpenFOAM /opt/OpenFOAM
 ENV CONDA_DIR=/opt/conda \
     HOME=/root \
     FoamAgent_PATH=/home/openfoam/Foam-Agent \
