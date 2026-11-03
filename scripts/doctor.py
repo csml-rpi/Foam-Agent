@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import importlib.metadata
+import io
 import json
 import os
 from pathlib import Path
@@ -37,11 +38,18 @@ def check_model_files(root: Path) -> list[str]:
         if not index.is_file():
             continue
         try:
-            names = set(json.loads(index.read_text())["weight_map"].values())
+            weight_map = json.loads(index.read_text())["weight_map"]
+            if not isinstance(weight_map, dict) or not weight_map:
+                raise ValueError("expected a nonempty weight_map object")
+            if any(not isinstance(name, str) or not name for name in weight_map.values()):
+                raise ValueError("expected weight filenames")
+            names = set(weight_map.values())
             for item in names:
-                path = (root / item).resolve()
-                path.relative_to(root.resolve())
-                weights.append(path)
+                relative = Path(item)
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise ValueError("expected a model-relative weight filename")
+                # Hugging Face cache shards can link to a shared blobs directory.
+                weights.append(root / relative)
         except (OSError, ValueError, KeyError, TypeError):
             errors.append(f"invalid weight index: {index}")
     if not weights:
@@ -60,7 +68,7 @@ def check_model_files(root: Path) -> list[str]:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check-embedding", action="store_true", help="Probe embeddings and index dimensions (may download weights or call an embedding API)")
-    parser.add_argument("--check-llm", action="store_true", help="Send one small structured request to the selected LLM (uses credentials/quota)")
+    parser.add_argument("--check-llm", action="store_true", help="Probe the selected LLM with a small structured request (uses credentials/quota)")
     args = parser.parse_args(argv)
     failed = False
 
@@ -68,6 +76,14 @@ def main(argv=None) -> int:
         nonlocal failed
         print(f"{'OK' if ok else 'FAIL'}  {message}")
         failed |= not ok
+
+    def check_package(package: str, extra: str = "mesh"):
+        try:
+            version = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            report(False, f"missing {package}; install with python -m pip install -c constraints.txt -e '.[{extra}]'")
+        else:
+            report(True, f"{package} {version}")
 
     try:
         with contextlib.redirect_stdout(sys.stderr):
@@ -84,12 +100,18 @@ def main(argv=None) -> int:
         "sentence-transformers", "torch", "transformers", "huggingface-hub",
         "pyvista", "requests", "tiktoken", "Pillow",
     ):
-        try:
-            version = importlib.metadata.version(package)
-        except importlib.metadata.PackageNotFoundError:
-            report(False, f"missing {package}; install with python -m pip install -c constraints.txt -e '.[mesh]'")
-        else:
-            report(True, f"{package} {version}")
+        check_package(package)
+
+    extras = {cfg.model_provider} & {"bedrock", "ollama"}
+    if cfg.embedding_provider == "ollama":
+        extras.add("ollama")
+    provider_packages = {
+        "bedrock": ("langchain-aws", "boto3"),
+        "ollama": ("langchain-ollama", "ollama"),
+    }
+    for extra in sorted(extras):
+        for package in provider_packages[extra]:
+            check_package(package, extra)
 
     expected = {"foundation-v10": {"10"}, "esi-v2006": {"2006", "v2006"}}[target]
     report(bool(os.getenv("WM_PROJECT_DIR")) and bool(shutil.which("blockMesh")) and os.getenv("WM_PROJECT_VERSION") in expected,
@@ -112,7 +134,10 @@ def main(argv=None) -> int:
                 pass
         if model_path:
             errors = check_model_files(Path(model_path))
-            report(not errors, "local embedding weights (file checks; use --check-embedding to verify loading)")
+            if errors and args.check_embedding and not cfg.embedding_model_path:
+                print("INFO  cached weights are incomplete; the requested embedding probe may download missing files")
+            else:
+                report(not errors, "local embedding weights (file checks; use --check-embedding to verify loading)")
             for error in errors:
                 print(f"      {error}")
         elif args.check_embedding:
@@ -150,10 +175,15 @@ def main(argv=None) -> int:
             from utils import LLMService
             class Probe(BaseModel):
                 status: Literal["ok"]
-            LLMService(cfg).invoke('Return {"status":"ok"}.', pydantic_obj=Probe, max_retries=0)
+            # SDK/service errors may echo request headers or credentials. Keep
+            # their raw output out of this diagnostic's user-facing report.
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                LLMService(cfg).invoke('Return {"status":"ok"}.', pydantic_obj=Probe, max_retries=0)
             report(True, f"LLM authentication, model and structured output ({cfg.structured_output_method})")
         except Exception as exc:
-            report(False, f"LLM probe failed ({type(exc).__name__}); verify provider/model/credentials and FOAMAGENT_STRUCTURED_OUTPUT_METHOD")
+            status = getattr(exc, "status_code", None)
+            http = f", HTTP {status}" if isinstance(status, int) and 100 <= status < 600 else ""
+            report(False, f"LLM probe failed ({type(exc).__name__}{http}); verify provider/model/credentials and FOAMAGENT_STRUCTURED_OUTPUT_METHOD")
 
     print("Installation checks passed." if not failed else "Installation needs attention; see FAIL lines.")
     return int(failed)

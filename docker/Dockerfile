@@ -31,6 +31,7 @@ FROM openfoam/openfoam10-paraview510:latest
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates xvfb libgl1 libglu1-mesa libgomp1 && rm -rf /var/lib/apt/lists/*
 ENV CONDA_DIR=/opt/conda \
+    HOME=/root \
     FoamAgent_PATH=/home/openfoam/Foam-Agent \
     TIKTOKEN_CACHE_DIR=/opt/foamagent-tokenizers \
     HF_HOME=/opt/foamagent-hf-cache \

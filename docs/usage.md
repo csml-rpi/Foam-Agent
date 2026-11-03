@@ -81,7 +81,7 @@ Set credentials before running the CLI or starting MCP; importing the services i
 | `anthropic` | `ANTHROPIC_API_KEY` |
 | `deepseek` | `DEEPSEEK_API_KEY` |
 | `bedrock` | AWS credentials and a supported model/inference profile |
-| `ollama` | A local Ollama installation and model |
+| `ollama` | [Optional Python packages, a local Ollama service and model](#ollama) |
 | `openai-codex` | Codex subscription OAuth cache |
 
 For API-key usage, select both provider and model:
@@ -101,6 +101,22 @@ docker run -it \
   -v ~/.codex/auth.json:/root/.codex/auth.json:ro \
   foamagent:local
 ```
+
+### Ollama
+
+Follow the [local installation](#local-installation), then install the Ollama
+extra in the same Python environment and select your installed model:
+
+```bash
+python -m pip install -c constraints.txt -e '.[ollama]'
+export FOAMAGENT_MODEL_PROVIDER=ollama
+export FOAMAGENT_MODEL_VERSION=your-installed-model
+```
+
+Install Ollama separately, start its service at `http://localhost:11434`, and
+download the selected model before running Foam-Agent. The Python extra installs
+client packages only. Default Docker builds include the core and mesh dependencies;
+use the local Python route for an Ollama service running on the host.
 
 ## Existing Cases
 
@@ -176,12 +192,15 @@ produce a nonzero exit and a suggested next step.
 - Add `--check-embedding` to load the embedding model, downloading it if needed,
   and compare its vector dimension with each selected FAISS index. Remote
   embedding providers use their API and may consume quota.
-- Add `--check-llm` to send one small structured request to the configured model.
+- Add `--check-llm` for a small structured request to the configured model.
   This tests authentication, model access and output compatibility, and consumes quota.
+  Client retry policies can cause additional requests after transient errors.
 
 File checks cannot prove weight integrity or model identity. Use a trusted copy
 of the same model revision as your indices; the embedding probe also verifies
 that weights can actually be loaded. Matching dimensions alone is insufficient.
+Selected Bedrock/Ollama backends also require their corresponding optional Python
+packages; the diagnostic reports missing extras before any remote probe.
 
 For an offline copy, download on a connected machine and transfer the complete directory:
 
@@ -235,32 +254,13 @@ docker build --platform linux/amd64 -f docker/Dockerfile.esi-v2006 -t foamagent:
 Both images work in `/home/openfoam/Foam-Agent`. Mount input directories read-only
 and outputs separately, as in the [Quick Start](../README.md#quick-start-recommended-docker).
 The default command opens a shell; append any CLI/MCP command to run it directly.
-Startup messages use stderr so stdio MCP output stays available to the client.
+Container entrypoint messages use stderr.
 
-### Releases
-
-The `Docker images` GitHub Actions workflow builds a candidate, checks embedding
-loading and CLI/MCP imports with container networking disabled, then publishes it.
-It does not run CFD simulations or send LLM requests. Pull requests build/test the
-Foundation image; a published GitHub release builds both native targets. Manual
-runs default to building without publishing.
-
-GHCR uses the repository's `GITHUB_TOKEN` and repository name (lowercase). To also
-publish to Docker Hub, configure repository variable `DOCKERHUB_IMAGE` (for example
-`leoyue123/foamagent`) and secrets `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`.
-Ensure the GHCR package is public if users should pull it without authentication.
-
-Published tags include `sha-<12-character-commit>-<target>` and
-`<release-tag>-<target>`. Stable releases also update `foundation-v10`, `esi-v2006`,
-and Foundation's `latest`/`<release-tag>` aliases. Prereleases do not move stable
-aliases. Use the release's published tag or digest after confirming it exists;
-no new version tag is assumed by this guide. Prefer `IMAGE@sha256:DIGEST` to fix the
-exact artifact. To update, pull/build another image and recreate the container.
-
-Old images that auto-update at startup require `FOAMAGENT_SKIP_UPDATE=1` to retain
-their bundled code. New builds never auto-update; `FOAMAGENT_VERSION` no longer
-changes code inside the container. A full offline transfer can use `docker save`
-and `docker load` on a Docker host.
+For published images such as `v2.2.0`, follow that release's documentation.
+Older images that auto-update at startup require `FOAMAGENT_SKIP_UPDATE=1` to
+retain their bundled code. New builds never auto-update; `FOAMAGENT_VERSION`
+no longer changes code inside the container. A full offline transfer can use
+`docker save` and `docker load` on a Docker host.
 
 ## Troubleshooting
 

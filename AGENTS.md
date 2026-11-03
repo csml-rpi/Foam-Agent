@@ -7,6 +7,7 @@ Foam-Agent automates CFD simulation through LangGraph, OpenFOAM tutorial retriev
 ```bash
 conda env create -f environment.yml
 conda activate FoamAgent
+python -m pip install 'torch==2.5.1' --index-url https://download.pytorch.org/whl/cpu
 python -m pip install -c constraints.txt -e '.[mesh]'
 python scripts/doctor.py
 python foambench_main.py --output ./output --prompt_path ./user_requirement.txt

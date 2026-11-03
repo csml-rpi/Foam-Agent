@@ -13,8 +13,10 @@ Foam-Agent automates OpenFOAM simulations from a natural language prompt or an e
 
 Docker bundles Foundation OpenFOAM v10, Python dependencies, tutorial indices,
 and the default Qwen 0.6B embedding weights. No host Conda, OpenFOAM, or GPU is
-needed. Configure your LLM backend with API credentials, subscription login,
-or a local Ollama model.
+needed. Configure an API-key provider or a Codex subscription using the
+[authentication guide](docs/usage.md#authentication). For Ollama, follow the
+[local setup](docs/usage.md#ollama): it requires optional Python packages and
+a running Ollama service, which the default images do not include.
 
 | Your environment | Installation |
 |---|---|
@@ -45,16 +47,14 @@ docker run --rm --env-file .env \
   foamagent:local bash examples/quickstart/run.sh
 ```
 
-The diagnostic sends one small LLM request; the example uses the existing
+The diagnostic checks LLM access with a small request; the example uses the existing
 `user_requirement.txt`. Files and logs are saved to `output/quickstart/`.
 Use a fresh output directory for another run. See [authentication](docs/usage.md#authentication)
 for a Codex subscription or another provider.
 
-Images built from this source use their bundled code and assets without startup
-updates. Published version/digest selection and the release workflow are documented
-under [Docker builds and releases](docs/usage.md#docker-builds). The older
-`leoyue123/foamagent:latest` image predates this setup; do not assume it includes
-these commands or assets.
+Locally built images run their bundled code and assets without startup updates.
+See [Docker builds](docs/usage.md#docker-builds) for native targets and older image
+compatibility.
 
 To use your own prompt, mount its directory read-only and pass the container path:
 
