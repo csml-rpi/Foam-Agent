@@ -26,7 +26,7 @@ The console command defaults to stdio. To serve HTTP:
 foamagent-mcp --transport http --host 0.0.0.0 --port 7860
 ```
 
-For Docker:
+For Docker, first [build the runtime image](usage.md#docker-builds):
 
 ```bash
 mkdir -p runs
@@ -36,7 +36,7 @@ docker run -it \
   -e OPENAI_API_KEY=your-key-here \
   -v "$PWD/runs:/home/openfoam/Foam-Agent/runs" \
   -p 7860:7860 \
-  leoyue123/foamagent \
+  foamagent:local \
   python -m src.mcp.fastmcp_server --transport http --host 0.0.0.0 --port 7860
 ```
 

@@ -114,6 +114,8 @@ def require_target_corpus(config: Any) -> None:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"Cannot read {target} corpus manifest {manifest_path}: {exc}") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError(f"Corpus manifest {manifest_path} must contain a JSON object.")
     if manifest.get("openfoam_target") != target:
         raise ValueError(
             f"Corpus manifest {manifest_path} declares "
@@ -126,9 +128,15 @@ def require_target_corpus(config: Any) -> None:
             f"(wm_project_version={manifest.get('wm_project_version')!r})."
         )
 
+    def unavailable(path: Path) -> bool:
+        if not path.is_file() or path.stat().st_size == 0:
+            return True
+        with path.open("rb") as stream:
+            return stream.read(128).startswith(b"version https://git-lfs.github.com/spec/")
+
     raw_dir = database_path / "raw"
     missing_raw = sorted(
-        filename for filename in _REQUIRED_RAW_CORPUS_FILES if not (raw_dir / filename).is_file()
+        filename for filename in _REQUIRED_RAW_CORPUS_FILES if unavailable(raw_dir / filename)
     )
     model = str(
         getattr(config, "embedding_model", "Qwen/Qwen3-Embedding-0.6B")
@@ -139,8 +147,8 @@ def require_target_corpus(config: Any) -> None:
     missing_indices = sorted(
         index
         for index in _REQUIRED_FAISS_INDICES
-        if not (index_root / index / "index.faiss").is_file()
-        or not (index_root / index / "index.pkl").is_file()
+        if unavailable(index_root / index / "index.faiss")
+        or unavailable(index_root / index / "index.pkl")
     )
     if missing_raw or missing_indices:
         details = []
@@ -152,7 +160,8 @@ def require_target_corpus(config: Any) -> None:
             )
         raise FileNotFoundError(
             f"{target} corpus is incomplete (" + "; ".join(details) + "). "
-            f"Build it with: python init_database.py --openfoam_target {target} "
-            "--openfoam_path <OpenFOAM-root> and select the matching "
-            "--embedding_provider and --embedding_model."
+            "Run git lfs pull and scripts/verify_target_corpus.py first. "
+            "Keep FOAMAGENT_EMBEDDING_MODEL as the model ID; use "
+            "FOAMAGENT_EMBEDDING_MODEL_PATH for local Hugging Face weights. "
+            "Only rebuild with init_database.py if this target/model has no prebuilt indices."
         )
