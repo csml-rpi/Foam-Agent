@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import os
+from .cli import run_server
 from .fastmcp_server import mcp
 
 if __name__ == "__main__":  # pragma: no cover
@@ -11,9 +12,5 @@ if __name__ == "__main__":  # pragma: no cover
 
     print(f"Starting FastMCP server transport={transport} host={host} port={port}")
 
-    if transport == "http":
-        uvicorn_config = {"ws": "websockets"}
-        mcp.run("http", host=host, port=port, uvicorn_config=uvicorn_config)
-    else:
-        mcp.run("stdio")
+    run_server(mcp, transport=transport, host=host, port=port)
 

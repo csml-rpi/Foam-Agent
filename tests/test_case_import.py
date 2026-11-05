@@ -7,8 +7,164 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 import sys
+import subprocess
+import gzip
 
 import pytest
+
+
+@pytest.mark.parametrize('with_properties', [False, True])
+@pytest.mark.parametrize('time_dir', ['0', '0.0', '0e0'])
+@pytest.mark.parametrize('compressed', [False, True])
+def test_regional_case_context_keeps_inputs_without_bulk_mesh(tmp_path, with_properties, time_dir, compressed):
+    from utils import load_case_files, read_case_foamfiles, scan_case_directory
+
+    def put(relative, content):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(gzip.compress(content.encode()) if path.suffix == '.gz' else content.encode())
+
+    inputs = {
+        'constant/regionProperties': 'regions (fluid (air) solid (wall));',
+        'system/controlDict': 'application chtMultiRegionFoam;',
+        'system/air/fvSolution': 'solvers { p_rgh { solver GAMG; } }',
+        'system/wall/fvSchemes': 'ddtSchemes { default Euler; }',
+        'constant/air/thermophysicalProperties': 'thermoType { type heRhoThermo; }',
+        'constant/wall/thermophysicalProperties': 'thermoType { type heSolidThermo; }',
+        f'{time_dir}/air/T': 'internalField uniform 300;',
+        f'{time_dir}/wall/T': 'internalField uniform 400;',
+    }
+    if not with_properties:
+        inputs.pop('constant/air/thermophysicalProperties')
+        inputs.pop('constant/wall/thermophysicalProperties')
+    boundaries = {
+        'constant/air/polyMesh/boundary': 'airWall { type wall; }',
+        'constant/wall/polyMesh/boundary': 'solidWall { type wall; }',
+    }
+    if compressed:
+        inputs = {path + ('.gz' if path != 'system/controlDict' else ''): content
+                  for path, content in inputs.items()}
+        boundaries = {path + '.gz': content for path, content in boundaries.items()}
+    for relative, content in {**inputs, **boundaries}.items():
+        put(relative, content)
+    put('constant/air/polyMesh/points', 'bulk mesh coordinates')
+    put('constant/geometry/surface.stl', 'bulk geometry coordinates')
+    put('constant/.foamagent/reconstruction/old/points', 'archived coordinates')
+    put('1/air/T', 'old result field')
+    put('processors2/0/air/T', 'decomposed field')
+    directory = scan_case_directory(str(tmp_path))
+    assert set(directory) == {str(Path(path).parent) for path in inputs}
+    assert set(f'{f.folder_name}/{f.file_name}' for f in
+               read_case_foamfiles(str(tmp_path), directory).list_foamfile) == set(inputs)
+    loaded = load_case_files({'case_dir': str(tmp_path)})
+    actual = {f'{f.folder_name}/{f.file_name}': f.content for f in loaded['foamfiles'].list_foamfile}
+    assert actual == {**inputs, **boundaries}
+
+
+@pytest.mark.parametrize('target,returned,existing,actual', [
+    ('U', 'U.gz', ['U.gz'], 'U.gz'),
+    ('U.gz', 'U.gz', ['U', 'U.gz'], 'U.gz'),
+    ('U', 'U', ['U', 'U.gz'], 'U'),
+])
+def test_rewrite_preserves_selected_compression_and_native_file_precedence(
+    tmp_path, target, returned, existing, actual,
+):
+    from services.input_writer import rewrite_files
+    from utils import FoamPydantic, load_case_files
+
+    field_dir = tmp_path / '0.0'
+    field_dir.mkdir()
+    for name in existing:
+        text = 'internalField uniform ' + ('1;' if name == 'U' else '2;')
+        (field_dir / name).write_bytes(gzip.compress(text.encode()) if name.endswith('.gz') else text.encode())
+    initial = load_case_files({'case_dir': str(tmp_path)})
+    current = initial['foamfiles'].list_foamfile
+    assert len(current) == 1 and current[0].file_name == ('U' if 'U' in existing else 'U.gz')
+    content = 'internalField uniform 3;'
+    llm = SimpleNamespace(invoke=lambda *a, **kw: FoamPydantic(list_foamfile=[dict(
+        folder_name='0.0', file_name=returned, content=content)]))
+    result = rewrite_files(
+        str(tmp_path), [], 'Correct the requested initial value',
+        {'target_files': [dict(file='0.0/' + target, stage='solver', changes='Set the requested value')]},
+        'Preserve all other physical inputs', llm_service=llm, **initial,
+    )
+    output = field_dir / actual
+    assert output.is_file() and sorted(p.name for p in field_dir.iterdir()) == [actual]
+    if actual.endswith('.gz'):
+        assert output.read_bytes().startswith(b'\x1f\x8b')
+        assert gzip.decompress(output.read_bytes()).decode() == content
+    else:
+        assert output.read_text() == content
+    assert result['written_files'] == result['updated_files'] == ['0.0/' + actual]
+    assert result['rewrite_plan'] == {'target_files': []} and not result['error_logs']
+    assert result['dir_structure'] == {'0.0': [actual]}
+    assert [f.file_name for f in result['foamfiles'].list_foamfile] == [actual]
+    assert load_case_files({'case_dir': str(tmp_path)})['foamfiles'].list_foamfile[0].content == content
+
+
+@pytest.mark.parametrize('mode', ['sequential_dependency', 'parallel_no_context'])
+def test_initial_writer_creates_compressed_fields_with_actual_receipts(tmp_path, mode):
+    from services.input_writer import initial_write
+    from services.stage_plan import pending_file_creates
+
+    task = dict(folder_name='0.0', file_name='U.gz', stage='solver', action='create', changes='Create velocity')
+    content = 'FoamFile { class volVectorField; object U; }\ninternalField uniform (1 0 0);\n'
+    result = initial_write(str(tmp_path), [task], 'Use the requested velocity', '', 'icoFoam',
+                           generation_mode=mode, llm_service=SimpleNamespace(invoke=lambda *a: content))
+    assert gzip.decompress((tmp_path / '0.0/U.gz').read_bytes()).decode() == content.strip()
+    assert result['written_files'] == ['0.0/U.gz']
+    assert result['dir_structure'] == {'0.0': ['U.gz']}
+    assert not pending_file_creates([dict(task, file_name='U')], result['written_files'])
+
+
+def test_case_file_variants_reject_symlinks_before_writing(tmp_path):
+    from utils import save_case_text
+
+    outside = tmp_path / 'outside'
+    outside.write_text('preserve external input')
+    field = tmp_path / '0/U'
+    field.parent.mkdir()
+    field.write_text('original input')
+    (field.parent / 'U.gz').symlink_to(outside)
+    with pytest.raises(ValueError, match='symbolic links'):
+        save_case_text(field, 'replacement input')
+    assert outside.read_text() == 'preserve external input' and field.read_text() == 'original input'
+
+
+def test_truncated_gzip_context_is_reported_and_explicit_repair_restores_it(tmp_path, capsys):
+    from services.case_import import _read_text
+    from services.input_writer import rewrite_files
+    from utils import FoamPydantic, load_case_files
+
+    content = 'FoamFile { class volVectorField; object U; }\ninternalField uniform (1 0 0);\n'
+    field = tmp_path / '0.0/U.gz'
+    field.parent.mkdir()
+    truncated = gzip.compress(content.encode())[:-4]
+    field.write_bytes(truncated)
+    with pytest.raises(EOFError):
+        gzip.decompress(truncated)
+    valid = tmp_path / 'constant/transportProperties.gz'
+    valid.parent.mkdir()
+    valid_bytes = gzip.compress(b'nu 1e-05;\n')
+    valid.write_bytes(valid_bytes)
+    initial = load_case_files({'case_dir': str(tmp_path)})
+    assert [(f.folder_name, f.file_name) for f in initial['foamfiles'].list_foamfile] == [
+        ('constant', 'transportProperties.gz')]
+    assert 'Error reading file ' + str(field) in capsys.readouterr().out
+    assert _read_text(field) == ''
+    llm = SimpleNamespace(invoke=lambda *a, **kw: FoamPydantic(list_foamfile=[dict(
+        folder_name='0.0', file_name='U.gz', content=content)]))
+    result = rewrite_files(
+        str(tmp_path), [], 'Replace the corrupt field from the supplied physical definition',
+        {'target_files': [dict(file='0.0/U.gz', stage='solver', changes='Restore supplied field definition')]},
+        'Keep the supplied physical definition', llm_service=llm, **initial,
+    )
+    assert gzip.decompress(field.read_bytes()).decode() == content
+    assert result['written_files'] == result['updated_files'] == ['0.0/U.gz']
+    assert not result['error_logs'] and result['rewrite_plan'] == {'target_files': []}
+    assert valid.read_bytes() == valid_bytes
+    assert any(f.file_name == 'U.gz' and f.content == content for f in
+               load_case_files({'case_dir': str(tmp_path)})['foamfiles'].list_foamfile)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -33,6 +189,13 @@ from utils import FoamPydantic, FoamfilePydantic, read_case_foamfiles, scan_case
 
 
 @pytest.fixture(autouse=True)
+def native_dictionary(monkeypatch):
+    from services import solver_execution
+    monkeypatch.setattr(solver_execution, 'run_openfoam_utility', lambda argv, **kw:
+                        subprocess.CompletedProcess(argv, 0, 'icoFoam\n', ''))
+
+
+@pytest.fixture(autouse=True)
 def _restore_writable_tmp_tree(tmp_path: Path):
     """Allow pytest to remove immutable original/ trees after each test."""
     yield
@@ -44,6 +207,11 @@ def _restore_writable_tmp_tree(tmp_path: Path):
             path.chmod(path.stat().st_mode | 0o700)
         except OSError:
             pass
+
+
+def _solver_operations():
+    return [dict(stage="solver", command="#!/bin/sh\nicoFoam\n", purpose="Execute the imported case's solver",
+                 executor="script", required_inputs=[], generated_inputs=[])]
 
 
 def _make_case(root: Path, target: str = "foundation-v10") -> Path:
@@ -78,7 +246,7 @@ class _FakeLLM:
 
 def test_replanning_uses_current_files_instead_of_import_snapshot(tmp_path):
     case = _make_case(tmp_path / "case")
-    llm = _FakeLLM(ExistingCasePlan())
+    llm = _FakeLLM(ExistingCasePlan(operations=[]))
     directory = scan_case_directory(str(case))
     result = plan_imported_case({
         "config": SimpleNamespace(openfoam_target="foundation-v10"),
@@ -171,7 +339,7 @@ def test_import_node_loads_resources_for_the_detected_target_when_planning_is_ne
 
 def test_explicit_change_creates_targeted_writer_then_run_plan() -> None:
     plan = ExistingCasePlan.model_validate(
-        {'status': 'ready', 'requires_meshing': False, 'requires_input_writer': True, 'target_files': [{'file': 'system/controlDict', 'changes': 'Set endTime to 5', 'stage': 'solver'}], 'reason': 'Change the requested end time.'}
+        {'operations': [], 'status': 'ready', 'requires_meshing': False, 'requires_input_writer': True, 'target_files': [{'file': 'system/controlDict', 'changes': 'Set endTime to 5', 'stage': 'solver'}], 'reason': 'Change the requested end time.'}
     )
     llm = _FakeLLM(plan)
     state = {
@@ -198,7 +366,7 @@ def test_explicit_change_creates_targeted_writer_then_run_plan() -> None:
 
 def test_missing_files_and_unknown_physics_use_structured_planner_outcomes() -> None:
     missing_file_plan = ExistingCasePlan.model_validate(
-        {'status': 'ready', 'requires_meshing': False, 'requires_input_writer': True, 'target_files': [], 'reason': 'Create the missing dictionary.'}
+        {'operations': [], 'status': 'ready', 'requires_meshing': False, 'requires_input_writer': True, 'target_files': [], 'reason': 'Create the missing dictionary.'}
     )
     state = {
         "case_context": {
@@ -218,7 +386,7 @@ def test_missing_files_and_unknown_physics_use_structured_planner_outcomes() -> 
     assert "target_files" in repair["termination_reason"]
 
     failed_plan = ExistingCasePlan.model_validate(
-        {'status': 'failed', 'reason': 'The inlet condition cannot be inferred.', 'requires_meshing': False, 'requires_input_writer': False}
+        {'operations': [], 'status': 'failed', 'reason': 'The inlet condition cannot be inferred.', 'requires_meshing': False, 'requires_input_writer': False}
     )
     failed = plan_imported_case({**state, "llm_service": _FakeLLM(failed_plan)})
     assert failed["workflow_status"] == "failed"
@@ -285,7 +453,7 @@ def test_rewrite_uses_planned_files_and_records_actual_diffs(tmp_path: Path) -> 
         ]
     )
     directory = scan_case_directory(str(case))
-    state = {'case_origin': 'imported', 'case_dir': str(case), 'input_writer_mode': 'rewrite', 'review_analysis': 'Apply the planned changes to fix the reported setup error.', 'rewrite_plan': {'target_files': [{'file': 'system/controlDict', 'changes': 'Set endTime to 5', 'stage': 'solver'}, {'file': 'system/fvSolution', 'changes': 'Update solver settings'}]}, 'error_logs': [{'file': 'Allrun', 'error_content': 'setup error'}], 'user_requirement': DEFAULT_IMPORTED_REQUIREMENT, 'foamfiles': read_case_foamfiles(str(case), directory), 'dir_structure': directory, 'case_solver': 'icoFoam', 'config': SimpleNamespace(openfoam_target='foundation-v10'), 'llm_service': _FakeLLM(response), 'loop_count': 1}
+    state = {'pending_solver_operations': [], 'solver_operations': _solver_operations(), 'solver_review_history': [], 'solver_script_dirty': False, 'case_origin': 'imported', 'case_dir': str(case), 'input_writer_mode': 'rewrite', 'review_analysis': 'Apply the planned changes to fix the reported setup error.', 'rewrite_plan': {'target_files': [{'file': 'system/controlDict', 'changes': 'Set endTime to 5', 'stage': 'solver'}, {'file': 'system/fvSolution', 'changes': 'Update solver settings'}]}, 'error_logs': [{'file': 'Allrun', 'error_content': 'setup error'}], 'user_requirement': DEFAULT_IMPORTED_REQUIREMENT, 'foamfiles': read_case_foamfiles(str(case), directory), 'dir_structure': directory, 'case_solver': 'icoFoam', 'config': SimpleNamespace(openfoam_target='foundation-v10'), 'llm_service': _FakeLLM(response), 'loop_count': 1}
 
     result = input_writer_node(state)
 
@@ -299,7 +467,7 @@ def test_rewrite_uses_planned_files_and_records_actual_diffs(tmp_path: Path) -> 
     [("", "foundation-v10"), ("foundation-v10", "foundation-v10"), ("esi-v2006", "esi-v2006")],
 )
 def test_runner_uses_shared_cleanup_and_selected_runtime(
-    monkeypatch, target: str, target_version: str
+    tmp_path: Path, monkeypatch, target: str, target_version: str
 ) -> None:
     runner_module = importlib.import_module("nodes.local_runner_node")
     observed = {}
@@ -309,7 +477,8 @@ def test_runner_uses_shared_cleanup_and_selected_runtime(
         return []
 
     monkeypatch.setattr(runner_module, "run_allrun_and_collect_errors", fake_run)
-    state = {'case_origin': 'imported', 'case_dir': '/task/work', 'config': SimpleNamespace(max_time_limit=9, openfoam_target=target)}
+    (tmp_path / 'Allrun').write_text('#!/bin/sh\nicoFoam\n')
+    state = {'pending_solver_operations': [], 'solver_operations': _solver_operations(), 'solver_review_history': [], 'solver_script_dirty': False, 'case_origin': 'imported', 'case_dir': str(tmp_path), 'config': SimpleNamespace(max_time_limit=9, openfoam_target=target)}
 
     result = local_runner_node(state)
 
@@ -336,7 +505,7 @@ def test_failed_run_returns_errors_without_restoring_old_results(
         return [{"file": "Allrun", "error_content": "solver failed"}]
 
     monkeypatch.setattr(runner_module, "run_allrun_and_collect_errors", failed_run)
-    state = {'case_origin': 'imported', 'case_dir': str(work), 'config': SimpleNamespace(max_time_limit=9, openfoam_target='foundation-v10')}
+    state = {'pending_solver_operations': [], 'solver_operations': _solver_operations(), 'solver_review_history': [], 'solver_script_dirty': False, 'case_origin': 'imported', 'case_dir': str(work), 'config': SimpleNamespace(max_time_limit=9, openfoam_target='foundation-v10')}
 
     result = local_runner_node(state)
 
@@ -374,7 +543,7 @@ def test_graph_routes_success_to_visualization_or_result() -> None:
     assert route_after_runner({**base, "requires_visualization": True}) == "visualization"
 
 
-def test_runner_has_no_allrun_preflight_or_completion_marker_gate(
+def test_runner_reports_missing_native_solver_completion(
     tmp_path: Path, monkeypatch
 ) -> None:
     run_service = importlib.import_module("services.run_local")
@@ -396,8 +565,11 @@ def test_runner_has_no_allrun_preflight_or_completion_marker_gate(
 
     monkeypatch.setattr(run_service, "run_command", successful_run)
 
-    assert run_service.run_allrun_and_collect_errors(str(case)) == []
+    errors = run_service.run_allrun_and_collect_errors(str(case))
+    assert errors
+    assert any('No normal completion evidence' in error['error_content'] for error in errors)
     assert len(calls) == 1
+    assert calls[0][1]["fail_fast"] is True
 
 
 def test_custom_mesh_conversion_requires_polymesh_artifact(
@@ -407,11 +579,13 @@ def test_custom_mesh_conversion_requires_polymesh_artifact(
     source = tmp_path / "uploaded.msh"
     source.write_text("$MeshFormat\n2.2 0 8\n$EndMeshFormat\n", encoding="utf-8")
     case = tmp_path / "case"
-    monkeypatch.setattr(mesh_service, "run_openfoam_utility", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(mesh_service, "run_openfoam_utility", lambda args, **_kwargs:
+                        SimpleNamespace(returncode=0, stdout='', stderr=''))
 
     result = mesh_service.copy_custom_mesh(
         str(source),
         str(case),
+        timeout=3600,
     )
 
     assert result["error_logs"] == ["polyMesh directory not created"]

@@ -1,22 +1,18 @@
-"""Console entry point for `foamagent-mcp` command.
-
-Usage (after pip install):
-    foamagent-mcp                     # stdio mode (default, for MCP clients)
-    foamagent-mcp --transport http    # HTTP mode (for web clients)
-    foamagent-mcp --help
-
-Integration with AI tools:
-    claude mcp add foamagent -- foamagent-mcp
-"""
+"""Shared startup for the console and module MCP entry points."""
 
 from __future__ import annotations
 
 import argparse
-import os
-import sys
 
 
-def main() -> None:
+def run_server(server, *, transport: str, host: str, port: int) -> None:
+    if transport == "http":
+        server.run("http", host=host, port=port, uvicorn_config={"ws": "websockets"})
+    else:
+        server.run("stdio")
+
+
+def main(argv=None, *, server=None, default_transport="stdio", default_host="0.0.0.0") -> None:
     parser = argparse.ArgumentParser(
         prog="foamagent-mcp",
         description="Foam-Agent MCP server — exposes OpenFOAM CFD simulation tools over MCP",
@@ -24,13 +20,13 @@ def main() -> None:
     parser.add_argument(
         "--transport",
         choices=["stdio", "http"],
-        default="stdio",
-        help="Transport method (default: stdio)",
+        default=default_transport,
+        help="Transport method (default: %(default)s)",
     )
     parser.add_argument(
         "--host",
-        default="0.0.0.0",
-        help="Host for HTTP transport (default: 0.0.0.0)",
+        default=default_host,
+        help="Host for HTTP transport (default: %(default)s)",
     )
     parser.add_argument(
         "--port",
@@ -38,19 +34,15 @@ def main() -> None:
         default=7860,
         help="Port for HTTP transport (default: 7860)",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    # Do NOT add src/ to sys.path here — it would cause src/mcp/ to shadow
-    # the pip "mcp" package.  fastmcp_server.py handles its own sys.path
-    # setup (line 17) AFTER importing fastmcp (line 11), so the ordering
-    # is safe when we let it manage the path itself.
-    from src.mcp.fastmcp_server import mcp
+    # The server imports FastMCP before adding src/ to sys.path, so the local
+    # src/mcp directory cannot shadow the third-party mcp package.
+    if server is None:
+        from src.mcp.fastmcp_server import mcp
 
-    if args.transport == "http":
-        uvicorn_config = {"ws": "websockets"}
-        mcp.run("http", host=args.host, port=args.port, uvicorn_config=uvicorn_config)
-    else:
-        mcp.run("stdio")
+        server = mcp
+    run_server(server, transport=args.transport, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

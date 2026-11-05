@@ -1,11 +1,6 @@
 *.faiss filter=lfs diff=lfs merge=lfs -text
 *.pkl filter=lfs diff=lfs merge=lfs -text
-overview.png filter=lfs diff=lfs merge=lfs -text
-wechat_foamagent.JPG filter=lfs diff=lfs merge=lfs -text
+docs/assets/overview.png filter=lfs diff=lfs merge=lfs -text
 database/foundation-v10/raw/* filter=lfs diff=lfs merge=lfs -text
 database/esi-v2006/raw/* filter=lfs diff=lfs merge=lfs -text
-database/esi-v2006/faiss/**/*.faiss filter=lfs diff=lfs merge=lfs -text
-database/esi-v2006/faiss/**/*.pkl filter=lfs diff=lfs merge=lfs -text
-database/foundation-v10/faiss/**/*.faiss filter=lfs diff=lfs merge=lfs -text
-database/foundation-v10/faiss/**/*.pkl filter=lfs diff=lfs merge=lfs -text
-tandem_wing.msh filter=lfs diff=lfs merge=lfs -text
+examples/tandem-wing/*.msh filter=lfs diff=lfs merge=lfs -text

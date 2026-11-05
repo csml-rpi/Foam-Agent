@@ -1,12 +1,14 @@
 import os
 import re
+import gzip
 from difflib import unified_diff
 from typing import Dict, List, Any, Optional, Callable
-import shutil
-from utils import save_file, parse_context, retrieve_faiss, FoamPydantic, FoamfilePydantic, scan_case_directory, read_case_foamfiles, read_file
+from pathlib import Path
+from utils import save_file, parse_context, retrieve_faiss, FoamPydantic, FoamfilePydantic, scan_case_directory, read_case_foamfiles, case_file_key, resolve_case_file, read_case_text, save_case_text
 from config import Config
 from openfoam_target import database_path_for_config
 from . import global_llm_service
+from .stage_plan import script_commands, render_stage_script, check_file_targets, unwritten_file_errors
 from .case_paths import (
     CasePathSafetyError,
     safe_case_path,
@@ -24,6 +26,43 @@ def parse_shell_script(text: str) -> str:
             and lines[-1].strip() == "```"):
         return "".join(lines[1:-1])
     return text
+
+
+def generate_allrun_script(
+    user_prompt: str, *, allrun_reference: str, openfoam_fork: str,
+    phase: str, llm_client: Any, command_context: str = "", operations=None,
+) -> str:
+    """Shared renderer for automatic, explicitly requested and repaired Allrun."""
+    if operations is not None:
+        return render_stage_script(operations)
+    script_name = 'Allmesh' if phase == 'mesh' else 'Allrun'
+    system = (
+        f"You are an expert in OpenFOAM. Generate the complete {script_name} shell script. "
+        "Return only shell code, optionally inside one outer shell code fence. "
+        "For edits, preserve the existing script except for the requested corrections. "
+        "Propagate failures of every required preparation and solver command. Use set -e; "
+        "if using pipelines, use bash with set -o pipefail. Explicitly handle any expected "
+        "nonzero status. Do not mask errors with a final successful command. "
+        "RunFunctions owns its log files: never redirect runApplication or runParallel "
+        "to the same log it creates. Use distinct log suffixes for repeated commands. "
+        "Retain the solver's native output, including its Exec header and normal End, "
+        "in root-level log files or standard output. Do not fabricate completion markers. "
+        "Do not add post-processing commands.\n"
+        + _generation_contract(openfoam_fork)
+    )
+    if phase == "solver":
+        system += (
+            "\nThe script is Allrun. The mesh has already been prepared. Only physical "
+            "field preparation, solver-parallel setup and solving belong here. Do not "
+            "generate, convert, check, modify or clean up the mesh, or call Allmesh."
+        )
+    elif phase == 'mesh':
+        system += '\nAllmesh contains mesh work only; preserve unrelated shell content and do not prepare physical fields or run a solver.'
+    system += f"\nCommand guidance: {command_context}\nReference Allrun: {allrun_reference}"
+    script = parse_shell_script(llm_client.invoke(user_prompt, system))
+    if not script.strip():
+        raise ValueError("The LLM returned an empty Allrun script.")
+    return script
 
 
 def compute_priority(subtask):
@@ -56,6 +95,8 @@ def initial_write(
     openfoam_fork: str = "foundation",
     llm_service: Optional[Any] = None,
     config: Optional[Config] = None,
+    allrun_phase: str = "all",
+    operations: Optional[List[dict]] = None,
 ) -> Dict[str, Any]:
     """
     Generate OpenFOAM files from scratch based on user requirements and subtasks.
@@ -145,14 +186,21 @@ def initial_write(
     )
     seen_targets: set[tuple[str, str]] = set()
     for subtask in subtasks:
-        target = (subtask["folder_name"], subtask["file_name"])
+        target = (subtask["folder_name"], case_file_key(subtask["file_name"]))
         if target in seen_targets:
             relative = "/".join(part for part in target if part)
             raise ValueError(f"Duplicate generated subtask target: {relative}")
         seen_targets.add(target)
+    target_errors = check_file_targets(case_dir, [
+        safe_case_relative_path(t['folder_name'], t['file_name']).as_posix() for t in subtasks])
+    if target_errors:
+        return {'dir_structure': {}, 'foamfiles': FoamPydantic(list_foamfile=[]),
+                'written_files': [], 'error_logs': target_errors}
     written_files = []
     dir_structure = {}
     generation_contract = _generation_contract(openfoam_fork)
+    advice = similar_case_advice.model_dump() if hasattr(similar_case_advice, "model_dump") else similar_case_advice
+    pre_solver_steps = advice.get("pre_solver_steps", []) if operations is None and isinstance(advice, dict) else []
     INITIAL_WRITE_SYSTEM_PROMPT = (
         "You are an expert in OpenFOAM simulation and numerical modeling."
         "Your task is to generate a complete and functional file named: <file_name>{file_name}</file_name> within the <folder_name>{folder_name}</folder_name> directory. "
@@ -168,23 +216,28 @@ def initial_write(
     )
 
     def _build_prompts(file_name: str, folder_name: str, written_files_ctx: List[FoamfilePydantic]) -> tuple[str, str]:
+        logical_name = case_file_key(file_name)
         code_system_prompt = INITIAL_WRITE_SYSTEM_PROMPT.format(
-            file_name=file_name,
+            file_name=logical_name,
             folder_name=folder_name,
             case_solver=case_solver,
             generation_contract=generation_contract,
         )
-        if isinstance(similar_case_advice, dict):
-            advice_text = (
-                f"Similar case match level: {similar_case_advice.get('match_level')}\n"
-                f"Use scope: {similar_case_advice.get('use_scope')}\n"
-                f"Advice: {similar_case_advice.get('advice')}\n"
-            )
-        else:
-            advice_text = str(similar_case_advice or "")
+        advice_text = ""
+        file_reference = tutorial_reference
+        if isinstance(advice, dict) and "per_file" in advice:
+            file_advice = next((item for item in advice["per_file"]
+                                if item.get("folder_name", "").strip("/.") == folder_name.strip("/.")
+                                and case_file_key(item.get("file_name", "")) == logical_name), None)
+            if file_advice:
+                advice_text = f"<file_advice>{file_advice}</file_advice>\n"
+                if file_advice.get("classification") in {"present_but_unused", "write_fresh"}:
+                    file_reference = ""
+        elif advice:
+            advice_text = f"<similar_case_advice>{advice}</similar_case_advice>\n"
         similar_ref_block = (
-            f"Refer to the following similar case file content if helpful:\n<similar_case_reference>{tutorial_reference}</similar_case_reference>\n"
-            if tutorial_reference else "No suitable similar case was found for this domain.\n"
+            f"<similar_case_reference>{file_reference}</similar_case_reference>\n"
+            if file_reference else "Generate this file from the user requirement and compatibility contract.\n"
         )
 
         code_user_prompt = (
@@ -198,7 +251,7 @@ def initial_write(
             "When generating controlDict, do not include anything to preform post processing. Just include the necessary settings to run the simulation."
         )
 
-        if file_name == "fvSolution":
+        if logical_name == "fvSolution":
             code_user_prompt += (
                 "\n\nCRITICAL for transient pressure-velocity coupling solvers using PISO/PIMPLE: "
                 "the solvers dictionary must include matching Final solver entries for fields used on the final correction. "
@@ -226,23 +279,40 @@ def initial_write(
         except CasePathSafetyError as exc:
             raise ValueError(f"Unsafe generated subtask path: {subtask!r}") from exc
         file_path.parent.mkdir(parents=True, exist_ok=True)
+        script_name = 'Allmesh' if allrun_phase == 'mesh' else 'Allrun'
+        if folder_name in ('', '.') and file_name == script_name and operations is not None:
+            content = render_stage_script(operations)
+            save_file(str(file_path), content)
+            return FoamfilePydantic(file_name=file_name, folder_name=folder_name, content=content)
         if reuse_generated_dir:
-            reuse_src = safe_case_path(reuse_generated_dir, folder_name, file_name)
-            if reuse_src.exists():
+            reuse_src = resolve_case_file(safe_case_path(reuse_generated_dir, folder_name, file_name))
+            if reuse_src.is_file():
                 print(f"Reusing generated file: {reuse_src}")
-                shutil.copy2(reuse_src, file_path)
+                content = read_case_text(reuse_src)
+                actual = save_case_text(file_path, content)
                 return FoamfilePydantic(
-                    file_name=file_name,
+                    file_name=actual.name,
                     folder_name=folder_name,
-                    content=read_file(str(reuse_src)),
+                    content=content,
                 )
         code_user_prompt, code_system_prompt = _build_prompts(file_name, folder_name, written_files_ctx)
         code_user_prompt += f"\n<file_task>{subtask.get('changes', '')}</file_task>"
+        if operations is not None:
+            code_user_prompt += f"\n<approved_operations>{operations}</approved_operations>\nFollow these operations without adding or independently selecting commands."
+        if folder_name == "" and file_name == "Allrun":
+            code_context = generate_allrun_script(
+                code_user_prompt + f"\nSelected solver: {case_solver}\n<existing_files>{read_case_foamfiles(case_dir, scan_case_directory(case_dir))}</existing_files>"
+                + f"\nRequired pre-solver steps: {pre_solver_steps}",
+                allrun_reference=allrun_reference, openfoam_fork=openfoam_fork,
+                phase=allrun_phase, llm_client=llm_client,
+            )
+            save_file(str(file_path), code_context)
+            return FoamfilePydantic(file_name=file_name, folder_name=folder_name, content=code_context)
         generation_response = llm_client.invoke(code_user_prompt, code_system_prompt)
         shell = folder_name in ("", ".") and file_name in {"Allrun", "Allmesh"}
         code_context = parse_shell_script(generation_response) if shell else parse_context(generation_response)
-        save_file(str(file_path), code_context)
-        return FoamfilePydantic(file_name=file_name, folder_name=folder_name, content=code_context)
+        actual = save_case_text(file_path, code_context)
+        return FoamfilePydantic(file_name=actual.name, folder_name=folder_name, content=code_context)
 
     # Build dir_structure upfront (deterministic ordering) and generate files
     for subtask in subtasks:
@@ -252,8 +322,10 @@ def initial_write(
             dir_structure[folder_name] = []
         dir_structure[folder_name].append(file_name)
 
+    script_tasks = [t for t in subtasks if (t["folder_name"], t["file_name"]) == ("", "Allrun")]
+    subtasks = [t for t in subtasks if (t["folder_name"], t["file_name"]) != ("", "Allrun")]
     generate_allrun = bool(database_path) and ("", "Allrun") not in seen_targets
-    total_steps = len(subtasks) + (2 if generate_allrun else 0)
+    total_steps = len(subtasks) + len(script_tasks) + (2 if generate_allrun else 0)
     _report_progress(0, total_steps, f"Starting file generation for {len(subtasks)} files")
 
     if generation_mode == "parallel_no_context":
@@ -292,6 +364,10 @@ def initial_write(
             written_files.append(foamfile)
             _report_progress(idx + 1, total_steps, f"Generated {file_name} in {folder_name}")
     
+    for task in script_tasks:
+        written_files.append(_generate_one(task, written_files))
+        _report_progress(len(subtasks) + 1, total_steps, "Generated Allrun")
+
     # Generate a default Allrun only when no explicit root-level task supplies it.
     if generate_allrun:
         allrun_result = build_allrun(
@@ -303,6 +379,8 @@ def initial_write(
             llm_service=llm_client,
             config=config,
             openfoam_fork=openfoam_fork,
+            pre_solver_steps=pre_solver_steps,
+            phase=allrun_phase, operations=operations,
         )
         # ``FoamfilePydantic`` stores paths relative to ``case_dir``.  Keeping
         # Allrun at the case root makes this entry safe to reuse in a later
@@ -316,8 +394,14 @@ def initial_write(
         )
     
     foamfiles = FoamPydantic(list_foamfile=written_files)
+    for foamfile in written_files:
+        folder = dir_structure.setdefault(foamfile.folder_name, [])
+        folder[:] = [name for name in folder if case_file_key(name) != case_file_key(foamfile.file_name)]
+        folder.append(foamfile.file_name)
     print("</initial_write_service>")
-    return {"dir_structure": dir_structure, "foamfiles": foamfiles}
+    return {"dir_structure": dir_structure, "foamfiles": foamfiles,
+            "written_files": [safe_case_relative_path(f.folder_name, f.file_name).as_posix()
+                              for f in written_files]}
 
 
 def build_allrun(
@@ -337,6 +421,8 @@ def build_allrun(
     config: Optional[Config] = None,
     openfoam_fork: str = "foundation",
     phase: str = "all",
+    pre_solver_steps: Optional[List[str]] = None,
+    operations: Optional[List[dict]] = None,
 ) -> Dict[str, Any]:
     """
     Build an Allrun script for automated OpenFOAM simulation execution.
@@ -383,6 +469,11 @@ def build_allrun(
         ... )
         >>> print(f"Generated script with {len(result['commands'])} commands")
     """
+    if operations is not None:
+        script = render_stage_script(operations)
+        path = str(safe_case_path(case_dir, '', 'Allmesh' if phase == 'mesh' else 'Allrun'))
+        save_file(path, script)
+        return {'allrun_path': path, 'allrun_script': script, 'commands': script_commands(operations)}
     from pydantic import BaseModel, Field
     from typing import List
     
@@ -451,10 +542,11 @@ def build_allrun(
     
     command_system_prompt += stage_prompt + "\n" + _generation_contract(openfoam_fork)
 
+    if pre_solver_steps:
+        command_user_prompt += f"\nRequired pre-solver steps in order: {pre_solver_steps}\n"
     command_response = (
-        CommandsPydantic(commands=mesh_commands)
-        if phase == "mesh"
-        else llm_client.invoke(command_user_prompt, command_system_prompt, pydantic_obj=CommandsPydantic)
+        CommandsPydantic(commands=mesh_commands) if phase == "mesh" else
+        llm_client.invoke(command_user_prompt, command_system_prompt, pydantic_obj=CommandsPydantic)
     )
 
     if progress_callback:
@@ -518,7 +610,18 @@ def build_allrun(
     if phase == "mesh":
         allrun_user_prompt += f"\nExecute these planned commands in order: {mesh_commands}\n"
 
-    allrun_response = llm_client.invoke(allrun_user_prompt, allrun_system_prompt)
+    if pre_solver_steps:
+        allrun_user_prompt += f"\nRequired pre-solver steps in order: {pre_solver_steps}\n"
+    allrun_response = (
+        llm_client.invoke(allrun_user_prompt, allrun_system_prompt)
+        if phase == "mesh" else generate_allrun_script(
+            allrun_user_prompt
+            + f"\n<existing_files>{read_case_foamfiles(case_dir, scan_case_directory(case_dir))}</existing_files>",
+            allrun_reference=allrun_reference, openfoam_fork=openfoam_fork,
+            phase=phase, llm_client=llm_client,
+            command_context=f"Planned commands: {command_response.commands}\n{commands_help}",
+        )
+    )
 
     if progress_callback:
         try:
@@ -529,7 +632,7 @@ def build_allrun(
     allrun_script = parse_shell_script(allrun_response)
     if not allrun_script.strip():
         raise ValueError("The LLM returned an empty Allrun script.")
-    allrun_file_path = os.path.join(case_dir, "Allmesh" if phase == "mesh" else "Allrun")
+    allrun_file_path = str(safe_case_path(case_dir, '', 'Allmesh' if phase == 'mesh' else 'Allrun'))
     save_file(allrun_file_path, allrun_script)
     
     return {"allrun_path": allrun_file_path, "allrun_script": allrun_script, "commands": command_response.commands}
@@ -547,6 +650,9 @@ def rewrite_files(
     openfoam_fork: str = "foundation",
     case_solver: str = "",
     llm_service: Optional[Any] = None,
+    allrun_reference: str = "",
+    operations: Optional[List[dict]] = None,
+    script_phase: str = 'solver',
 ) -> Dict[str, Any]:
     """
     Rewrite OpenFOAM files based on error analysis and reviewer suggestions.
@@ -616,7 +722,7 @@ def rewrite_files(
     )
     for entry in files:
         entry = entry.model_dump() if hasattr(entry, "model_dump") else entry
-        if entry.get("folder_name") == "system" and entry.get("file_name") == "controlDict":
+        if entry.get("folder_name") == "system" and case_file_key(entry.get("file_name", "")) == "controlDict":
             content = re.sub(
                 r"/\*.*?\*/|//[^\n]*", "", entry.get("content", ""), flags=re.DOTALL
             )
@@ -624,14 +730,18 @@ def rewrite_files(
             case_solver = application.group(1) if application else ""
             break
     generation_contract = _generation_contract(openfoam_fork)
+    plan_instruction = (
+        "Follow rewrite_plan strictly: only modify its target_files and apply only the requested changes. "
+        if rewrite_plan is not None else
+        "Return only files that require a change or addition to resolve the review analysis; preserve all other files. "
+    )
     rewrite_system_prompt = (
         "You are an expert in OpenFOAM simulation and numerical modeling. "
         "Modify files only as required by the repair context and user requirement. "
         "Changes explicitly requested by the user are allowed; preserve every other existing "
         "physical condition unless the plan explicitly requires a technical correction. "
-        "You will receive a rewrite_plan. Follow it strictly: only modify files listed in rewrite_plan.target_files and apply only the requested changes. "
-        "Do not modify files outside the plan. "
-        f"The selected solver is {case_solver or 'not specified'}. "
+        + plan_instruction
+        + f"The selected solver is {case_solver or 'not specified'}. "
         "Apply this OpenFOAM compatibility contract to every rewritten file:\n"
         f"{generation_contract}\n"
         "Return complete corrected files as JSON: "
@@ -646,8 +756,7 @@ def rewrite_files(
         f"<user_requirement>{user_requirement}</user_requirement>\n"
         f"<openfoam_fork>{openfoam_fork}</openfoam_fork>\n"
         f"<case_solver>{case_solver}</case_solver>\n"
-        "Please update OpenFOAM files according to rewrite_plan only. "
-        "Only include files from rewrite_plan.target_files in your output."
+        + plan_instruction
     )
 
     allowed_files: set[str] = set()
@@ -660,22 +769,58 @@ def rewrite_files(
                 allowed_files.add(safe_case_relative_from_text(file_path).as_posix())
             except CasePathSafetyError as exc:
                 raise ValueError(f"Unsafe rewrite target in plan: {file_path!r}") from exc
-    if not allowed_files:
+    if rewrite_plan is not None and not allowed_files:
         print("Warning: rewrite_plan.target_files is empty; no files to rewrite, leaving case unchanged.")
         return {
             "dir_structure": dir_structure,
             "foamfiles": foamfiles,
             "error_logs": error_logs,
             "updated_files": [],
+            "written_files": [],
             "file_diffs": [],
+            "rewrite_plan": {'target_files': []},
         }
+    planned_paths = {case_file_key(path): path for path in allowed_files}
+    if len(planned_paths) != len(allowed_files):
+        raise ValueError("Duplicate plain/gzip representations of a rewrite target")
+
+    target_errors = check_file_targets(case_dir, allowed_files)
+    if target_errors:
+        return {'dir_structure': dir_structure, 'foamfiles': foamfiles,
+                'error_logs': target_errors, 'written_files': [], 'updated_files': [],
+                'file_diffs': [], 'rewrite_plan': rewrite_plan}
 
     llm_client = llm_service if llm_service is not None else global_llm_service
-    response = llm_client.invoke(
-        rewrite_user_prompt,
-        rewrite_system_prompt,
-        pydantic_obj=FoamPydantic,
+    script_name = 'Allmesh' if script_phase == 'mesh' else 'Allrun'
+    script_requested = script_name in allowed_files
+    other_targets = allowed_files - {script_name}
+    response = (
+        llm_client.invoke(
+            rewrite_user_prompt,
+            rewrite_system_prompt + (f" {script_name} is handled separately: do not return it." if script_requested else ""),
+            pydantic_obj=FoamPydantic,
+        ) if not script_requested or other_targets else FoamPydantic(list_foamfile=[])
     )
+    script_requested |= any(
+        f.file_name == script_name and f.folder_name in ("", ".")
+        and (rewrite_plan is None or script_name in allowed_files)
+        for f in response.list_foamfile
+    )
+    if script_requested:
+        # Generate after the other proposed repairs are available, without changing
+        # the on-disk script before the normal diff/allowed-target handling below.
+        repaired_inputs = [f for f in response.list_foamfile if f.file_name != script_name or f.folder_name not in ("", ".")]
+        script_path = safe_case_path(case_dir, "", script_name)
+        existing_script = script_path.read_text() if script_path.is_file() else ""
+        script = generate_allrun_script(
+            rewrite_user_prompt + f"\n<existing_{script_name}>{existing_script}</existing_{script_name}>"
+            + f"\n<proposed_file_repairs>{repaired_inputs}</proposed_file_repairs>"
+            + f"\n<approved_operations>{operations}</approved_operations>\nWhen provided, preserve this operation plan exactly.",
+            allrun_reference=allrun_reference, openfoam_fork=openfoam_fork,
+            phase=script_phase, llm_client=llm_client, operations=operations,
+        )
+        response = FoamPydantic(list_foamfile=[*repaired_inputs,
+            FoamfilePydantic(file_name=script_name, folder_name="", content=script)])
 
     updated_dir = {folder: list(files) for folder, files in dir_structure.items()}
     by_relative_path = {
@@ -683,6 +828,7 @@ def rewrite_files(
         for item in foamfiles.list_foamfile
     }
     updated_files: List[str] = []
+    written_files: List[str] = []
     file_diffs: List[str] = []
     for foamfile in response.list_foamfile:
         try:
@@ -694,23 +840,41 @@ def rewrite_files(
                 f"{foamfile.folder_name!r}/{foamfile.file_name!r}"
             ) from exc
         relative_path = relative.as_posix()
-        if relative_path not in allowed_files:
+        logical_path = case_file_key(relative_path)
+        if rewrite_plan is not None and logical_path not in planned_paths:
             print(f"Warning: Skipping unplanned rewrite file: {relative_path}")
             continue
+        if rewrite_plan is not None:
+            # A logical task may name U while current context names U.gz. The
+            # task selects the representation; the model supplies its contents.
+            relative = safe_case_relative_from_text(planned_paths[logical_path])
+            file_path = safe_case_path(case_dir, str(relative.parent), relative.name)
         folder_name = "" if relative.parent.as_posix() == "." else relative.parent.as_posix()
-        file_name = relative.name
-        before = file_path.read_text(encoding="utf-8", errors="replace") if file_path.is_file() else None
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        save_file(str(file_path), foamfile.content)
+        previous = resolve_case_file(file_path)
+        try:
+            before = read_case_text(previous, errors="replace") if previous.is_file() else None
+        except (EOFError, gzip.BadGzipFile) as error:
+            if previous.suffix != '.gz' or rewrite_plan is None:
+                raise
+            # An explicit repair can replace corrupt gzip content even when
+            # its previous text cannot be recovered for a diff.
+            print(f"Warning: Replacing explicitly targeted unreadable gzip file {previous}: {error}")
+            before = None
+        actual = save_case_text(file_path, foamfile.content)
+        relative_path = actual.relative_to(Path(case_dir).expanduser().resolve()).as_posix()
+        file_name = actual.name
+        written_files.append(relative_path)
         updated_dir.setdefault(folder_name, [])
-        if file_name not in updated_dir[folder_name]:
-            updated_dir[folder_name].append(file_name)
+        updated_dir[folder_name] = [name for name in updated_dir[folder_name]
+                                    if case_file_key(name) != case_file_key(file_name)] + [file_name]
+        by_relative_path = {path: item for path, item in by_relative_path.items()
+                            if case_file_key(path) != logical_path}
         by_relative_path[relative_path] = FoamfilePydantic(
             file_name=file_name,
             folder_name=folder_name,
             content=foamfile.content,
         )
-        if before != foamfile.content:
+        if before != foamfile.content or previous != actual:
             updated_files.append(relative_path)
             file_diffs.append(
                 "".join(
@@ -723,12 +887,17 @@ def rewrite_files(
                 )
             )
     updated_foamfiles = FoamPydantic(list_foamfile=list(by_relative_path.values()))
+    written_keys = {case_file_key(path) for path in written_files}
+    pending = [task for task in rewrite_plan['target_files']
+               if case_file_key(safe_case_relative_from_text(task['file'])) not in written_keys] if rewrite_plan is not None else []
     return {
         "dir_structure": updated_dir,
         "foamfiles": updated_foamfiles,
-        "error_logs": [],
+        "error_logs": unwritten_file_errors(task['file'] for task in pending),
         "updated_files": updated_files,
+        "written_files": written_files,
         "file_diffs": file_diffs,
+        "rewrite_plan": {'target_files': pending},
     }
 
 
@@ -766,4 +935,10 @@ def _generation_contract(openfoam_fork: str) -> str:
             "Keep all generated files internally consistent with that configured fork and do not mix conventions from another fork.",
         ]
 
+    constraints.append(
+        "When a supplied tutorial matches this target and selected solver, preserve its "
+        "applicable dictionary structure and value notation while adapting requested physical "
+        "values. Do not replace native tutorial syntax based only on memory; use the actual "
+        "runtime parser errors to establish needed corrections."
+    )
     return "\n".join(f"- {constraint}" for constraint in constraints)

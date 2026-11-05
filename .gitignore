@@ -1,7 +1,11 @@
 # Project
 CLAUDE.md
+PR_DESCRIPTION.md
 .claude/settings.local.json
 .claude/memory/
+*.tmp
+*.bak
+usage_nrel_aws.json
 runs/
 output/
 benchmark/
@@ -10,7 +14,6 @@ benchmark/
 *_v10_ready/
 tests/fixtures/v10/
 .venv/
-database/foamgpt/data
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -143,6 +146,8 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.example
 .venv
 env/
 venv/

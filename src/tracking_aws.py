@@ -13,14 +13,11 @@ bedrock_runtime = tracking_aws.new_default_client()
 Your usage will be tracked in a local file called `usage_nrel_aws.json`.
 """
 from __future__ import annotations
-from math import nan
 import itertools
 import os
-import io
 import json
 import pathlib
 from typing import Union, Dict
-import pathlib
 from typing import Any
 from contextlib import contextmanager
 

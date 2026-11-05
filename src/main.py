@@ -10,15 +10,19 @@ from openfoam_target import (
 )
 from nodes.solver_planner_node import solver_planner_node
 from nodes.meshing_planner_node import meshing_planner_node
-from nodes.meshing_node import meshing_node
+from nodes.standard_meshing_node import standard_meshing_node
+from nodes.gmsh_meshing_node import gmsh_meshing_node
+from nodes.custom_meshing_node import custom_meshing_node
 from nodes.input_writer_node import input_writer_node
 from nodes.local_runner_node import local_runner_node
-from nodes.reviewer_node import reviewer_node
+from nodes.mesh_reviewer_node import mesh_reviewer_node
+from nodes.solver_reviewer_node import solver_reviewer_node
 from nodes.visualization_node import visualization_node
 from nodes.hpc_runner_node import hpc_runner_node
 from nodes.preparation_node import preparation_node
 from router_func import (
     route_after_preparation,
+    route_after_meshing_planner,
     route_after_meshing,
     route_after_solver_planner,
     route_after_input_writer,
@@ -44,23 +48,28 @@ def create_foam_agent_graph() -> StateGraph:
     # Add nodes
     workflow.add_node("meshing_planner", meshing_planner_node)
     workflow.add_node("solver_planner", solver_planner_node)
-    workflow.add_node("meshing", meshing_node)
+    workflow.add_node("standard_meshing", standard_meshing_node)
+    workflow.add_node("gmsh_meshing", gmsh_meshing_node)
+    workflow.add_node("custom_meshing", custom_meshing_node)
     workflow.add_node("input_writer", input_writer_node)
     workflow.add_node("local_runner", local_runner_node)
     workflow.add_node("hpc_runner", hpc_runner_node)
-    workflow.add_node("reviewer", reviewer_node)
+    workflow.add_node("mesh_reviewer", mesh_reviewer_node)
+    workflow.add_node("solver_reviewer", solver_reviewer_node)
     workflow.add_node("visualization", visualization_node)
     workflow.add_node("preparation", preparation_node)
     
     # Add edges
     workflow.add_edge(START, "preparation")
-    workflow.add_edge("meshing_planner", "meshing")
+    workflow.add_conditional_edges("meshing_planner", route_after_meshing_planner)
     workflow.add_conditional_edges("solver_planner", route_after_solver_planner)
-    workflow.add_conditional_edges("meshing", route_after_meshing)
+    for node in ("standard_meshing", "gmsh_meshing", "custom_meshing"):
+        workflow.add_conditional_edges(node, route_after_meshing)
     workflow.add_conditional_edges("input_writer", route_after_input_writer)
     workflow.add_conditional_edges("hpc_runner", route_after_runner)
     workflow.add_conditional_edges("local_runner", route_after_runner)
-    workflow.add_conditional_edges("reviewer", route_after_reviewer)
+    workflow.add_conditional_edges("mesh_reviewer", route_after_reviewer)
+    workflow.add_conditional_edges("solver_reviewer", route_after_reviewer)
     workflow.add_conditional_edges("preparation", route_after_preparation)
     workflow.add_edge("visualization", END)
     
@@ -87,11 +96,13 @@ def initialize_state(
         case_name="",
         subtasks=[],
         solver_planned=False,
-        solver_allrun=None,
         loop_count=0,
         llm_service=llm_service,
         case_stats=case_stats,
         tutorial_reference=None,
+        mesh_script_action=None,
+        mesh_reference=None,
+        mesh_boundary_plan=None,
         case_path_reference=None,
         dir_structure_reference=None,
         case_info=None,
@@ -101,6 +112,9 @@ def initialize_state(
         foamfiles=None,
         error_logs=None,
         history_text=None,
+        mesh_review_history=[], solver_review_history=[],
+        mesh_operations=[], solver_operations=[], pending_solver_operations=[], solver_execution=None,
+        cross_stage_request=None, solver_script_dirty=False,
         case_domain=None,
         case_category=None,
         case_solver=None,

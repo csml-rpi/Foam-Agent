@@ -14,6 +14,10 @@ from .output_safety import prepare_output_directory, validate_output_path
 def prepare_inputs(state):
     config = state["config"]
     try:
+        if config.case_dir and state.get("custom_mesh_path"):
+            # Import also clears the selected output. Protect every supplied
+            # source before that happens, including an additional mesh input.
+            validate_output_path(config.case_dir, source_path=state["custom_mesh_path"])
         if state.get("workflow_mode") == "imported_case":
             # Keep the existing adapter's target detection and failure semantics.
             update = prepare_imported_case(state)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
@@ -26,11 +27,10 @@ _TIME_DIRECTORY_RE = re.compile(
 
 
 def _read_text(path: Path, *, limit: Optional[int] = None) -> str:
+    from utils import read_case_text
     try:
-        with path.open("rb") as handle:
-            data = handle.read(limit) if limit is not None else handle.read()
-        return data.decode("utf-8", errors="replace")
-    except OSError:
+        return read_case_text(path, errors="replace", limit=limit)
+    except (OSError, EOFError):
         return ""
 
 
@@ -134,7 +134,7 @@ def _reject_source_symlinks(source: Path) -> None:
 
 def _candidate_cases(root: Path) -> list[str]:
     candidates: list[str] = []
-    for control_dict in root.rglob("controlDict"):
+    for control_dict in [*root.rglob("controlDict"), *root.rglob("controlDict.gz")]:
         if control_dict.parent.name != "system" or not control_dict.is_file():
             continue
         case_root = control_dict.parent.parent
@@ -170,10 +170,11 @@ def _select_case_root(
 
 
 def _case_evidence(case_root: Path) -> str:
+    from utils import resolve_case_file
     paths = [case_root / "system" / "controlDict"]
     for name in ("blockMeshDict", "fvSchemes", "fvSolution"):
         paths.append(case_root / "system" / name)
-    return "\n".join(_read_text(path, limit=256_000) for path in paths if path.is_file())
+    return "\n".join(_read_text(path, limit=256_000) for path in paths if resolve_case_file(path).is_file())
 
 
 def _detect_platform(case_root: Path) -> tuple[str, Optional[str]]:
@@ -231,6 +232,7 @@ def _application(case_root: Path) -> Optional[str]:
 
 def _discovery_issues(case_root: Path) -> list[str]:
     """Describe incomplete or unreadable case inputs for Planner/Reviewer."""
+    from utils import resolve_case_file
     issues: list[str] = []
     required = [
         case_root / "system" / "controlDict",
@@ -238,6 +240,7 @@ def _discovery_issues(case_root: Path) -> list[str]:
         case_root / "system" / "fvSolution",
     ]
     for path in required:
+        path = resolve_case_file(path)
         if not path.is_file():
             issues.append(f"Missing {path.relative_to(case_root).as_posix()}.")
             continue
@@ -259,13 +262,23 @@ def _discovery_issues(case_root: Path) -> list[str]:
     return issues
 
 
-def snapshot_files(root: str | Path) -> dict[str, str]:
+def snapshot_files(root: str | Path, *, exclude_runtime: bool = False) -> dict[str, str]:
     root = Path(root)
     snapshot: dict[str, str] = {}
     if not root.is_dir():
         return snapshot
-    for path in sorted(root.rglob("*")):
-        if path.is_file():
+    if exclude_runtime:
+        from utils import is_solver_output_dir
+        paths = []
+        for directory, names, files in os.walk(root, followlinks=False):
+            names[:] = [name for name in names if name != ".foamagent"]
+            if Path(directory) == root:
+                names[:] = [name for name in names if not is_solver_output_dir(name)]
+            paths.extend(Path(directory) / name for name in files)
+    else:
+        paths = root.rglob("*")
+    for path in sorted(paths):
+        if path.is_file() and not path.is_symlink():
             try:
                 snapshot[path.relative_to(root).as_posix()] = hashlib.sha256(
                     path.read_bytes()
@@ -300,6 +313,7 @@ def build_case_context(
     *,
     manifest: Optional[CaseManifest] = None,
 ) -> dict[str, Any]:
+    from utils import is_initial_time_dir, resolve_case_file
     root = Path(case_dir)
     files = sorted(
         path.relative_to(root).as_posix()
@@ -320,10 +334,10 @@ def build_case_context(
         "version": version or (manifest.version if manifest else None),
         "application": application or (manifest.application if manifest else None),
         "files": files,
-        "has_control_dict": (root / "system" / "controlDict").is_file(),
+        "has_control_dict": resolve_case_file(root / "system" / "controlDict").is_file(),
         "has_allrun": (root / "Allrun").is_file(),
         "time_directories": time_directories,
-        "has_existing_results": any(name not in {"0", "0.0"} for name in time_directories)
+        "has_existing_results": any(not is_initial_time_dir(name) for name in time_directories)
         or (root / "postProcessing").exists(),
         "candidate_cases": list(manifest.candidate_cases) if manifest else [],
         "issues": [

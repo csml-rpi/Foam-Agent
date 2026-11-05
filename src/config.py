@@ -41,6 +41,7 @@ class Config:
     # - Anthropic: claude-3-5-sonnet-latest
     model_version: str = "gpt-5.3-codex"
     temperature: float = 1
+    structured_output_method: str = "auto"
     openfoam_fork: str = "foundation"  # Default to Foundation v10
     # An explicit target is additive.  Leaving it empty keeps the existing
     # Foundation/generic-ESI routing exactly as it was before v2006 support.
@@ -49,6 +50,8 @@ class Config:
     # Embedding Configuration
     embedding_provider: str = "huggingface"  # [openai, huggingface, ollama]
     embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"  # e.g. "text-embedding-3-small", "text-embedding-3-large", "Qwen/Qwen3-Embedding-0.6B", "Qwen/Qwen3-Embedding-8B"
+    # Loading location is independent of the model identity used by FAISS.
+    embedding_model_path: str = ""
 
     def __post_init__(self) -> None:
         """Load config overrides from environment variables.
@@ -94,6 +97,17 @@ class Config:
         else:
             print(f"<config>model_version={self.model_version} (default)</config>")
 
+        self.structured_output_method = (
+            _env_nonempty("FOAMAGENT_STRUCTURED_OUTPUT_METHOD") or self.structured_output_method
+        )
+        if self.structured_output_method not in {
+            "auto", "json_schema", "function_calling", "json_mode", "json_prompt"
+        }:
+            raise ValueError(
+                "Unsupported FOAMAGENT_STRUCTURED_OUTPUT_METHOD. Use auto, "
+                "json_schema, function_calling, json_mode, or json_prompt."
+            )
+
         # Embedding provider/model overrides
         emb_provider_key = "FOAMAGENT_EMBEDDING_PROVIDER"
         emb_model_key = "FOAMAGENT_EMBEDDING_MODEL"
@@ -117,6 +131,17 @@ class Config:
             print(f"<config>embedding_model={self.embedding_model} (env:{emb_model_key})</config>")
         else:
             print(f"<config>embedding_model={self.embedding_model} (default)</config>")
+
+        self.embedding_model_path = (
+            _env_nonempty("FOAMAGENT_EMBEDDING_MODEL_PATH") or self.embedding_model_path
+        )
+        if self.embedding_model_path:
+            if self.embedding_provider.lower() != "huggingface":
+                raise ValueError("FOAMAGENT_EMBEDDING_MODEL_PATH requires the huggingface embedding provider.")
+            model_path = Path(self.embedding_model_path).expanduser().resolve()
+            if not model_path.is_dir():
+                raise ValueError(f"Local embedding model directory does not exist: {model_path}")
+            self.embedding_model_path = str(model_path)
 
         # OpenFOAM Fork Override
         fork_key = "FOAMAGENT_OPENFOAM_FORK"

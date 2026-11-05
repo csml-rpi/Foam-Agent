@@ -31,19 +31,24 @@ dependencies = [
     "langchain-anthropic>=0.2",
     "langchain-community>=0.3",
     "langchain-huggingface>=0.1",
+    "sentence-transformers>=2.6",
     "langgraph>=0.2",
     "faiss-cpu>=1.7",
     "openai>=1.0",
     "anthropic>=0.20",
     "uvicorn>=0.30",
     "pyvista>=0.44",
+    "requests>=2.31",
+    "tiktoken>=0.8",
+    "Pillow>=10",
 ]
 
 [project.optional-dependencies]
+mesh = ["gmsh>=4.11,<5"]
 hpc = ["boto3"]
 ollama = ["langchain-ollama>=0.3", "ollama>=0.4"]
 bedrock = ["langchain-aws>=0.2", "boto3"]
-all = ["foamagent[hpc,ollama,bedrock]"]
+all = ["foamagent[mesh,hpc,ollama,bedrock]"]
 
 [project.scripts]
 foamagent-mcp = "src.mcp.cli:main"
@@ -59,6 +64,7 @@ namespaces = true
 
 [tool.setuptools.package-data]
 "*" = ["*.json", "*.md"]
+"src" = ["codex_instructions_default.txt"]
 
 [tool.pytest.ini_options]
 markers = [

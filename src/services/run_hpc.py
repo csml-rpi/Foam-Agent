@@ -5,7 +5,8 @@ import subprocess
 import re
 import time
 from models import RunOut
-from utils import check_foam_errors, save_file
+from utils import save_file
+from .solver_execution import check_solver_execution
 from . import global_llm_service
 
 
@@ -378,9 +379,11 @@ def extract_cluster_info_from_requirement(
         }
 
 
-def check_logs_for_errors(case_dir: str):
+def check_logs_for_errors(case_dir: str, *, fields_before: dict[str, tuple[int, ...]],
+                          openfoam_target: str = "", timeout: int = 3600):
     """Return parsed OpenFOAM error logs for a case directory."""
-    return check_foam_errors(case_dir)
+    return check_solver_execution(
+        case_dir, fields_before=fields_before, openfoam_target=openfoam_target, timeout=timeout)
 
 
 def wait_for_job(job_id: str, max_wait_time: int = 3600, wait_interval: int = 30) -> Tuple[str, bool, str]:
@@ -445,7 +448,7 @@ def run_stage_hpc(state, script, stage, timeout):
     q = lambda p: shlex.quote(str(p))
     wrapper.write_text("#!/bin/bash\n" +
         f"cd {q(case)} || exit 1\n" +
-        f"bash {'-e -o pipefail ' if stage == 'mesh' else ''}{q(Path(script).resolve())} > {q(out)} 2> {q(err)}\n" +
+        f"bash -e -o pipefail {q(Path(script).resolve())} > {q(out)} 2> {q(err)}\n" +
         "rc=$?\n" + f"printf '%s\\n' \"$rc\" > {q(marker)}.tmp\n" +
         f"mv {q(marker)}.tmp {q(marker)}\nexit \"$rc\"\n")
     wrapper.chmod(0o700)
