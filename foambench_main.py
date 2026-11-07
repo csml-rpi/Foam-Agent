@@ -10,6 +10,19 @@ def parse_args():
     base_dir = os.path.dirname(os.path.abspath(__file__))
 
     parser.add_argument(
+        '--execution_mode', choices=['careful', 'fast'], default='careful',
+        help="careful (default): dependency-aware generation and LLM static review before the first run; fast: parallel generation without static review."
+    )
+    parser.add_argument(
+        '--input_writer_generation_mode',
+        choices=['sequential_dependency', 'parallel_no_context'], default=None,
+        help="Override only file generation; keeps the selected execution mode's review behavior."
+    )
+    parser.add_argument(
+        '--max_static_review_retries', type=int, default=10,
+        help="Maximum static review/repair rounds before the first execution (default: 10); then run, separately from max_loop."
+    )
+    parser.add_argument(
         '--openfoam_target',
         type=str,
         default=None,
@@ -59,6 +72,8 @@ def parse_args():
     args = parser.parse_args()
     if args.case_subdir and not args.case_path:
         parser.error("--case_subdir requires --case_path.")
+    if args.max_static_review_retries < 0:
+        parser.error("--max_static_review_retries must be non-negative.")
     return args
 
 def run_command(command):
@@ -100,6 +115,10 @@ def main():
 
     # Build the workflow invocation as argument tokens, not shell text.
     main_cmd = [sys.executable, "src/main.py", "--output_dir", args.output]
+    main_cmd.extend(["--execution_mode", args.execution_mode,
+                     "--max_static_review_retries", str(args.max_static_review_retries)])
+    if args.input_writer_generation_mode is not None:
+        main_cmd.extend(["--input_writer_generation_mode", args.input_writer_generation_mode])
     if args.openfoam_target:
         main_cmd.extend(["--openfoam_target", args.openfoam_target])
     if args.case_path:

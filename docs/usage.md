@@ -69,7 +69,54 @@ Each `--output` is a dedicated task directory; use a new directory for a new tas
 | `FOAMAGENT_OPENFOAM_TARGET` | Explicit native target: `foundation-v10` or `esi-v2006` | Unset; Foundation path |
 | `FOAMAGENT_OPENFOAM_FORK` | Legacy fork routing: `foundation` or translated `esi` | `foundation` |
 
-Other `Config` fields use Python configuration or an exposed CLI/API parameter. Defaults include `max_loop=25`, `recursion_limit=100`, and `max_time_limit=3600` seconds. `input_writer_generation_mode` selects `sequential_dependency` (default, files share context) or `parallel_no_context` (independent parallel generation).
+Other `Config` fields use Python configuration or an exposed CLI/API parameter. Defaults include `max_loop=25`, `recursion_limit=100`, and `max_time_limit=3600` seconds.
+
+### Execution modes and static review
+
+`execution_mode="careful"` is the default for generated and imported cases. It
+shares generated files as context and uses the configured LLM to review inputs
+before the first local run or HPC submission. `fast` generates files independently
+in parallel and skips static review. Both modes retain runtime review and repair.
+
+```bash
+# Default: dependency-aware generation and initial static review
+python foambench_main.py --prompt_path requirements.txt --output output/careful
+
+# For inexpensive runs
+python foambench_main.py --prompt_path requirements.txt --output output/fast --execution_mode fast
+```
+
+`input_writer_generation_mode` defaults to `None`, following the preset. Set it to
+`sequential_dependency` or `parallel_no_context` through the corresponding CLI flag
+or Python `Config` to override generation independently:
+
+```python
+import sys
+sys.path.insert(0, "src")  # Run from the repository root.
+from config import Config
+
+config = Config(execution_mode="careful", input_writer_generation_mode="parallel_no_context")
+```
+
+Static review requests only definite, necessary corrections to syntax,
+consistency, or explicit user requirements. It reuses the retrieved references;
+tutorial differences alone do not justify edits. Unconfirmed claims and questions
+requiring execution are warnings. Review does not establish convergence or
+physical correctness; omitted binary, oversized, hidden, or linked files are listed.
+
+`max_static_review_retries` defaults to `10` and is independent of runtime
+`max_loop`. Execution proceeds when review passes, no files change, or the repair
+limit is reached; unresolved findings remain in the report. `0` reviews once
+without repairing. A failed service call or invalid review stops the workflow.
+After the first Run, repairs proceed without repeating static review. The initial
+static phase receives its own bounded allowance above `recursion_limit`.
+
+Reports live in `CASE/.foamagent/` for generated cases or `OUTPUT/report/` for
+imports. `static_review.json` retains the last initial review;
+`review_history.jsonl` stores findings, verification decisions, edit diffs and
+runtime feedback; `static_review_references.json` stores the references used.
+Standalone MCP tools require an explicit [`static_review`](mcp.md#workflows) call;
+`run_case` follows the complete workflow.
 
 ### Authentication
 
@@ -135,11 +182,24 @@ The output contains read-only `original/`, writable `work/`, and `report/` direc
 
 In Docker, mount host case directories or ZIPs into the container and pass their container paths. Mount the output directory separately to retain results on the host.
 
-Platform detection uses OpenFOAM headers. Specify `--openfoam_target` when detection is inconclusive. A configured target conflict is routed to Reviewer for repair. With `Allrun`, no detected issues, and no explicit prompt or custom mesh, a case skips file planning and routes to Runner; LLM resources and routing calls are still required. Other cases use planning to select file changes or meshing, and fail if required physical information cannot be inferred.
+Platform detection uses OpenFOAM headers. Specify `--openfoam_target` when detection is inconclusive. A configured target conflict stops the workflow. With `Allrun`, no detected issues, and no explicit prompt or custom mesh, a case skips file planning and proceeds to pre-execution review in careful mode, or directly to Runner in fast mode; LLM resources are still required. Other cases use planning to select file changes or meshing, and fail if required physical information cannot be inferred.
 
-Local execution clears previous run artifacts and nonzero time directories from `work/` before each run. Use `original/` to recover the input; this workflow does not resume prior results. The case's `Allrun` executes from `work/` unless the repair workflow changes it. HPC execution follows its Slurm script and `Allrun` instead.
+Full workflows retain editable source inputs under the report directory's
+`inputs/workflow-*/`. Writer updates these sources, which are restored into the
+case directory before each execution. Supplied meshes and binary/private assets
+are retained. Standalone `run` executes the supplied case directly.
 
-Generated and imported cases share the repair loop. Reviewer diagnoses errors, Input Writer rewrites files, and meshing errors return to Meshing before running again. Repair stops at the retry/recursion limit or when no progress is made, retaining the last attempt's files and logs. If planning cannot proceed, correct the reported inputs and start a new run.
+Local execution clears previous run artifacts and nonzero time directories;
+it does not resume prior results. Use `original/` to recover imported inputs.
+`Allrun` executes from `work/` for imports or the generated case directory.
+HPC follows its Slurm script and the [monitoring limits](#hpc-execution-and-monitoring).
+
+Generated and imported cases share runtime repair: Reviewer diagnoses current
+errors and logs, Writer edits inputs, and mesh repairs return to Meshing.
+Repair stops at the retry/recursion limit, on no actual edits, or before repeating
+an already failed input state, retaining diagnostics. Static repair follows the
+separate policy above. If planning cannot proceed, correct the reported inputs
+and start a new run.
 
 Request visualization in the prompt. If execution succeeds but visualization fails, the status is `partial_success`, the termination reason is `visualization_failed`, and the CLI exits nonzero. MCP `run_case` returns the execution result and visualization error separately.
 
@@ -234,10 +294,10 @@ Pydantic validation, or explicitly select another method supported by that backe
 authentication errors are not silently downgraded. Test with `--check-llm` before
 starting a workflow. JSON validation checks response structure, not CFD correctness.
 
-The Codex subscription backend uses schema-in-prompt validation and supports
-`auto` and `json_prompt`. Native `json_schema`, `function_calling` and `json_mode`
-settings are rejected during client initialization; use a backend that supports
-the requested native method instead.
+The Codex subscription backend uses native strict JSON Schema with `auto` or
+`json_schema`, followed by local Pydantic validation. Use `json_prompt` explicitly
+for schema-in-prompt compatibility. `function_calling` and `json_mode` are not
+supported by this client. Authentication errors are not silently downgraded.
 
 ## Docker Builds
 

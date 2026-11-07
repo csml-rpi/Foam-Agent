@@ -16,11 +16,14 @@ class Config:
     case_dir: str = ""
     overwrite_case_dir: bool = False
     max_time_limit: int = 3600  # Max time limit after which the openfoam run will be terminated, in seconds
-    recursion_limit: int = 100  # LangGraph recursion limit
+    recursion_limit: int = 100  # Base graph budget; static review gets an additional bounded allowance
+    execution_mode: str = "careful"  # careful: review before first execution; fast: run directly
+    max_static_review_retries: int = 10  # Initial review/repair rounds, separate from max_loop
+    # Explicit override; None follows the execution mode preset.
     # Input writer generation mode:
     # - "sequential_dependency": generate files sequentially; use already-generated files as context to enforce consistency.
     # - "parallel_no_context": generate files in parallel without cross-file context (faster, may need more reviewer iterations).
-    input_writer_generation_mode: str = "sequential_dependency"
+    input_writer_generation_mode: str | None = None
     # Optional: reuse previously generated files by copying from this directory.
     # If set, InputWriter will check <reuse_generated_dir>/<folder>/<file> first.
     # When present, it will copy into the current case_dir and skip LLM generation.
@@ -52,12 +55,36 @@ class Config:
     # Loading location is independent of the model identity used by FAISS.
     embedding_model_path: str = ""
 
+    @property
+    def generation_mode(self) -> str:
+        return self.input_writer_generation_mode or (
+            "parallel_no_context" if self.execution_mode == "fast" else "sequential_dependency"
+        )
+
+    @property
+    def static_review_enabled(self) -> bool:
+        return self.execution_mode == "careful"
+
+    @property
+    def workflow_recursion_limit(self) -> int:
+        # The initial phase has at most N review/Writer pairs (one review for N=0).
+        # Leave the configured base budget available for the existing runtime graph.
+        static_steps = max(1, 2 * self.max_static_review_retries) if self.static_review_enabled else 0
+        return self.recursion_limit + static_steps
+
     def __post_init__(self) -> None:
         """Load config overrides from environment variables.
 
         Priority: env var (if set & non-empty) > default value.
         Always prints what value is used to make runs reproducible.
         """
+
+        if self.execution_mode not in {"careful", "fast"}:
+            raise ValueError("execution_mode must be careful or fast.")
+        if self.input_writer_generation_mode not in {None, "sequential_dependency", "parallel_no_context"}:
+            raise ValueError("input_writer_generation_mode must be sequential_dependency or parallel_no_context.")
+        if not isinstance(self.max_static_review_retries, int) or self.max_static_review_retries < 0:
+            raise ValueError("max_static_review_retries must be a non-negative integer.")
 
         def _env_nonempty(key: str) -> str | None:
             v = os.getenv(key)

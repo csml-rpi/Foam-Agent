@@ -83,8 +83,8 @@ def run_allrun_and_collect_errors(
             error_logs.append(
                 {
                     "file": "Allrun",
-                    "error_content": f"Allrun exceeded the {timeout} second execution timeout."
-                    + (f"\n{output}" if output else ""),
+                    "error_content": f"Allrun exceeded the {timeout} second execution timeout.",
+                    "diagnostic_context": output,
                 }
             )
         elif returncode not in (None, 0):
@@ -92,8 +92,8 @@ def run_allrun_and_collect_errors(
             error_logs.append(
                 {
                     "file": "Allrun",
-                    "error_content": f"Allrun exited with non-zero return code {returncode}."
-                    + (f"\n{output}" if output else ""),
+                    "error_content": f"Allrun exited with non-zero return code {returncode}.",
+                    "diagnostic_context": output,
                 }
             )
 
@@ -161,13 +161,29 @@ def _cleanup_run_artifacts(case_dir: str) -> None:
 
 def _execution_output(case_dir: str) -> str:
     """Return recent process output as diagnostic context for the Reviewer."""
+    root = Path(case_dir)
+    command_logs = sorted(
+        (path for path in root.glob("log*") if path.is_file() and not path.is_symlink()),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )[:3]
+    paths = [root / "Allrun.err", root / "Allrun.out", *command_logs]
     excerpts: List[str] = []
-    for name in ("Allrun.err", "Allrun.out"):
-        path = Path(case_dir) / name
+    remaining = 32_000
+    for path in paths:
+        if remaining <= 0:
+            break
+        if path.is_symlink():
+            continue
         try:
-            content = path.read_text(encoding="utf-8", errors="replace")
+            with path.open("rb") as stream:
+                stream.seek(0, 2)
+                stream.seek(max(0, stream.tell() - min(8_000, remaining)))
+                data = stream.read(min(8_000, remaining))
         except OSError:
             continue
+        content = data.decode("utf-8", errors="replace")
         if content.strip():
-            excerpts.append(f"[{name}]\n" + "\n".join(content.splitlines()[-200:]))
+            remaining -= len(data)
+            excerpts.append(f"[{path.name}: recent output]\n{content}")
     return "\n\n".join(excerpts)

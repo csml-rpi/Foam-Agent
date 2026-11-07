@@ -2,6 +2,8 @@ from services.mesh import copy_custom_mesh, prepare_standard_mesh, handle_gmsh_m
 from openfoam_target import runtime_openfoam_target
 from pathlib import Path
 from utils import load_case_files, FoamfilePydantic
+from services.case_workspace import prepare_case_workspace
+from services.review_history import ReviewHistory
 
 def meshing_node(state):
     """
@@ -21,6 +23,11 @@ def meshing_node(state):
     case_dir = state["case_dir"]
     llm_service = state.get("llm_service")
     target_version = runtime_openfoam_target(state["config"])
+    workspace = None
+    if state.get("case_input_source_dir"):
+        workspace = prepare_case_workspace(
+            case_dir, state.get("case_import_report_dir"), state["case_input_source_dir"],
+        )
     repairing = bool(state.get("repairing_mesh"))
     repair_kwargs = {
         "repair_feedback": state.get("review_analysis") or "",
@@ -56,6 +63,17 @@ def meshing_node(state):
         print("<mesh_routing>Standard mesh generation.</mesh_routing>")
         result = prepare_standard_mesh()  # service
     print("</meshing>")
+    if workspace:
+        history = ReviewHistory(case_dir, state.get("case_import_report_dir"))
+        try:
+            workspace.capture_inputs()
+        except (OSError, ValueError) as exc:
+            history.append("input_snapshot_failed", stage="meshing", error=str(exc))
+            raise
+        history.append(
+            "input_source_updated", stage="meshing", source_dir=str(workspace.source_dir),
+            error_logs=result.get("error_logs") or [],
+        )
     result.update(load_case_files({**state, **result}))
     if result.get("error_logs"):
         script = Path(case_dir) / "generate_mesh.py"
