@@ -122,9 +122,9 @@ def _ensure_faiss_dbs_loaded(config: Optional[Config] = None) -> Dict[str, Any]:
     return FAISS_DB_CACHE[cache_key]
 
 class FoamfilePydantic(BaseModel):
-    file_name: str = Field(description="Name of the OpenFOAM input file")
-    folder_name: str = Field(description="Folder where the foamfile should be stored")
-    content: str = Field(description="Content of the OpenFOAM file, written in OpenFOAM dictionary format")
+    file_name: str = Field(description="File basename only, such as epsilon or fvSolution; its directory belongs in folder_name")
+    folder_name: str = Field(description="Case-relative directory, such as 0 or system; use an empty string for a root file")
+    content: str = Field(description="Complete file content, using the syntax required by this file type")
 
 class FoamPydantic(BaseModel):
     list_foamfile: List[FoamfilePydantic] = Field(description="List of OpenFOAM configuration files")
@@ -146,6 +146,8 @@ class _CodexResponsesWrapper:
 
     class _Resp:
         def __init__(self, content: str):
+            if not content or not content.strip():
+                raise ValueError("Empty response; expected JSON or final answer text.")
             self.content = content
 
     def __init__(
@@ -176,33 +178,18 @@ class _CodexResponsesWrapper:
     def get_num_tokens(self, text: str) -> int:
         return len(self._enc.encode(text or ""))
 
-    @staticmethod
-    def _extract_json_object(text: str) -> str:
-        """Best-effort extraction of a JSON object from a model response."""
-        if not text:
-            raise ValueError("Empty response; expected JSON")
+    def with_structured_output(self, pydantic_obj: Type[BaseModel], *, method: str = "json_schema"):
+        """Constrain the response at the endpoint, then validate it locally."""
+        from openai.lib._pydantic import to_strict_json_schema
 
-        s = text.strip()
-        # Strip fenced code blocks.
-        if s.startswith("```"):
-            s = re.sub(r"^```[a-zA-Z0-9_-]*\n", "", s)
-            s = re.sub(r"\n```\s*$", "", s).strip()
-
-        # If it's already a JSON object, return it.
-        if s.startswith("{") and s.endswith("}"):
-            return s
-
-        # Otherwise, find the first {...} block.
-        m = re.search(r"\{[\s\S]*\}", s)
-        if not m:
-            raise ValueError(f"Could not find a JSON object in response: {s[:200]}")
-        return m.group(0)
-
-    def with_structured_output(self, pydantic_obj: Type[BaseModel]):
-        """Return a wrapper that parses the model output into a Pydantic object.
-
-        This is a minimal compatibility shim for LangChain's `.with_structured_output()`.
-        """
+        if method != "json_schema":
+            raise ValueError("The Responses wrapper supports native json_schema output.")
+        response_format = {
+            "type": "json_schema",
+            "name": pydantic_obj.__name__,
+            "strict": True,
+            "schema": to_strict_json_schema(pydantic_obj),
+        }
 
         parent = self
 
@@ -211,20 +198,11 @@ class _CodexResponsesWrapper:
                 return parent.get_num_tokens(text)
 
             def invoke(self, messages):
-                schema = pydantic_obj.model_json_schema()
-                schema_hint = (
-                    "Return ONLY valid JSON (no markdown) that matches this JSON Schema:\n"
-                    + str(schema)
-                )
-
-                patched = list(messages)
-                # Prepend a system constraint for JSON output.
-                patched.insert(0, {"role": "system", "content": schema_hint})
-
-                resp = parent.invoke(patched)
+                resp = parent.invoke(messages, response_format=response_format)
                 raw = getattr(resp, "content", "")
-                json_text = parent._extract_json_object(raw)
-                return pydantic_obj.model_validate_json(json_text)
+                if not raw.strip():
+                    raise ValueError("Empty response; expected JSON")
+                return pydantic_obj.model_validate_json(raw)
 
         return _StructuredWrapper()
 
@@ -240,23 +218,33 @@ class _CodexResponsesWrapper:
 
     @staticmethod
     def _extract_output_text(resp_json: dict) -> str:
-        # Newer APIs often include output_text; fall back to traversing.
-        if isinstance(resp_json, dict) and isinstance(resp_json.get("output_text"), str):
+        """Return the final answer, keeping progress messages out of artifacts."""
+        if not isinstance(resp_json, dict):
+            return ""
+        if resp_json.get("error") or resp_json.get("status") in {"failed", "incomplete"}:
+            raise RuntimeError(f"Responses failed: {resp_json.get('error') or resp_json.get('incomplete_details') or resp_json.get('status')}")
+        messages = [item for item in resp_json.get("output", [])
+                    if isinstance(item, dict) and item.get("type") in {None, "message"}]
+        phased = any(item.get("phase") for item in messages)
+        final = [item for item in messages if item.get("phase") == "final_answer"]
+        messages = final or [item for item in messages if not item.get("phase")]
+        if any(item.get("status") in {"in_progress", "incomplete"} for item in messages):
+            raise RuntimeError("Responses returned an unfinished final answer.")
+        if not phased and isinstance(resp_json.get("output_text"), str):
             return resp_json["output_text"]
+        return "\n".join(
+            content["text"] for item in messages for content in item.get("content", [])
+            if isinstance(content, dict) and content.get("type") in {"output_text", "text"}
+            and isinstance(content.get("text"), str)
+        ).strip()
 
-        texts = []
-        for item in resp_json.get("output", []) if isinstance(resp_json, dict) else []:
-            for c in item.get("content", []) if isinstance(item, dict) else []:
-                if isinstance(c, dict):
-                    if c.get("type") in {"output_text", "text"} and isinstance(c.get("text"), str):
-                        texts.append(c["text"])
-        return "\n".join(texts).strip()
-
-    def _build_payload(self, messages):
+    def _build_payload(self, messages, *, response_format: Optional[dict] = None):
         payload = {
             "model": self._model,
             "input": self._to_responses_input(messages),
         }
+        if response_format is not None:
+            payload["text"] = {"format": response_format}
 
         # OpenAI Platform supports temperature.
         if "chatgpt.com" not in self._base_url:
@@ -294,7 +282,7 @@ class _CodexResponsesWrapper:
                 break
             yield data
 
-    def invoke(self, messages):
+    def invoke(self, messages, *, response_format: Optional[dict] = None):
         url = f"{self._base_url}/responses"
         headers = {
             "Authorization": f"Bearer {self._token}",
@@ -305,7 +293,7 @@ class _CodexResponsesWrapper:
         if self._account_id:
             headers["ChatGPT-Account-Id"] = self._account_id
 
-        payload = self._build_payload(messages)
+        payload = self._build_payload(messages, response_format=response_format)
 
         # ChatGPT Codex backend can take 60-180s on complex prompts when
         # reasoning.summary=auto is enabled — the model spends time on the
@@ -331,34 +319,52 @@ class _CodexResponsesWrapper:
             data = r.json()
             return self._Resp(self._extract_output_text(data))
 
-        # Streaming: accumulate text deltas.
-        import json
-
-        chunks: list[str] = []
-        for s in self._iter_sse_text(r):
+        # Preserve output-item identity: deltas can belong to commentary or the answer.
+        items: dict[int, dict] = {}
+        parts: dict[tuple[int, int], str] = {}
+        completed = None
+        for data in self._iter_sse_text(r):
             try:
-                j = json.loads(s)
-            except Exception:
+                event = json.loads(data)
+            except (ValueError, TypeError):
                 continue
+            if not isinstance(event, dict):
+                continue
+            kind = event.get("type")
+            if kind in {"error", "response.failed", "response.incomplete"}:
+                detail = event.get("error") or event.get("message") or event.get("response", {}).get("error") or kind
+                raise RuntimeError(f"Responses stream failed: {detail}")
+            if kind == "response.completed":
+                completed = event.get("response")
+            elif not kind and ("output" in event or "output_text" in event):
+                completed = event
+            index = event.get("output_index", 0)
+            if kind in {"response.output_item.added", "response.output_item.done"}:
+                item = event.get("item")
+                if isinstance(item, dict):
+                    items[index] = {**items.get(index, {}), **item}
+            elif kind in {"response.output_text.delta", "response.output_text.done"}:
+                key = (index, event.get("content_index", 0))
+                if kind.endswith(".delta") and isinstance(event.get("delta"), str):
+                    parts[key] = parts.get(key, "") + event["delta"]
+                elif isinstance(event.get("text"), str):
+                    parts[key] = event["text"]
+        text = self._extract_output_text(completed) if isinstance(completed, dict) else ""
+        if not text:
+            # The subscription backend can finish with a metadata-only response.
+            # Completed output items still carry the final answer in that stream.
+            output = []
+            for index in sorted(set(items) | {key[0] for key in parts}):
+                item = dict(items.get(index) or {"type": "message"})
+                if not item.get("content"):
+                    item["content"] = [
+                        {"type": "output_text", "text": parts[key]}
+                        for key in sorted(parts) if key[0] == index
+                    ]
+                output.append(item)
+            text = self._extract_output_text({"output": output})
+        return self._Resp(text)
 
-            # Codex backend streams OpenAI Responses-style events.
-            if isinstance(j, dict):
-                t = j.get("type")
-                if t == "response.output_text.delta" and isinstance(j.get("delta"), str):
-                    chunks.append(j["delta"])
-                    continue
-                if t == "response.output_text.done" and isinstance(j.get("text"), str):
-                    # Some clients rely on done; we already collected deltas but keep as fallback.
-                    if not chunks:
-                        chunks.append(j["text"])
-                    continue
-
-            # Fallback: try generic extraction.
-            t2 = self._extract_output_text(j)
-            if t2:
-                chunks.append(t2)
-
-        return self._Resp("".join(chunks).strip())
 
 
 class LLMService:
@@ -504,11 +510,11 @@ class LLMService:
         """Return the configured mode, rejecting unsupported Codex native modes."""
         method = getattr(self._config, "structured_output_method", "auto")
         is_codex = self.model_provider.lower() in {"openai-codex", "codex", "chatgpt-oauth"}
-        if is_codex and method not in {"auto", "json_prompt"}:
+        if is_codex and method not in {"auto", "json_schema", "json_prompt"}:
             raise ValueError(
-                "The Codex subscription backend supports only auto or json_prompt "
+                "The Codex subscription backend supports auto, json_schema or json_prompt "
                 "for FOAMAGENT_STRUCTURED_OUTPUT_METHOD; "
-                f"{method!r} requires a backend with native structured-output support."
+                f"{method!r} is not supported by this subscription client."
             )
         return method
 
@@ -944,6 +950,15 @@ class GraphState(TypedDict):
     review_analysis: Optional[str]
     rewrite_plan: Optional[dict]
     input_writer_mode: Optional[str]
+    repair_source: Optional[str]
+    input_omissions: Optional[dict[str, str]]
+    last_repair: Optional[dict]
+    failed_run_inputs: Dict[str, List[Any]]
+    case_input_source_dir: Optional[str]
+    last_run_input_fingerprint: Optional[str]
+    static_review_report: Optional[dict]
+    static_review_retries: int
+    static_review_complete: bool  # Latched once the initial phase ends or a Runner executes.
     similar_case_advice: Optional[dict]
     # Routing decision cache
     requires_hpc: Optional[bool]
@@ -1060,10 +1075,9 @@ def is_solver_output_dir(name: str) -> bool:
     if name.startswith(SOLVER_OUTPUT_PREFIXES):
         return True
     try:
-        float(name)  # any other float-named directory is a written time step
+        return float(name) != 0  # Numeric zero spellings are initial fields too.
     except ValueError:
         return False
-    return True
 
 
 def scan_case_directory(case_dir: str) -> Dict[str, List[str]]:
@@ -1102,7 +1116,7 @@ def scan_case_directory(case_dir: str) -> Dict[str, List[str]]:
         # Do not descend into solver output; a processor* tree holds a full copy of the
         # mesh and every field, and reading it is pure cost.
         if current_depth == base_depth:
-            dirs[:] = [d for d in dirs if not is_solver_output_dir(d)]
+            dirs[:] = [d for d in dirs if not d.startswith('.') and not is_solver_output_dir(d)]
         # Only process directories one level below case_dir
         if current_depth == base_depth + 1:
             folder_name = os.path.relpath(root, case_dir)

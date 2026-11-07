@@ -129,7 +129,7 @@ def route_after_planner(state: GraphState):
             return "meshing"
         if state.get("requires_input_writer"):
             return "input_writer"
-        return _route_runner(state)
+        return _route_execution(state)
 
     mesh_type = state.get("mesh_type", "standard_mesh")
     if mesh_type == "custom_mesh":
@@ -148,7 +148,7 @@ def route_after_meshing(state: GraphState):
     if state.get("error_logs"):
         return "reviewer"
     if state.get("case_origin") == "imported":
-        return "input_writer" if state.get("requires_input_writer") else _route_runner(state)
+        return "input_writer" if state.get("requires_input_writer") else _route_execution(state)
     return "input_writer"
 
 
@@ -166,6 +166,21 @@ def route_after_input_writer(state: GraphState):
     if state.get("repairing_mesh"):
         return "meshing"
 
+    return _route_execution(state)
+
+
+def _route_execution(state: GraphState):
+    if (getattr(state.get("config"), "static_review_enabled", False)
+            and not state.get("static_review_complete")):
+        return "static_review"
+    return _route_runner(state)
+
+
+def route_after_static_review(state: GraphState):
+    if state.get("workflow_status") == "failed":
+        return END
+    if state.get("repair_source") == "static_review":
+        return "input_writer"
     return _route_runner(state)
 
 
@@ -184,6 +199,8 @@ def _route_runner(state: GraphState):
         return "local_runner"
 
 def route_after_runner(state: GraphState):
+    if state.get("termination_reason") == "repair_made_no_progress":
+        return END
     if state.get("error_logs") and len(state["error_logs"]) > 0:
         return "reviewer"
 

@@ -13,9 +13,32 @@ from services.run_hpc import (
 )
 from logger import log_review
 from openfoam_target import runtime_openfoam_target
+from services.review_history import ReviewHistory
+from services.case_workspace import prepare_case_workspace
+from services.case_inputs import case_input_fingerprint
 
 
 def hpc_runner_node(state):
+    workspace = prepare_case_workspace(
+        state["case_dir"], state.get("case_import_report_dir"), state.get("case_input_source_dir"),
+    )
+    state = {**state, "case_input_source_dir": str(workspace.source_dir) if workspace else None}
+    history = ReviewHistory(state["case_dir"], state.get("case_import_report_dir"))
+    fingerprint = case_input_fingerprint(state["case_dir"])
+    state["last_run_input_fingerprint"] = fingerprint
+    history.append("run_started", runner="hpc", runtime_loop=state.get("loop_count", 0),
+                   input_fingerprint=fingerprint)
+    result = _run_hpc(state)
+    result["static_review_complete"] = True
+    history.append(
+        "run_result", runner="hpc", runtime_loop=state.get("loop_count", 0),
+        error_logs=result.get("error_logs") or [], job_id=result.get("job_id"),
+        input_fingerprint=fingerprint,
+    )
+    return result
+
+
+def _run_hpc(state):
     """
     HPC Runner node: Extract cluster info from user requirement, create SLURM script,
     submit job to cluster, wait for completion, and check for errors.
