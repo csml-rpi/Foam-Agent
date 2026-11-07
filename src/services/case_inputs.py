@@ -1,6 +1,7 @@
 """Bounded current case inputs shared by review and repair, independent of execution mode."""
 
 import hashlib
+import gzip
 import json
 import os
 from pathlib import Path
@@ -40,6 +41,7 @@ def is_case_artifact(relative: Path, *, directory: bool = False) -> bool:
         relative.name.startswith("log")
         or relative.name in {
             "Allrun.out", "Allrun.err", "workflow.log", "review.log", "similar_case.txt",
+            "Allmesh.out", "Allmesh.err", "submit_job.slurm",
         }
     )
 
@@ -123,8 +125,13 @@ def read_case_inputs(case_dir: str) -> tuple[FoamPydantic, dict[str, str]]:
         if not path.is_file():
             omitted[name] = "Non-regular input not inspected"
             continue
-        with path.open("rb") as handle:
-            data = handle.read(min(128_000, remaining) + 1)
+        try:
+            opener = gzip.open if path.suffix == ".gz" else open
+            with opener(path, "rb") as handle:
+                data = handle.read(min(128_000, remaining) + 1)
+        except (EOFError, gzip.BadGzipFile):
+            omitted[name] = "Unreadable gzip input not inspected"
+            continue
         if len(data) > min(128_000, remaining):
             omitted[name] = "File exceeds the per-file or total review context limit"
             continue

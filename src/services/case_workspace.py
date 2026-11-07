@@ -6,6 +6,8 @@ import tempfile
 
 from .case_inputs import is_case_artifact
 from .review_history import ReviewHistory
+from .case_paths import safe_case_relative_from_text
+from utils import resolve_case_file
 
 
 def prepare_case_workspace(
@@ -107,3 +109,15 @@ class CaseWorkspace:
             self.source_dir, self.case_dir, symlinks=True, dirs_exist_ok=True,
             ignore=self._ignored(self.source_dir),
         )
+
+    def update_inputs(self, written_files) -> None:
+        """Commit explicit input edits without capturing execution-expanded files."""
+        for name in written_files:
+            relative = safe_case_relative_from_text(name)
+            source = self.case_dir / relative
+            target = self.source_dir / relative
+            previous = resolve_case_file(target)
+            if previous != target and previous.is_file():
+                previous.unlink()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target, follow_symlinks=False)

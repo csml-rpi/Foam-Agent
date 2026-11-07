@@ -11,7 +11,7 @@ def parse_args():
 
     parser.add_argument(
         '--execution_mode', choices=['careful', 'fast'], default='careful',
-        help="careful (default): dependency-aware generation and LLM static review before the first run; fast: parallel generation without static review."
+        help="careful (default): dependency-aware generation and initial mesh/solver static review; fast: parallel generation without static review."
     )
     parser.add_argument(
         '--input_writer_generation_mode',
@@ -20,7 +20,7 @@ def parse_args():
     )
     parser.add_argument(
         '--max_static_review_retries', type=int, default=10,
-        help="Maximum static review/repair rounds before the first execution (default: 10); then run, separately from max_loop."
+        help="Static repair rounds shared by initial mesh/solver reviews (default: 10), separate from max_loop."
     )
     parser.add_argument(
         '--openfoam_target',
@@ -62,7 +62,7 @@ def parse_args():
         '--custom_mesh_path',
         type=str,
         default=None,
-        help="Path to a Gmsh .msh file (ASCII 2.2 format). If not provided, no custom mesh will be used."
+        help="Path to a Gmsh .msh file (ASCII 2.2 format)."
     )
     parser.add_argument(
         '--overwrite_output',

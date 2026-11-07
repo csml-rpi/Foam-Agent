@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from services.plan import (
     resolve_case_dir,
     retrieve_references,
-    generate_simulation_plan
+    generate_simulation_plan,
 )
 from services.input_writer import initial_write
 from services.run_local import run_allrun_and_collect_errors
@@ -122,8 +122,12 @@ async def plan(
         
         await ctx.info(f"Generated {len(plan_data['subtasks'])} subtasks")
         
-        # Convert subtasks to PlanResponse format
-        subtasks = [{"file": s["file_name"], "folder": s["folder_name"]} for s in plan_data["subtasks"]]
+        # Keep legacy path keys while preserving the planner's file instructions.
+        subtasks = [
+            {"file": task["file_name"], "folder": task["folder_name"],
+             **{key: task[key] for key in ("stage", "action", "changes") if key in task}}
+            for task in plan_data["subtasks"]
+        ]
         
         return PlanResponse(
             subtasks=subtasks,
@@ -218,11 +222,12 @@ async def input_writer(
             if isinstance(st, dict):
                 # Handle both formats: {file, folder} or {file_name, folder_name}
                 file_name = st.get("file_name") or st.get("file")
-                folder_name = st.get("folder_name") or st.get("folder")
-                if file_name and folder_name:
+                folder_name = st.get("folder_name", st.get("folder"))
+                if file_name and folder_name is not None:
                     converted_subtasks.append({
                         "file_name": file_name,
-                        "folder_name": folder_name
+                        "folder_name": folder_name,
+                        **{key: st[key] for key in ("stage", "action", "changes") if key in st},
                     })
                 else:
                     raise ValueError(f"Invalid subtask format: {st}. Must have 'file'/'file_name' and 'folder'/'folder_name'")
@@ -278,6 +283,8 @@ async def input_writer(
             generation_mode=config.generation_mode,
             config=config,
         )
+        if result.get('error_logs'):
+            raise RuntimeError(str(result['error_logs']))
 
         await ctx.info(f"result: {result}")
 
@@ -349,7 +356,6 @@ async def run(
         if not os.path.exists(request.case_dir):
             raise ValueError(f"Case directory does not exist: {request.case_dir}")
         
-        # Run locally
         error_logs = run_allrun_and_collect_errors(
             case_dir=request.case_dir,
             timeout=request.timeout,
@@ -576,8 +582,12 @@ async def apply_fixes(
             user_requirement=request.user_requirement,
             foamfiles=foamfiles,
             openfoam_fork=generation_convention(global_config),
+            script_phase="all",
             omitted_files=omitted,
+            static_repair=not request.error_logs,
         )
+        if (result.get('rewrite_plan') or {}).get('target_files') and result.get('error_logs'):
+            raise RuntimeError(str(result['error_logs']))
 
         written_files = [
             os.path.join(request.case_dir, relative_path)
@@ -643,7 +653,7 @@ class RunCaseRequest(BaseModel):
     )
     custom_mesh_path: Optional[str] = Field(
         default=None,
-        description="Optional external mesh used by the imported-case workflow",
+        description="Optional Gmsh .msh file (ASCII 2.2 format)",
     )
     openfoam_target: Optional[str] = Field(
         default=None,
@@ -654,13 +664,13 @@ class RunCaseRequest(BaseModel):
         description="Allow replacement of an existing Foam-Agent-owned output directory",
     )
     execution_mode: Optional[Literal["careful", "fast"]] = Field(
-        default=None, description="careful (default) reviews inputs before the first execution; fast skips static review",
+        default=None, description="careful (default) reviews before initial mesh and solver execution; fast skips static review",
     )
     input_writer_generation_mode: Optional[Literal["sequential_dependency", "parallel_no_context"]] = Field(
         default=None, description="Explicit file generation override, independent of static review",
     )
     max_static_review_retries: Optional[int] = Field(
-        default=None, ge=0, description="Static review/repair rounds before the first execution (default 10); independent of max_loop",
+        default=None, ge=0, description="Static repair rounds shared by both initial stages (default 10); independent of max_loop",
     )
 
 
@@ -675,7 +685,7 @@ class RunCaseResponse(BaseModel):
     errors: List[Any] = Field(description="Terminal execution or workflow errors")
     termination_reason: Optional[str] = Field(description="Reason the workflow stopped, if it failed")
     static_review: Optional[StaticReviewReport] = Field(
-        default=None, description="Initial pre-run static review; not repeated after runtime repairs, separate from runtime errors",
+        default=None, description="Aggregated initial mesh/solver static reviews; not repeated after runtime repairs",
     )
 
 

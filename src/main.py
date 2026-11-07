@@ -2,30 +2,34 @@ from typing import Optional
 from langgraph.graph import StateGraph, START, END
 import argparse
 from pathlib import Path
-from utils import GraphState, load_agent_resources
+from utils import GraphState
 
 from config import Config
 from openfoam_target import (
     normalise_openfoam_target,
 )
-from nodes.planner_node import planner_node
-from nodes.meshing_node import meshing_node
+from nodes.solver_planner_node import solver_planner_node
+from nodes.meshing_planner_node import meshing_planner_node
+from nodes.standard_meshing_node import standard_meshing_node
+from nodes.gmsh_meshing_node import gmsh_meshing_node
+from nodes.custom_meshing_node import custom_meshing_node
 from nodes.input_writer_node import input_writer_node
 from nodes.local_runner_node import local_runner_node
-from nodes.reviewer_node import reviewer_node
+from nodes.mesh_reviewer_node import mesh_reviewer_node
+from nodes.solver_reviewer_node import solver_reviewer_node
 from nodes.static_review_node import static_review_node
 from nodes.visualization_node import visualization_node
 from nodes.hpc_runner_node import hpc_runner_node
-from nodes.imported_case_node import case_import_node
+from nodes.preparation_node import preparation_node
 from router_func import (
-    route_after_case_import,
+    route_after_preparation,
+    route_after_meshing_planner,
     route_after_meshing,
-    route_after_planner,
+    route_after_solver_planner,
     route_after_input_writer,
     route_after_runner,
     route_after_reviewer,
     route_after_static_review,
-    route_workflow_entry,
 )
 from logger import close_logging
 from services.plan import DEFAULT_IMPORTED_REQUIREMENT
@@ -44,26 +48,33 @@ def create_foam_agent_graph() -> StateGraph:
     workflow = StateGraph(GraphState)
     
     # Add nodes
-    workflow.add_node("planner", planner_node)
-    workflow.add_node("meshing", meshing_node)
+    workflow.add_node("meshing_planner", meshing_planner_node)
+    workflow.add_node("solver_planner", solver_planner_node)
+    workflow.add_node("standard_meshing", standard_meshing_node)
+    workflow.add_node("gmsh_meshing", gmsh_meshing_node)
+    workflow.add_node("custom_meshing", custom_meshing_node)
     workflow.add_node("input_writer", input_writer_node)
     workflow.add_node("local_runner", local_runner_node)
     workflow.add_node("hpc_runner", hpc_runner_node)
-    workflow.add_node("reviewer", reviewer_node)
+    workflow.add_node("mesh_reviewer", mesh_reviewer_node)
+    workflow.add_node("solver_reviewer", solver_reviewer_node)
     workflow.add_node("static_review", static_review_node)
     workflow.add_node("visualization", visualization_node)
-    workflow.add_node("case_import", case_import_node)
+    workflow.add_node("preparation", preparation_node)
     
     # Add edges
-    workflow.add_conditional_edges(START, route_workflow_entry)
-    workflow.add_conditional_edges("planner", route_after_planner)
-    workflow.add_conditional_edges("meshing", route_after_meshing)
+    workflow.add_edge(START, "preparation")
+    workflow.add_conditional_edges("meshing_planner", route_after_meshing_planner)
+    workflow.add_conditional_edges("solver_planner", route_after_solver_planner)
+    for node in ("standard_meshing", "gmsh_meshing", "custom_meshing"):
+        workflow.add_conditional_edges(node, route_after_meshing)
     workflow.add_conditional_edges("input_writer", route_after_input_writer)
     workflow.add_conditional_edges("hpc_runner", route_after_runner)
     workflow.add_conditional_edges("local_runner", route_after_runner)
-    workflow.add_conditional_edges("reviewer", route_after_reviewer)
+    workflow.add_conditional_edges("mesh_reviewer", route_after_reviewer)
+    workflow.add_conditional_edges("solver_reviewer", route_after_reviewer)
     workflow.add_conditional_edges("static_review", route_after_static_review)
-    workflow.add_conditional_edges("case_import", route_after_case_import)
+    workflow.add_conditional_edges("preparation", route_after_preparation)
     workflow.add_edge("visualization", END)
     
     return workflow
@@ -82,19 +93,20 @@ def initialize_state(
     """Build state for generated or imported agent workflows."""
     case_stats = None
     llm_service = None
-    if workflow_mode == "prompt":
-        llm_service, case_stats = load_agent_resources(config)
-    # mesh_type = "custom_mesh" if custom_mesh_path else "standard_mesh"
     state = GraphState(
         user_requirement=user_requirement,
         config=config,
         case_dir="",
         case_name="",
         subtasks=[],
+        solver_planned=False,
         loop_count=0,
         llm_service=llm_service,
         case_stats=case_stats,
         tutorial_reference=None,
+        mesh_script_action=None,
+        mesh_reference=None,
+        mesh_boundary_plan=None,
         case_path_reference=None,
         dir_structure_reference=None,
         case_info=None,
@@ -104,6 +116,9 @@ def initialize_state(
         foamfiles=None,
         error_logs=None,
         history_text=None,
+        mesh_review_history=[], solver_review_history=[],
+        mesh_operations=[], solver_operations=[], pending_solver_operations=[], solver_execution=None,
+        cross_stage_request=None, solver_script_dirty=False,
         case_domain=None,
         case_category=None,
         case_solver=None,
@@ -122,7 +137,10 @@ def initialize_state(
         case_input_source_dir=None,
         static_review_report=None,
         static_review_retries=0,
-        static_review_complete=False,
+        static_review_complete={},
+        static_review_reports={},
+        static_review_repair=None,
+        static_review_stage=None,
         requires_hpc=None,
         requires_visualization=requires_visualization,
         job_id=None,
@@ -212,7 +230,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--execution_mode", choices=["careful", "fast"], default="careful",
-        help="careful (default): dependency-aware generation and LLM static review before the first run; fast: parallel generation without static review.",
+        help="careful (default): dependency-aware generation and initial mesh/solver static review; fast: parallel generation without static review.",
     )
     parser.add_argument(
         "--input_writer_generation_mode",
@@ -221,7 +239,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--max_static_review_retries", type=int, default=10,
-        help="Static review/repair rounds before the first execution (default: 10); then run, independently of max_loop.",
+        help="Static repair rounds shared by initial mesh/solver reviews (default: 10), independent of max_loop.",
     )
     parser.add_argument(
         "--prompt_path",
@@ -267,7 +285,7 @@ if __name__ == "__main__":
         "--custom_mesh_path",
         type=str,
         default=None,
-        help="Path to a Gmsh .msh file (ASCII 2.2 format). If not provided, no custom mesh will be used.",
+        help="Path to a Gmsh .msh file (ASCII 2.2 format).",
     )
     parser.add_argument(
         "--reuse_generated_dir",

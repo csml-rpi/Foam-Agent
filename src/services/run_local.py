@@ -1,10 +1,10 @@
 import os
-import re
 import shutil
 from pathlib import Path
 from typing import Any, List
 
-from utils import check_foam_errors, remove_numeric_folders, run_command
+from utils import remove_numeric_folders, run_command
+from .solver_execution import PROCESSOR_DIRECTORY_RE, check_solver_execution, snapshot_result_fields
 
 
 def run_allrun_and_collect_errors(
@@ -38,14 +38,14 @@ def run_allrun_and_collect_errors(
         >>> errors = run_allrun_and_collect_errors(
         ...     case_dir="/path/to/case",
         ...     timeout=1800,
-        ...     max_retries=2
+        ...     max_retries=2,
         ... )
         >>> if not errors:
         ...     print("Simulation completed successfully")
         >>> else:
         ...     print(f"Found {len(errors)} errors")
     """
-    allrun_file_path = os.path.join(case_dir, "Allrun")
+    allrun_file_path = str(Path(case_dir).resolve() / "Allrun")
     if not os.path.isfile(allrun_file_path):
         return [
             {
@@ -66,12 +66,14 @@ def run_allrun_and_collect_errors(
             if openfoam_target
             else {}
         )
+        fields_before = snapshot_result_fields(case_dir)
         command_result = run_command(
             allrun_file_path,
             out_file,
             err_file,
             case_dir,
             timeout,
+            fail_fast=True,
             **command_kwargs,
         )
 
@@ -97,7 +99,8 @@ def run_allrun_and_collect_errors(
                 }
             )
 
-        error_logs.extend(check_foam_errors(case_dir))
+        error_logs.extend(check_solver_execution(
+            case_dir, fields_before=fields_before, openfoam_target=openfoam_target, timeout=timeout))
         error_logs = _deduplicate_errors(error_logs)
         if not error_logs:
             return []
@@ -132,7 +135,7 @@ def _deduplicate_errors(errors: List[Any]) -> List[Any]:
 
 
 def _cleanup_run_artifacts(case_dir: str) -> None:
-    """Remove disposable outputs before retrying a newly generated case."""
+    """Remove disposable solver outputs before a fresh execution attempt."""
     root = Path(case_dir)
     try:
         entries = list(root.iterdir())
@@ -150,7 +153,7 @@ def _cleanup_run_artifacts(case_dir: str) -> None:
             ):
                 entry.unlink()
             elif entry.is_dir() and (
-                re.fullmatch(r"processor\d+", entry.name)
+                PROCESSOR_DIRECTORY_RE.fullmatch(entry.name)
                 or entry.name in {"postProcessing", "VTK"}
             ):
                 shutil.rmtree(entry)

@@ -113,11 +113,15 @@ To apply corrections, format error findings as `review_analysis` text and pass
 read-only and leaves history persistence to the client.
 
 Full `run_case` uses the [static review policy and reports](usage.md#execution-modes-and-static-review)
-and retains canonical inputs under `report/inputs/workflow-*/`. Writer updates
-these sources; execution restores them into `work/`. Standalone `run` executes
+with mesh and solver initial reviews sharing one repair allowance. It retains
+canonical inputs under `report/inputs/workflow-*/`. Writer updates these sources;
+successful mesh handoffs synchronize the current mesh before execution restores
+inputs into `work/`. Standalone `run` executes
 the supplied case directly.
 
 Individual tools do not execute the complete graph. `run` is local-only and executes directly, without automatic static review; there is no standalone meshing or HPC tool. Use the CLI graph for generated-case Gmsh/custom-mesh and HPC routing; use `run_case` for the imported-case graph, including automatic static review in careful mode and its configured repair limits. [HPC monitoring limits](usage.md#hpc-execution-and-monitoring) apply to that graph.
+
+`run` executes the supplied Allrun directly without rewriting its commands or asking a model to locate solver invocations. Success requires a zero exit status, normal native solver completion and a new or rewritten result field from the current execution, including time zero. Result changes are checked across the whole Allrun; individual commands are not observed separately.
 
 Standalone `review` reads the case and supplied errors, but uses fixed `simpleFoam`/`fluid`/`tutorial` metadata and the directory basename for retrieval rather than inferring the solver.
 
@@ -126,7 +130,7 @@ Structured execution errors keep `file` and `error_content`; an optional
 errors so review has the complete execution evidence. Standalone `run` keeps its
 string-based error list and includes this context in each corresponding string.
 
-`run_case` returns `status`, `message`, `visualization_error`, `case_dir`, `report_dir`, `errors`, `termination_reason`, and the last initial-phase `static_review` (or `null` if unavailable). This report is not refreshed after runtime repairs. Static findings are separate from runtime `errors`. Simulation success with failed visualization is `partial_success` with message `Simulation completed successfully, but visualization failed.` Standalone `visualization` raises an error on failure.
+`run_case` returns `status`, `message`, `visualization_error`, `case_dir`, `report_dir`, `errors`, `termination_reason`, and the aggregated initial mesh/solver `static_review` (or `null` if unavailable). This report is not refreshed after runtime repairs. Static findings are separate from runtime `errors`. Simulation success with failed visualization is `partial_success` with message `Simulation completed successfully, but visualization failed.` Standalone `visualization` raises an error on failure.
 
 ## Claude Code Skill
 

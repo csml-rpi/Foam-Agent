@@ -16,6 +16,7 @@ import requests
 import time
 import random
 import shutil
+import gzip
 from config import Config
 from openfoam_target import database_path_for_config, require_target_corpus
 try:
@@ -921,6 +922,24 @@ class GraphState(TypedDict):
     case_dir: str
     case_name: str
     subtasks: List[dict]
+    mesh_review_history: List[dict]
+    solver_review_history: List[dict]
+    mesh_operations: List[dict]
+    solver_operations: List[dict]
+    pending_solver_operations: List[dict]
+    solver_execution: Optional[dict]
+    cross_stage_request: Optional[dict]
+    solver_script_dirty: bool
+    mesh_jobs: Optional[List[dict]]
+    solver_jobs: Optional[List[dict]]
+    solver_planned: bool
+    replan_solver: bool
+    pending_solver_subtasks: Optional[List[dict]]
+    mesh_execution: Optional[dict]
+    mesh_script_action: Optional[str]
+    mesh_reference: Optional[dict]
+    mesh_boundary_plan: Optional[List[dict]]
+    final_reconstruction: Optional[dict]
     loop_count: int
     # Additional state fields that will be added during execution
     llm_service: Optional['LLMService']
@@ -938,11 +957,13 @@ class GraphState(TypedDict):
     case_domain: Optional[str]
     case_category: Optional[str]
     case_solver: Optional[str]
+    mesh_source: Optional[str]
     # Mesh-related state fields
     mesh_info: Optional[dict]
     mesh_commands: Optional[List[str]]
     custom_mesh_used: Optional[bool]
     mesh_type: Optional[str]
+    mesh_subtasks: Optional[List[dict]]
     repairing_mesh: bool
     mesh_resume_state: Optional[dict]
     custom_mesh_path: Optional[str]
@@ -958,7 +979,10 @@ class GraphState(TypedDict):
     last_run_input_fingerprint: Optional[str]
     static_review_report: Optional[dict]
     static_review_retries: int
-    static_review_complete: bool  # Latched once the initial phase ends or a Runner executes.
+    static_review_complete: Dict[str, bool]  # Each initial stage review ends once.
+    static_review_reports: Dict[str, dict]
+    static_review_repair: Optional[dict]
+    static_review_stage: Optional[str]
     similar_case_advice: Optional[dict]
     # Routing decision cache
     requires_hpc: Optional[bool]
@@ -968,7 +992,7 @@ class GraphState(TypedDict):
     cluster_info: Optional[dict]
     slurm_script_path: Optional[str]
     termination_reason: Optional[str]
-    # Existing cases participate in the same planner/writer/runner/reviewer graph.
+    # Existing cases share Meshing and the solver-planner/writer/runner/reviewer graph.
     workflow_mode: str
     case_origin: str
     user_requirement_explicit: bool
@@ -1004,6 +1028,54 @@ def read_file(path: str) -> str:
             return f.read()
     return ""
 
+
+def case_file_key(path: str | Path) -> str:
+    """The same OpenFOAM file can have plain and gzip representations."""
+    name = Path(path).as_posix()
+    return name[:-3] if name.endswith(".gz") else name
+
+
+def resolve_case_file(path: str | Path) -> Path:
+    """Select the plain file first, as OpenFOAM does, then its gzip variant."""
+    plain = Path(case_file_key(path))
+    for candidate in (plain, Path(str(plain) + ".gz")):
+        if candidate.is_symlink():
+            raise ValueError(f"Case file variants must not be symbolic links: {candidate}")
+        if candidate.is_file():
+            return candidate
+    return Path(path)
+
+
+def read_case_text(path: str | Path, *, errors: str = "strict", limit: int | None = None) -> str:
+    """Read native case text, including gzip inputs, with an optional byte limit."""
+    actual = resolve_case_file(path)
+    opener = gzip.open if actual.suffix == ".gz" else open
+    with opener(actual, "rb") as stream:
+        data = stream.read(limit) if limit is not None else stream.read()
+    return data.decode("utf-8", errors=errors)
+
+
+def save_case_text(path: str | Path, content: str) -> Path:
+    """Preserve an existing gzip input on logical-path edits and remove stale variants."""
+    requested = Path(path)
+    plain = Path(case_file_key(requested))
+    compressed = Path(str(plain) + ".gz")
+    for candidate in (plain, compressed):
+        if candidate.is_symlink():
+            raise ValueError(f"Case file variants must not be symbolic links: {candidate}")
+        if candidate.exists() and not candidate.is_file():
+            raise IsADirectoryError(f"Case file variant is not a regular file: {candidate}")
+    actual = requested if requested.suffix == ".gz" else resolve_case_file(requested)
+    actual.parent.mkdir(parents=True, exist_ok=True)
+    opener = gzip.open if actual.suffix == ".gz" else open
+    with opener(actual, "wt", encoding="utf-8") as stream:
+        stream.write(content)
+    alternate = plain if actual.suffix == ".gz" else compressed
+    if alternate.is_file():
+        alternate.unlink()
+    print(f"Saved file at {actual}")
+    return actual
+
 def remove_files(directory: str, prefix: str) -> None:
     for file in os.listdir(directory):
         if file.startswith(prefix):
@@ -1025,17 +1097,25 @@ def _is_numeric_name(name: str) -> bool:
     return True
 
 
+def is_initial_time_dir(name: str) -> bool:
+    """Accept every numeric spelling of time zero, including 0.0 and 0e0."""
+    try:
+        return float(name) == 0
+    except ValueError:
+        return False
+
+
 def remove_numeric_folders(case_dir: str) -> None:
     """
     Remove all folders in case_dir that represent numeric values, including those with decimal points,
-    except for the "0" folder.
+    except for initial time-zero folders.
     
     Args:
         case_dir (str): The directory path to process
     """
     for item in os.listdir(case_dir):
         item_path = os.path.join(case_dir, item)
-        if item == "0":
+        if is_initial_time_dir(item):
             continue
         # Never follow a numeric symlink while cleaning solver output.  A
         # retry must remove the link itself, not traverse or delete its target.
@@ -1057,7 +1137,7 @@ def remove_numeric_folders(case_dir: str) -> None:
 
 # Directories an OpenFOAM run writes into the case, which are output rather than input:
 # every written time step ("0.02", "100", ...), the per-rank copies decomposePar makes,
-# and the post-processing trees. `0` and `0.orig` are kept -- those are the initial
+# and the post-processing trees. Time zero and `0.orig` are kept -- those are the initial
 # conditions, which are part of the case.
 SOLVER_OUTPUT_PREFIXES = ("processor", "postProcessing", "VTK", "dynamicCode")
 
@@ -1070,7 +1150,7 @@ def is_solver_output_dir(name: str) -> bool:
     reach 22.5 MB (~5.6M tokens) on a case that had already run once -- a mesh's worth
     of field data per time step -- which no model can accept.
     """
-    if name in ("0", "0.orig"):
+    if name == "0.orig" or is_initial_time_dir(name):
         return False
     if name.startswith(SOLVER_OUTPUT_PREFIXES):
         return True
@@ -1084,8 +1164,9 @@ def scan_case_directory(case_dir: str) -> Dict[str, List[str]]:
     """
     Scan an OpenFOAM case directory and return the directory structure.
     
-    This function traverses the case directory one level deep and collects
-    the files in each subdirectory (typically 'system', 'constant', '0', etc.).
+    This function collects the files in each input directory (typically
+    'system', 'constant', '0', etc.), including regional inputs for a case
+    declaring constant/regionProperties. Bulk mesh files are read separately.
     Directories the solver wrote (time steps, processor*, postProcessing) are skipped:
     they are output, not case definition, and embedding them overflows every prompt.
     
@@ -1109,21 +1190,41 @@ def scan_case_directory(case_dir: str) -> Dict[str, List[str]]:
     
     dir_structure = {}
     base_depth = case_dir.rstrip(os.sep).count(os.sep)
+    regional = any((Path(case_dir) / ("constant/regionProperties" + suffix)).is_file()
+                   for suffix in ("", ".gz"))
+    initial_directories = {
+        path.name for path in Path(case_dir).iterdir()
+        if path.is_dir() and is_initial_time_dir(path.name)
+    }
     
     # Walk through the directory tree
     for root, dirs, files in os.walk(case_dir):
         current_depth = root.rstrip(os.sep).count(os.sep)
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
         # Do not descend into solver output; a processor* tree holds a full copy of the
         # mesh and every field, and reading it is pure cost.
         if current_depth == base_depth:
-            dirs[:] = [d for d in dirs if not d.startswith('.') and not is_solver_output_dir(d)]
-        # Only process directories one level below case_dir
-        if current_depth == base_depth + 1:
+            dirs[:] = [d for d in dirs if not is_solver_output_dir(d)]
+        elif current_depth == base_depth + 1:
+            if regional and Path(root).name in {"system", "constant", *initial_directories}:
+                dirs[:] = [d for d in dirs if d != "polyMesh"]
+                if Path(root).name == "constant":
+                    # Regional dictionaries have a mesh or corresponding input
+                    # directory; do not embed unrelated geometry source trees.
+                    dirs[:] = [d for d in dirs if (Path(root) / d / "polyMesh").is_dir()
+                               or any((Path(case_dir) / parent / d).is_dir()
+                                      for parent in ("system", *initial_directories))]
+            else:
+                dirs[:] = []
+        else:
+            dirs[:] = []
+        if current_depth == base_depth + 1 or (regional and current_depth == base_depth + 2):
             folder_name = os.path.relpath(root, case_dir)
             if is_solver_output_dir(folder_name):
                 continue
             # Filter out hidden files and only include regular files
-            regular_files = [f for f in files if not f.startswith('.') and os.path.isfile(os.path.join(root, f))]
+            regular_files = [f for f in files if not f.startswith('.') and os.path.isfile(os.path.join(root, f))
+                             and not (f.endswith('.gz') and f[:-3] in files)]
             if regular_files:
                 dir_structure[folder_name] = regular_files
     
@@ -1166,21 +1267,25 @@ def read_case_foamfiles(case_dir: str, dir_structure: Optional[Dict[str, List[st
     
     # Read files from each folder
     for folder_name, file_names in dir_structure.items():
+        seen_files = set()
         for file_name in file_names:
             file_path = os.path.join(case_dir, folder_name, file_name)
             
             try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
+                actual = resolve_case_file(file_path)
+                if actual in seen_files:
+                    continue
+                content = read_case_text(actual)
+                seen_files.add(actual)
                 
                 foamfile_list.append(FoamfilePydantic(
-                    file_name=file_name,
+                    file_name=actual.name,
                     folder_name=folder_name,
                     content=content
                 ))
             except UnicodeDecodeError:
                 print(f"Warning: Skipping file due to encoding error: {file_path}")
-            except OSError as e:
+            except (OSError, EOFError) as e:
                 print(f"Warning: Error reading file {file_path}: {e}")
     
     return FoamPydantic(list_foamfile=foamfile_list)
@@ -1193,6 +1298,7 @@ def run_command(
     max_time_limit: int,
     *,
     openfoam_target: str = "",
+    fail_fast: bool = False,
 ) -> Dict[str, Any]:
     print(f"Executing script {script_path} in {working_dir}")
     script = Path(script_path).expanduser().resolve()
@@ -1231,7 +1337,8 @@ def run_command(
         'active WM_PROJECT_VERSION=${WM_PROJECT_VERSION:-unset}" >&2; exit 64; '
         'fi; '
         'fi; '
-        'exec bash "$foamagent_script"'
+        + ('exec bash -e -o pipefail "$foamagent_script"' if fail_fast
+           else 'exec bash "$foamagent_script"')
     )
 
     timed_out = False
@@ -1386,7 +1493,7 @@ def retrieve_faiss(
     topk: int = 1,
     *,
     config: Optional[Config] = None,
-) -> dict:
+) -> List[Dict[str, Any]]:
     """
     Retrieve a similar case from a FAISS database selected by ``config``.
 
@@ -1394,6 +1501,9 @@ def retrieve_faiss(
     by legacy callers.  Supplying it is required when one process serves
     multiple configured workflows, because each embedding model needs its own
     compatible FAISS index and query vector.
+
+    Return an empty list when the search finds no documents. Loading and search
+    errors propagate to the caller.
     """
 
     dbs = _ensure_faiss_dbs_loaded(config)
@@ -1411,9 +1521,6 @@ def retrieve_faiss(
     except (AttributeError, NotImplementedError):
         docs = vectordb.similarity_search(query, k=topk)
         scores = [None] * len(docs)
-
-    if not docs:
-        raise ValueError(f"No documents found for query: {query}")
 
     formatted_results = []
     for doc, score in zip(docs, scores):
@@ -1502,6 +1609,20 @@ def load_case_files(state: dict[str, Any]) -> dict[str, Any]:
         return {}
     directory = scan_case_directory(case_dir)
     input_directory = _case_input_directory(directory)
+    scripts = [name for name in ("Allrun", "Allmesh", "generate_mesh.py")
+               if (Path(case_dir) / name).is_file()]
+    if scripts:
+        input_directory[""] = scripts
+    boundary = resolve_case_file(Path(case_dir) / "constant/polyMesh/boundary")
+    if boundary.is_file():
+        input_directory["constant/polyMesh"] = [boundary.name]
+    constant = Path(case_dir) / "constant"
+    if any((constant / ("regionProperties" + suffix)).is_file() for suffix in ("", ".gz")):
+        for region in constant.iterdir():
+            if region.is_dir() and not region.name.startswith('.'):
+                boundary = resolve_case_file(region / "polyMesh/boundary")
+                if boundary.is_file():
+                    input_directory[boundary.parent.relative_to(Path(case_dir)).as_posix()] = [boundary.name]
     foamfiles = read_case_foamfiles(case_dir, input_directory)
     return {
         "dir_structure": directory,
@@ -1514,9 +1635,10 @@ def _case_input_directory(directory: dict[str, list[str]]) -> dict[str, list[str
     selected = {
         name: files
         for name, files in directory.items()
-        if name in {"system", "constant", "0", "0.0"}
+        if name.partition(os.sep)[0] in {"system", "constant"}
+        or is_initial_time_dir(name.partition(os.sep)[0])
     }
-    if "0" in selected or "0.0" in selected:
+    if any(is_initial_time_dir(name.partition(os.sep)[0]) for name in selected):
         return selected
     numeric: list[tuple[float, str]] = []
     for name in directory:
