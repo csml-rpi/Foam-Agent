@@ -1,21 +1,38 @@
 """Thin LangGraph adapter for OpenFOAM input generation and rewriting."""
 
 from pathlib import Path
-from utils import read_case_foamfiles, scan_case_directory, load_case_files
+from utils import scan_case_directory, load_case_files
 from services.input_writer import initial_write, build_allrun, rewrite_files
 from services.case_paths import safe_case_relative_path
 from services.stage_plan import check_stage_operations, check_stage_inputs, check_stage_script, stage_outcome, pending_file_creates, unwritten_file_errors
+from services.review_history import ReviewHistory
+from services.case_inputs import read_case_inputs
+from services.case_workspace import CaseWorkspace
+from services.static_review import finish_static_repair
 from translation.esi_translator import convert_case_to_esi_if_needed
 from openfoam_target import database_path_for_config, generation_convention, uses_legacy_esi_translation
 
 def input_writer_node(state):
-    """
-    InputWriter node: Generate the complete OpenFOAM foamfile.
-    
-    Args:
-        state: The current state containing all necessary information
-    """
+    """Edit clean inputs, then expose those inputs to review and execution."""
+    original = state
+    if state.get("case_input_source_dir"):
+        state = {**state, "case_dir": state["case_input_source_dir"],
+                 "case_import_report_dir": original.get("case_import_report_dir") or str(Path(original["case_dir"]) / ".foamagent")}
+    out = _write_solver_inputs(state)
+    history = ReviewHistory(original["case_dir"], original.get("case_import_report_dir"))
+    if state["input_writer_mode"] == "rewrite" and state.get("repair_source") != "static_review":
+        history.append("file_repair", stage="solver", source=state.get("repair_source"),
+                       runtime_loop=state.get("loop_count", 0),
+                       updated_files=out.get("updated_files", []), file_diffs=out.get("file_diffs", []))
+    if out.get("workflow_status") != "failed" and not out.get("error_logs"):
+        if original.get("case_input_source_dir"):
+            CaseWorkspace(original["case_dir"], original["case_input_source_dir"]).restore_inputs()
+        out.update(load_case_files(original))
+    out.update(finish_static_repair(original, "solver", out))
+    return out
 
+
+def _write_solver_inputs(state):
     errors = check_stage_operations(state["solver_operations"], "solver")
     if errors:
         outcome = {"executed": False, "error_logs": errors}
@@ -92,37 +109,57 @@ def _build_solver_allrun(state):
 def _rewrite_mode(state):
     """Rewrite mode: delegate to service to modify files based on review analysis."""
     print("<input_writer mode=\"rewrite\">")
+    if not state.get("review_analysis"):
+        return {}
+    history = ReviewHistory(state["case_dir"], state.get("case_import_report_dir"))
+    static_repair = state.get("repair_source") == "static_review"
+    write_dir = state.get("case_input_source_dir") or state["case_dir"]
+    if state.get("case_input_source_dir"):
+        foamfiles, omitted = read_case_inputs(write_dir)
+        directory = scan_case_directory(write_dir)
+    else:
+        foamfiles, omitted = state.get("foamfiles"), state.get("input_omissions")
+        directory = state.get("dir_structure", {})
     out = rewrite_files(
-        case_dir=state["case_dir"],
+        case_dir=write_dir,
         error_logs=state.get("error_logs", []),
         review_analysis=state.get("review_analysis", ""),
         rewrite_plan=state.get("rewrite_plan"),
         user_requirement=state.get("user_requirement", "")
         + f"\n<solver_reference>{state.get('tutorial_reference') or ''}</solver_reference>",
-        foamfiles=state.get("foamfiles"),
-        dir_structure=state.get("dir_structure", {}),
+        foamfiles=foamfiles,
+        dir_structure=directory,
         openfoam_fork=generation_convention(state["config"]),
         case_solver=state.get("case_solver", ""),
         allrun_reference=state.get("allrun_reference") or "",
         operations=state["solver_operations"],
         llm_service=state.get("llm_service"),
+        review_context=history.context(events={"file_repair", "static_review_exit"}) if static_repair else "",
+        tutorial_reference=state.get("tutorial_reference") or "",
+        omitted_files=omitted,
+        static_repair=static_repair,
     )
     print("</input_writer>")
     
     if uses_legacy_esi_translation(state["config"]):
-        convert_case_to_esi_if_needed(state["case_dir"], state["config"])
+        convert_case_to_esi_if_needed(write_dir, state["config"])
     
     # Rescan the directory and foam files to reflect any translations
-    out["dir_structure"] = scan_case_directory(state["case_dir"])
-    out["foamfiles"] = read_case_foamfiles(state["case_dir"], out["dir_structure"])
+    out["dir_structure"] = scan_case_directory(write_dir)
+    out["foamfiles"], out["input_omissions"] = read_case_inputs(write_dir)
+    out["last_repair"] = {
+        "updated_files": out.get("updated_files", []),
+        "file_diffs": out.get("file_diffs", []),
+    }
 
-    if (state.get("error_logs") and not out.get("updated_files") and not state.get("repairing_mesh")
+    if (not static_repair and state.get("error_logs") and not out.get("updated_files") and not state.get("repairing_mesh")
             and not state["solver_script_dirty"] and not _preflight_plan_repaired(state)):
         print("Repair made no file changes. Stopping without rerunning the case.")
         out.update({
             "error_logs": state["error_logs"] + out.get('error_logs', []),
             "workflow_status": "failed",
             "termination_reason": "repair_made_no_progress",
+            "workflow_message": "Repair made no file changes; execution was not started.",
         })
 
     return out
@@ -143,8 +180,9 @@ def _initial_write_mode(state):
         allrun_reference=state.get("allrun_reference") or "",
         allrun_phase="solver",
         operations=state["solver_operations"],
+        case_info=state.get("case_info", ""),
         openfoam_fork=generation_convention(config),
-        generation_mode=getattr(config, "input_writer_generation_mode", "sequential_dependency"),
+        generation_mode=getattr(config, "generation_mode", "sequential_dependency"),
         similar_case_advice=state.get("similar_case_advice"),
         reuse_generated_dir=getattr(config, "reuse_generated_dir", ""),
         llm_service=state.get("llm_service"),
@@ -164,12 +202,13 @@ def _initial_write_mode(state):
     
     # Rescan the directory and foam files to reflect any translations
     dir_structure = scan_case_directory(state["case_dir"])
-    foamfiles = read_case_foamfiles(state["case_dir"], dir_structure)
+    foamfiles, omitted = read_case_inputs(state["case_dir"])
 
     return {
         "dir_structure": dir_structure,
         "commands": [],
         "foamfiles": foamfiles,
         "written_files": write_out['written_files'],
+        "input_omissions": omitted,
     }
 

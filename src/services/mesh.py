@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import sys
+from difflib import unified_diff
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -50,6 +51,18 @@ def _convert_mesh(case_dir, timeout, openfoam_target, utility_runner, execution)
         raise RuntimeError('checkMesh reported failed mesh checks.\n' + checked.stdout)
 
 
+def prepare_custom_mesh(custom_mesh_path, case_dir, *, retry=False, source_written=False):
+    mesh_in_case_dir = Path(case_dir) / 'geometry.msh'
+    origin_file = Path(case_dir) / '.foamagent/mesh-source.json'
+    origin = dict(source=str(Path(custom_mesh_path).expanduser().resolve()), backend='custom_mesh')
+    previous = json.loads(origin_file.read_text()) if origin_file.is_file() else None
+    if source_written or not retry or previous != origin or not mesh_in_case_dir.is_file():
+        if not (mesh_in_case_dir.exists() and os.path.samefile(custom_mesh_path, mesh_in_case_dir)):
+            shutil.copy2(custom_mesh_path, mesh_in_case_dir)
+    origin_file.parent.mkdir(parents=True, exist_ok=True)
+    origin_file.write_text(json.dumps(origin))
+
+
 def copy_custom_mesh(custom_mesh_path: str, case_dir: str, *, timeout: int,
                      openfoam_target: str = '', utility_runner=None, retry: bool = False,
                      source_written: bool = False) -> Dict[str, Any]:
@@ -61,25 +74,15 @@ def copy_custom_mesh(custom_mesh_path: str, case_dir: str, *, timeout: int,
         return _mesh_failure(f'Custom mesh not found: {custom_mesh_path}', execution)
     os.makedirs(case_dir, exist_ok=True)
     mesh_in_case_dir = Path(case_dir)/'geometry.msh'
-    origin_file = Path(case_dir)/'.foamagent/mesh-source.json'
-    origin = dict(source=str(Path(custom_mesh_path).expanduser().resolve()), backend='custom_mesh')
     try:
-        previous = json.loads(origin_file.read_text()) if origin_file.is_file() else None
-    except ValueError as error:
-        return _mesh_failure(f'Invalid mesh-source evidence: {error}', execution)
-    try:
-        # A declared source write must reach conversion; other retries retain
-        # any repairs made directly to the working geometry.msh.
-        if source_written or not retry or previous != origin or not mesh_in_case_dir.is_file():
-            if not (mesh_in_case_dir.exists() and os.path.samefile(custom_mesh_path, mesh_in_case_dir)):
-                shutil.copy2(custom_mesh_path, mesh_in_case_dir)
-        origin_file.parent.mkdir(parents=True, exist_ok=True)
-        origin_file.write_text(json.dumps(origin))
+        prepare_custom_mesh(custom_mesh_path, case_dir, retry=retry, source_written=source_written)
         (Path(case_dir)/'constant').mkdir(exist_ok=True)
         (Path(case_dir)/'system').mkdir(exist_ok=True)
         _convert_mesh(case_dir, timeout, openfoam_target, utility_runner, execution)
     except HpcWorkflowStop:
         raise
+    except ValueError as error:
+        return _mesh_failure(f'Invalid mesh-source evidence: {error}', execution)
     except subprocess.CalledProcessError as error:
         return _mesh_failure(f'Custom mesh conversion/check failed: {error.stderr or error.stdout or error}', execution)
     except subprocess.TimeoutExpired:
@@ -114,6 +117,34 @@ class GMSHPythonCode(BaseModel):
     geometry_type: str = Field(description='Planned geometry description')
 
 
+def prepare_gmsh_script(user_requirement, case_dir, *, script_prepared, llm_service=None,
+                        openfoam_target='', repair_feedback=''):
+    python_file = Path(case_dir) / 'generate_mesh.py'
+    changes = {'updated_files': [], 'file_diffs': []}
+    if not script_prepared:
+        existing = python_file.read_text() if python_file.is_file() else ''
+        client = llm_service if llm_service is not None else global_llm_service
+        response = client.invoke(
+            f'<user_requirements>{user_requirement}</user_requirements>\n'
+            f'<openfoam_target>{openfoam_target}</openfoam_target>\n'
+            f'<existing_python_code>{existing}</existing_python_code>\n'
+            f'<repair_feedback>{repair_feedback}</repair_feedback>',
+            GMSH_PYTHON_SYSTEM_PROMPT, pydantic_obj=GMSHPythonCode)
+        if not response.python_code.strip():
+            raise RuntimeError('Gmsh code generation returned an empty script.')
+        save_file(str(python_file), response.python_code)
+        if existing != response.python_code:
+            changes['updated_files'].append('generate_mesh.py')
+            changes['file_diffs'].append(''.join(
+                line if line.endswith('\n') else line + '\n\\ No newline at end of file\n'
+                for line in unified_diff(
+                    existing.splitlines(keepends=True), response.python_code.splitlines(keepends=True),
+                    fromfile='before/generate_mesh.py', tofile='after/generate_mesh.py')))
+    if not python_file.is_file():
+        raise RuntimeError('The declared prepared Gmsh script is missing.')
+    return changes
+
+
 def handle_gmsh_mesh(user_requirement: str, case_dir: str, *, timeout: int, script_prepared: bool,
                      llm_service: Optional[Any] = None, openfoam_target: str = '', utility_runner=None,
                      repair_feedback: str = '', python_runner=None) -> Dict[str, Any]:
@@ -124,20 +155,9 @@ def handle_gmsh_mesh(user_requirement: str, case_dir: str, *, timeout: int, scri
     msh_file = Path(case_dir)/'geometry.msh'
     execution = []
     try:
-        if not script_prepared:
-            existing = python_file.read_text() if python_file.is_file() else ''
-            client = llm_service if llm_service is not None else global_llm_service
-            response = client.invoke(
-                f'<user_requirements>{user_requirement}</user_requirements>\n'
-                f'<openfoam_target>{openfoam_target}</openfoam_target>\n'
-                f'<existing_python_code>{existing}</existing_python_code>\n'
-                f'<repair_feedback>{repair_feedback}</repair_feedback>',
-                GMSH_PYTHON_SYSTEM_PROMPT, pydantic_obj=GMSHPythonCode)
-            if not response.python_code.strip():
-                return _mesh_failure('Gmsh code generation returned an empty script.', execution)
-            save_file(str(python_file), response.python_code)
-        if not python_file.is_file():
-            return _mesh_failure('The declared prepared Gmsh script is missing.', execution)
+        prepare_gmsh_script(user_requirement, case_dir, script_prepared=script_prepared,
+                            llm_service=llm_service, openfoam_target=openfoam_target,
+                            repair_feedback=repair_feedback)
         _clear_gmsh_attempt_outputs(case_dir)
         _run_mesh_command(execution, python_runner or subprocess.run, [sys.executable, str(python_file)],
                           cwd=case_dir, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

@@ -5,10 +5,12 @@ from difflib import unified_diff
 from typing import Dict, List, Any, Optional, Callable
 from pathlib import Path
 from utils import save_file, parse_context, retrieve_faiss, FoamPydantic, FoamfilePydantic, scan_case_directory, read_case_foamfiles, case_file_key, resolve_case_file, read_case_text, save_case_text
+import json
 from config import Config
-from openfoam_target import database_path_for_config
+from openfoam_target import database_path_for_config, generation_contract as _generation_contract
 from . import global_llm_service
 from .stage_plan import script_commands, render_stage_script, check_file_targets, unwritten_file_errors
+from .case_inputs import format_case_inputs, read_case_inputs
 from .case_paths import (
     CasePathSafetyError,
     safe_case_path,
@@ -65,24 +67,13 @@ def generate_allrun_script(
     return script
 
 
-def compute_priority(subtask):
-    if subtask["folder_name"] == "system":
-        return 0
-    elif subtask["folder_name"] == "constant":
-        return 1
-    elif subtask["folder_name"] == "0":
-        return 2
-    else:
-        return 3
-
-
 def initial_write(
     case_dir: str,
     subtasks: List[Dict[str, str]],
     user_requirement: str,
     tutorial_reference: str,
     case_solver: str,
-    generation_mode: str = "sequential_dependency",
+    generation_mode: Optional[str] = None,
     case_info: str = "",
     allrun_reference: str = "",
     mesh_type: str = "blockMesh",
@@ -102,8 +93,8 @@ def initial_write(
     Generate OpenFOAM files from scratch based on user requirements and subtasks.
     
     This function creates OpenFOAM input files by analyzing user requirements,
-    using similar case references, and generating files in the correct order
-    (system -> constant -> 0 -> others). It also generates an Allrun script
+    using similar case references and preserving the Planner's dependency order
+    when sharing generated context. It also generates an Allrun script
     for automated execution.
     
     Args:
@@ -158,6 +149,8 @@ def initial_write(
         except Exception as exc:  # noqa: BLE001 - progress_callback implementation is external
             print(f"<progress_callback_error>{exc}</progress_callback_error>")
 
+    if generation_mode is None:
+        generation_mode = getattr(config, "generation_mode", "sequential_dependency")
     if generation_mode not in {"sequential_dependency", "parallel_no_context"}:
         raise ValueError(
             f"Unsupported generation_mode: {generation_mode}. "
@@ -180,10 +173,7 @@ def initial_write(
         normalized["file_name"] = relative.name
         return normalized
 
-    subtasks = sorted(
-        (_normalise_initial_subtask(item) for item in subtasks),
-        key=compute_priority,
-    )
+    subtasks = [_normalise_initial_subtask(item) for item in subtasks]
     seen_targets: set[tuple[str, str]] = set()
     for subtask in subtasks:
         target = (subtask["folder_name"], case_file_key(subtask["file_name"]))
@@ -223,6 +213,15 @@ def initial_write(
             case_solver=case_solver,
             generation_contract=generation_contract,
         )
+        code_system_prompt += (
+            "\nThe per-file planning advice describes how to use the reference. "
+            "For reuse, retain its structure and settings except changes required by the user, "
+            "the target runtime, or consistency with actual generated dependencies. "
+            "For modify, apply the described delta and any other changes necessary for those same constraints. "
+            "Do not redesign compatible reference settings or add speculative numerical tuning. "
+            "The advice is fallible: explicit user requirements and actual compatibility take precedence; "
+            "a reference default is never an additional user requirement. "
+        )
         advice_text = ""
         file_reference = tutorial_reference
         if isinstance(advice, dict) and "per_file" in advice:
@@ -242,6 +241,8 @@ def initial_write(
 
         code_user_prompt = (
             f"User requirement: {user_requirement}\n"
+            f"Case plan: {case_info}\n"
+            f"Planned inputs in generation order: {json.dumps(subtasks, ensure_ascii=False)}\n"
             f"{similar_ref_block}{advice_text}\n"
             "If the similar case is a weak match, do not copy it blindly. Use it only where it is consistent with the user requirement. "
             "The OpenFOAM compatibility contract in the system prompt takes precedence over incompatible syntax in a reference case. "
@@ -265,7 +266,8 @@ def initial_write(
 
         if generation_mode == "sequential_dependency" and written_files_ctx:
             code_user_prompt += (
-                f"The following are files content already generated: {written_files_ctx}\n\n\n"
+                "The following are files content already generated:\n"
+                f"{format_case_inputs(FoamPydantic(list_foamfile=written_files_ctx))}\n\n"
                 "You should ensure that the new file is consistent with the previous files. Such as boundary conditions, mesh settings, etc."
             )
 
@@ -333,7 +335,7 @@ def initial_write(
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import threading
 
-        # Parallelize all file generations; keep output order consistent with sorted subtasks.
+        # Parallelize generation; keep returned files in the provided plan order.
         results: List[Optional[FoamfilePydantic]] = [None] * len(subtasks)
         completed_count = 0
         count_lock = threading.Lock()
@@ -484,6 +486,14 @@ def build_allrun(
     if config is not None or openfoam_fork == "esi-v2006":
         database_path = str(database_path_for_config(retrieval_config))
 
+    input_context = ""
+    if os.path.isdir(case_dir):
+        current_inputs, omitted = read_case_inputs(case_dir)
+        input_context = (
+            f"<current_case_inputs>{format_case_inputs(current_inputs)}</current_case_inputs>\n"
+            f"<omitted_files>{json.dumps(omitted, ensure_ascii=False)}</omitted_files>\n"
+        )
+
     # CommandsPydantic class for structured response
     class CommandsPydantic(BaseModel):
         commands: List[str] = Field(description="List of commands")
@@ -506,7 +516,7 @@ def build_allrun(
     # Command generation system prompt
     command_system_prompt = (
         "You are an expert in OpenFOAM. The user will provide a list of available commands. "
-        "Your task is to generate only the necessary OpenFOAM commands required to create an Allrun script for the given user case, based on the provided directory structure. "
+        "Your task is to generate only the necessary OpenFOAM commands required to create an Allrun script for the given user case, based on its current inputs and case plan. "
         "Return only the list of commands—no explanations, comments, or additional text."
     )
 
@@ -531,7 +541,9 @@ def build_allrun(
     
     command_user_prompt = (
         f"Available OpenFOAM commands for the Allrun script: {commands}\n"
+        f"User requirement: {user_requirement}\n"
         f"Case directory structure: {dir_structure}\n"
+        f"{input_context}"
         f"User case information: {case_info}\n"
         f"Reference Allrun scripts from similar cases: {allrun_reference}\n"
         "Generate only the required OpenFOAM command list—no extra text."
@@ -571,6 +583,10 @@ def build_allrun(
     # Allrun generation system prompt
     allrun_system_prompt = (
         "You are an expert in OpenFOAM. Generate an Allrun script based on the provided details."
+        "The listed case inputs have already been generated. Allrun orchestrates tools; "
+        "do not recreate those inputs with duplicate inline definitions. It must remain "
+        "safe to rerun after repairs: preserve preprocessing templates and do not overwrite "
+        "a repaired dictionary with an embedded copy. "
         f"Available commands with descriptions: {commands_help}\n\n"
         f"Reference Allrun scripts from similar cases: {allrun_reference}\n\n"
         "If custom mesh commands are provided, make sure to include them in the appropriate order in the Allrun script. "
@@ -588,6 +604,7 @@ def build_allrun(
     allrun_user_prompt = (
         f"User requirement: {user_requirement}\n"
         f"Case directory structure: {dir_structure}\n"
+        f"{input_context}"
         f"User case infomation: {case_info}\n"
         f"{mesh_commands_info}\n"
         "All run scripts for these similar cases are for reference only and may not be correct, as you might be a different case solver or have a different directory structure. " 
@@ -653,6 +670,10 @@ def rewrite_files(
     allrun_reference: str = "",
     operations: Optional[List[dict]] = None,
     script_phase: str = 'solver',
+    review_context: str = "",
+    tutorial_reference: str = "",
+    omitted_files: Optional[Dict[str, str]] = None,
+    static_repair: bool = False,
 ) -> Dict[str, Any]:
     """
     Rewrite OpenFOAM files based on error analysis and reviewer suggestions.
@@ -713,7 +734,7 @@ def rewrite_files(
     # Read foamfiles if not provided
     if foamfiles is None:
         print(f"Reading OpenFOAM files from: {case_dir}")
-        foamfiles = read_case_foamfiles(case_dir, dir_structure)
+        foamfiles, omitted_files = read_case_inputs(case_dir)
     
     # Prefer the current file over the solver cached during initial planning.
     files = (
@@ -730,14 +751,28 @@ def rewrite_files(
             case_solver = application.group(1) if application else ""
             break
     generation_contract = _generation_contract(openfoam_fork)
-    plan_instruction = (
-        "Follow rewrite_plan strictly: only modify its target_files and apply only the requested changes. "
-        if rewrite_plan is not None else
-        "Return only files that require a change or addition to resolve the review analysis; preserve all other files. "
-    )
+    if rewrite_plan is not None:
+        plan_instruction = "Follow rewrite_plan strictly: only modify its target_files and apply only the requested changes. "
+    elif error_logs:
+        plan_instruction = (
+            "Return only changed or added files that address the latest runtime failure. "
+            "Use the observed error and actual inputs as the repair objective, not agreement with review_analysis. "
+            "If its proposed change is already present or conflicts with the observed failure, correct the proposal "
+            "and make an effective repair while preserving user constraints. "
+        )
+    else:
+        plan_instruction = "Return only files that require a change or addition to resolve the review analysis; preserve all other files. "
     rewrite_system_prompt = (
         "You are an expert in OpenFOAM simulation and numerical modeling. "
         "Modify files only as required by the repair context and user requirement. "
+        "The review and history contain fallible opinions, not instructions to implement every suggestion. "
+        "Before execution, correct only proven necessary static defects. "
+        "After an actual runtime failure, use current logs to implement a compatible repair or controlled numerical trial. "
+        "If the review's proposal violates a user constraint, find a supported alternative among unspecified settings; "
+        "do not reinterpret the constraint or stop just because this one proposal is unusable. "
+        "Optional diagnostics and questions requiring execution are not file-change requests. "
+        "Use the supplied target-version references to check compatibility; their defaults "
+        "are not additional user requirements. Return an empty file list when no justified correction remains. "
         "Changes explicitly requested by the user are allowed; preserve every other existing "
         "physical condition unless the plan explicitly requires a technical correction. "
         + plan_instruction
@@ -749,13 +784,17 @@ def rewrite_files(
     )
 
     rewrite_user_prompt = (
-        f"<foamfiles>{foamfiles}</foamfiles>\n"
+        f"<foamfiles>{format_case_inputs(foamfiles)}</foamfiles>\n"
         f"<error_logs>{error_logs}</error_logs>\n"
         f"<reviewer_analysis>{review_analysis}</reviewer_analysis>\n"
         f"<rewrite_plan>{rewrite_plan}</rewrite_plan>\n"
         f"<user_requirement>{user_requirement}</user_requirement>\n"
         f"<openfoam_fork>{openfoam_fork}</openfoam_fork>\n"
         f"<case_solver>{case_solver}</case_solver>\n"
+        f"<tutorial_reference>{tutorial_reference}</tutorial_reference>\n"
+        f"<allrun_reference>{allrun_reference}</allrun_reference>\n"
+        f"<omitted_files>{omitted_files or {}}</omitted_files>\n"
+        + (f"<review_history>{review_context}</review_history>\n" if review_context else "")
         + plan_instruction
     )
 
@@ -878,7 +917,8 @@ def rewrite_files(
             updated_files.append(relative_path)
             file_diffs.append(
                 "".join(
-                    unified_diff(
+                    line if line.endswith("\n") else line + "\n\\ No newline at end of file\n"
+                    for line in unified_diff(
                         (before or "").splitlines(keepends=True),
                         foamfile.content.splitlines(keepends=True),
                         fromfile=f"before/{relative_path}",
@@ -893,52 +933,9 @@ def rewrite_files(
     return {
         "dir_structure": updated_dir,
         "foamfiles": updated_foamfiles,
-        "error_logs": unwritten_file_errors(task['file'] for task in pending),
+        "error_logs": [] if static_repair else unwritten_file_errors(task['file'] for task in pending),
         "updated_files": updated_files,
         "written_files": written_files,
         "file_diffs": file_diffs,
         "rewrite_plan": {'target_files': pending},
     }
-
-
-def _generation_contract(openfoam_fork: str) -> str:
-    """Return version/fork constraints shared by initial writes and rewrites.
-
-    The contract is intentionally solver-level rather than case-level: it contains
-    no geometry, material, boundary, or operating values from a particular case.
-    """
-    fork = (openfoam_fork or "foundation").strip().lower()
-    if fork == "foundation":
-        constraints = [
-            "The target runtime is Foundation OpenFOAM v10 from openfoam.org.",
-            "Use only Foundation OpenFOAM v10 solver, file, field, dictionary, and boundary-condition conventions.",
-            "Do not use or mix in ESI/OpenCFD openfoam.com conventions from versioned releases such as v20xx, v21xx, v22xx, v23xx, or v24xx.",
-            "If a reference case conflicts with Foundation OpenFOAM v10, ignore the conflicting syntax and follow Foundation v10.",
-        ]
-    elif fork == "esi-v2006":
-        constraints = [
-            "The target runtime is ESI/OpenCFD OpenFOAM v2006 from openfoam.com.",
-            "Generate a native ESI v2006 case directly from the supplied ESI v2006 tutorial references.",
-            "Use only ESI v2006 solver, file, dictionary, function-object, and boundary-condition conventions.",
-            "Do not use Foundation OpenFOAM v10 conventions and do not rely on any post-generation translator.",
-            "Keep all generated files internally consistent with the ESI v2006 solver selected by the planner.",
-        ]
-    elif fork == "esi":
-        constraints = [
-            "The configured target runtime is ESI/OpenCFD OpenFOAM from openfoam.com.",
-            "Use ESI-compatible solver, file, field, dictionary, and boundary-condition conventions consistently.",
-            "Do not mix Foundation-only conventions into the generated files.",
-        ]
-    else:
-        constraints = [
-            f"The configured OpenFOAM fork is {fork!r}.",
-            "Keep all generated files internally consistent with that configured fork and do not mix conventions from another fork.",
-        ]
-
-    constraints.append(
-        "When a supplied tutorial matches this target and selected solver, preserve its "
-        "applicable dictionary structure and value notation while adapting requested physical "
-        "values. Do not replace native tutorial syntax based only on memory; use the actual "
-        "runtime parser errors to establish needed corrections."
-    )
-    return "\n".join(f"- {constraint}" for constraint in constraints)

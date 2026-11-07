@@ -10,6 +10,8 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 from models import PlannedFileChange, StageOperation
 from .stage_plan import OPERATION_CONTRACT, MESH_STAGE_CONTRACT, mesh_operation_updates, replace_pending_tasks, resolve_file_tasks, script_commands, check_stage_operations
 from .case_paths import safe_case_relative_from_text, safe_case_path
+from .case_inputs import case_input_fingerprint, format_case_inputs
+from openfoam_target import generation_contract
 from . import global_llm_service
 from utils import case_file_key, resolve_case_file
 
@@ -60,31 +62,39 @@ class SolverReviewDecision(StageReviewDecision):
 
 REVIEWER_SYSTEM_PROMPT = (
     "You are an expert in OpenFOAM simulation and numerical modeling. "
-    "Your task is to review the provided error logs and diagnose the underlying issues. "
-    "Diagnose the latest current error logs and actual current file contents first. "
-    "History records previous attempts, including resolved errors; do not repeat an old "
-    "repair when its missing entry now exists or the current failure has changed. "
-    "For target-matched tutorial files, retain applicable dictionary syntax unless the "
-    "current native parser error demonstrates a correction is needed. Do not assert a "
-    "different release syntax based on memory when it contradicts that evidence. "
-    "You will be provided with a similar case reference, which is a list of similar cases that are ordered by similarity. You can use this reference to help you understand the user requirement and the error."
-    "When an error indicates that a specific keyword is undefined (for example, 'div(phi,(p|rho)) is undefined'), your response must propose a solution that simply defines that exact keyword as shown in the error log. "
-    "Do not reinterpret or modify the keyword (e.g., do not treat '|' as 'or'); instead, assume it is meant to be taken literally. "
-    "Propose ideas on how to resolve the errors, but do not modify any files directly. "
-    "Please do not propose solutions that require modifying any parameters declared in the user requirement, try other approaches instead. Do not ask the user any questions."
-    "The user will supply all relevant foam files along with the error logs, and within the logs, you will find both the error content and the corresponding error command indicated by the log file name."
+    "Diagnose the latest execution failure using the current files, actual applied changes, "
+    "and target-version references. History contains earlier evidence and fallible opinions; "
+    "a past error is not a current blocker unless the latest evidence still supports it. "
+    "If an edit disappears or the executed dictionary differs from the repair, trace Allrun "
+    "and its templates to the producing definition; repair that source instead of repeatedly "
+    "editing an output the script regenerates. "
+    "Distinguish the fatal error from its preceding numerical symptoms. "
+    "Give one minimal, coherent repair or controlled numerical trial supported by that evidence, "
+    "naming the affected files and the hypothesis the next run will test. Numerical instability "
+    "does not require proof of a unique root cause before trying a compatible change to "
+    "unspecified numerical controls; explain the uncertainty and expected effect. "
+    "Missing keywords must retain the exact spelling from "
+    "the error, including punctuation. Preserve all physical conditions and parameters "
+    "specified by the user. References demonstrate compatible syntax, not replacement physics. "
+    "Separate necessary repairs from questions requiring another run and optional diagnostics. "
+    "Do not assert an uncertain diagnosis as fact, add monitoring configuration "
+    "as a substitute for a repair, or change a resolved setting merely to try a different approach. "
+    "If the evidence does not justify a file correction, say so. Do not modify files or ask questions."
 )
 
 
 def review_error_logs(
     tutorial_reference: str,
     foamfiles: Any,
-    error_logs: List[str],
+    error_logs: List[Any],
     user_requirement: str,
     similar_case_advice: Optional[Any] = None,
     history_text: Optional[List[str]] = None,
     llm_service: Optional[Any] = None,
     openfoam_target: str = "",
+    last_repair: Optional[dict] = None,
+    omitted_files: Optional[dict[str, str]] = None,
+    source_inputs: Optional[dict] = None,
 ) -> Tuple[str, List[str]]:
     """Stateless reviewer: returns (review_analysis, updated_history)."""
     advice_text = ""
@@ -92,31 +102,36 @@ def review_error_logs(
         advice = similar_case_advice.model_dump() if hasattr(similar_case_advice, "model_dump") else similar_case_advice
         advice_text = f"<similar_case_advice>{advice}</similar_case_advice>\n"
 
-    if history_text:
-        reviewer_user_prompt = (
-            f"<similar_case_reference>{tutorial_reference}</similar_case_reference>\n"
-            f"{advice_text}"
-            f"<foamfiles>{str(foamfiles)}</foamfiles>\n"
-            f"<current_error_logs>{error_logs}</current_error_logs>\n"
-            f"<history>\n{chr(10).join(history_text)}\n</history>\n\n"
-            f"<user_requirement>{user_requirement}</user_requirement>\n\n"
-            f"I have modified the files according to your previous suggestions. If the error persists, please provide further guidance. Make sure your suggestions adhere to user requirements and do not contradict it. Also, please consider the previous attempts and try a different approach."
-        )
-    else:
-        reviewer_user_prompt = (
-            f"<similar_case_reference>{tutorial_reference}</similar_case_reference>\n"
-            f"{advice_text}"
-            f"<foamfiles>{str(foamfiles)}</foamfiles>\n"
-            f"<error_logs>{error_logs}</error_logs>\n"
-            f"<user_requirement>{user_requirement}</user_requirement>\n"
-            "Please review the error logs and provide guidance on how to resolve the reported errors. Make sure your suggestions adhere to user requirements and do not contradict it."
-        )
+    applied_changes = json.dumps(last_repair or {}, ensure_ascii=False)
+    if len(applied_changes) > 64_000:
+        applied_changes = "[Earlier edit details omitted; complete diffs remain in the journal.]\n" + applied_changes[-64_000:]
+    source_block = (
+        f"<source_input_overrides>{json.dumps(source_inputs, ensure_ascii=False)}</source_input_overrides>\n"
+        if source_inputs is not None else ""
+    )
+    reviewer_user_prompt = (
+        f"<history>\n{chr(10).join(history_text or [])}\n</history>\n"
+        f"<similar_case_reference>{tutorial_reference}</similar_case_reference>\n"
+        f"{advice_text}"
+        f"<foamfiles>{format_case_inputs(foamfiles)}</foamfiles>\n"
+        f"{source_block}"
+        f"<omitted_files>{json.dumps(omitted_files or {})}</omitted_files>\n"
+        f"<actual_applied_changes>{applied_changes}</actual_applied_changes>\n"
+        f"<current_error_logs>{error_logs}</current_error_logs>\n"
+        f"<user_requirement>{user_requirement}</user_requirement>\n"
+        "Diagnose this latest attempt. Current files and errors take precedence over previous suggestions."
+    )
 
     llm_client = llm_service if llm_service is not None else global_llm_service
-    review_response = llm_client.invoke(
-        reviewer_user_prompt,
-        _reviewer_system_prompt(openfoam_target),
-    )
+    system_prompt = _reviewer_system_prompt(openfoam_target)
+    if source_inputs is not None:
+        system_prompt += (
+            "\nSource input overrides contain canonical files that differ from the executed inputs above. "
+            "Writer edits these canonical sources; before the next Run the workflow restores them "
+            "and reruns preprocessing. Use the executed files to diagnose the failure and fix the "
+            "source or producing script, rather than copying expanded runtime arrays into source inputs."
+        )
+    review_response = llm_client.invoke(reviewer_user_prompt, system_prompt)
     review_content = review_response
 
     updated_history = list(history_text) if history_text else []
@@ -124,6 +139,7 @@ def review_error_logs(
     current_attempt = [
         f"<Attempt {attempt_num}>\n",
         f"<Error_Logs>\n{error_logs}\n</Error_Logs>",
+        f"<Applied_Changes>\n{applied_changes}\n</Applied_Changes>",
         f"<Review_Analysis>\n{review_content}\n</Review_Analysis>",
         "</Attempt>\n",
     ]
@@ -160,7 +176,7 @@ def generate_rewrite_plan(
         )
 
     planner_user_prompt = (
-        f"<foamfiles>{str(foamfiles)}</foamfiles>\n"
+        f"<foamfiles>{format_case_inputs(foamfiles)}</foamfiles>\n"
         f"<error_logs>{error_logs}</error_logs>\n"
         f"<review_analysis>{review_analysis}</review_analysis>\n"
         f"<user_requirement>{user_requirement}</user_requirement>\n"
@@ -176,14 +192,17 @@ def generate_rewrite_plan(
     return response.model_dump()
 
 
-def error_fingerprint(state: dict[str, Any]) -> str:
+def error_fingerprint(state: dict[str, Any]) -> Optional[str]:
     """Compare errors and case inputs, excluding changing runtime outputs."""
     case = Path(state.get("case_dir") or "").resolve()
-    files = snapshot_files(case, exclude_runtime=True)
-    inputs = {
-        name: digest for name, digest in files.items()
-        if not _is_runtime_artifact(name)
-    }
+    if ("last_run_input_fingerprint" in state and not state.get("repairing_mesh")
+            and (state.get("solver_execution") or {}).get("executed") is not False):
+        inputs = state["last_run_input_fingerprint"]
+        if inputs is None:
+            return None
+    else:
+        files = snapshot_files(case, exclude_runtime=True)
+        inputs = {name: digest for name, digest in files.items() if not _is_runtime_artifact(name)}
     if "submit_job.slurm" in inputs:
         # Keep real submission-script edits visible, but an otherwise identical
         # script gets a fresh wrapper directory on every stage attempt.
@@ -206,7 +225,13 @@ def error_fingerprint(state: dict[str, Any]) -> str:
                         )
             inputs["submit_job.slurm"] = hashlib.sha256(script.encode("utf-8")).hexdigest()
     payload = {
-        "errors": state.get("error_logs") or [],
+        # Diagnostic tails retain volatile process metadata for the Reviewer,
+        # but do not change the identity of an otherwise identical failure.
+        "errors": [
+            {key: value for key, value in error.items() if key != "diagnostic_context"}
+            if isinstance(error, dict) else error
+            for error in state.get("error_logs") or []
+        ],
         "inputs": inputs,
         "mesh_operations": state.get("mesh_operations"),
         "solver_operations": state.get("solver_operations"),
@@ -276,14 +301,35 @@ def _review_stage(state, stage, schema):
         return {"workflow_status": "failed", "termination_reason": "max_review_loop_reached"}
     fingerprint = error_fingerprint(state)
     history = list(state[stage + "_review_history"])
-    repeated = bool(history and history[-1]["fingerprint"] == fingerprint)
+    repeated = bool(fingerprint and history and history[-1]["fingerprint"] == fingerprint)
     if repeated and stage == "solver":
         return {"workflow_status": "failed", "termination_reason": "repair_made_no_progress"}
+    from .case_inputs import read_case_inputs
+    from .review_history import ReviewHistory
+
+    initial_review_exit = {}
+    if (state.get("static_review_repair") or {}).get("stage") == stage:
+        from .static_review import _end_initial_review
+        initial_review_exit = _end_initial_review(state, stage, "execution_error")
+        state = {**state, **initial_review_exit}
+    journal = ReviewHistory(state["case_dir"], state.get("case_import_report_dir"))
+    foamfiles, omitted = read_case_inputs(state["case_dir"])
+    source_context = None
+    if state.get("case_input_source_dir"):
+        sources, source_omitted = read_case_inputs(state["case_input_source_dir"])
+        executed = {(f.folder_name, f.file_name): f.content for f in foamfiles.list_foamfile}
+        source_context = {"files": {
+            "/".join(p for p in (f.folder_name, f.file_name) if p): f.content
+            for f in sources.list_foamfile
+            if executed.get((f.folder_name, f.file_name)) != f.content
+        }, "omitted_files": source_omitted}
     reference = state["mesh_reference"] if stage == "mesh" else {
         "content": state.get("tutorial_reference"), "script": state.get("allrun_reference")}
     user = (
         f"<stage>{stage}</stage>\n<user_requirement>{state['user_requirement']}</user_requirement>\n"
-        f"<reference>{reference}</reference>\n<current_files>{state.get('foamfiles')}</current_files>\n"
+        f"<reference>{reference}</reference>\n<current_files>{format_case_inputs(foamfiles)}</current_files>\n"
+        f"<omitted_files>{omitted}</omitted_files>\n<source_inputs>{source_context}</source_inputs>\n"
+        f"<last_repair>{state.get('last_repair')}</last_repair>\n"
         f"<current_errors>{errors}</current_errors>\n<actual_mesh>{state.get('mesh_info')}</actual_mesh>\n"
         f"<mesh_execution>{state.get('mesh_execution')}</mesh_execution>\n"
         f"<boundary_plan>{state.get('mesh_boundary_plan')}</boundary_plan>\n"
@@ -340,6 +386,7 @@ def _review_stage(state, stage, schema):
                             "errors": errors, "decision": None,
                             "response_error": details, "outcome": None})
             return {
+                **initial_review_exit,
                 stage + "_review_history": history, "loop_count": next_loop,
                 "workflow_status": "failed", "termination_reason": "invalid_review_response",
                 "error_logs": [*errors, {"file": stage + "_review", "error_content":
@@ -350,20 +397,37 @@ def _review_stage(state, stage, schema):
     log_review(str(payload), "rewrite_plan")
     history.append({"round": next_loop, "fingerprint": fingerprint,
                     "errors": errors, "decision": payload, "outcome": None})
+    journal.append(
+        "runtime_review", stage=stage, runtime_loop=next_loop,
+        error_logs=errors, review_analysis=payload, applied_changes=state.get("last_repair"),
+        omitted_files=omitted, source_inputs=source_context,
+    )
+    result = {**initial_review_exit, **apply_stage_decision(state, stage, decision)}
+    result.update({stage + "_review_history": history, "loop_count": next_loop,
+                   "repair_source": "runtime"})
+    if decision.action == "stop":
+        result.update(workflow_status="failed", termination_reason=stage + "_review_stopped")
+    elif next_loop >= state["config"].max_loop:
+        result.update(workflow_status="failed", termination_reason="max_review_loop_reached")
+    return result
+
+
+def apply_stage_decision(state, stage, decision):
+    """Apply the existing stage task/operation contract to a validated decision."""
+    payload = decision.model_dump()
     targets = replace_pending_tasks((state.get("rewrite_plan") or {}).get("target_files", []), payload["target_files"])
     creates, targets = resolve_file_tasks(
         [*(state.get('mesh_subtasks') or []), *(state.get('pending_solver_subtasks') or []),
          *(state.get('subtasks') or [])], targets)
     solver_creates = [task for task in creates if task['stage'] == 'solver']
     result = {
-        stage + "_review_history": history, "loop_count": next_loop,
         "review_analysis": decision.diagnosis + "\n" + decision.reason,
         "rewrite_plan": {"target_files": targets},
         "mesh_subtasks": [task for task in creates if task['stage'] == 'mesh'],
         "subtasks": solver_creates, "pending_solver_subtasks": solver_creates,
         "input_writer_mode": 'initial' if solver_creates else 'rewrite',
         "requires_input_writer": True, "repairing_mesh": stage == "mesh" or decision.action == "repair_mesh",
-        "error_logs": errors,
+        "error_logs": state.get("error_logs") or [],
     }
     if decision.operations is not None:
         if stage == "mesh":
@@ -384,21 +448,11 @@ def _review_stage(state, stage, schema):
                     result['rewrite_plan']['dependencies_changed'] = True
     if decision.operation_request:
         result["cross_stage_request"] = {"source": stage, "request": decision.operation_request,
-                                         "evidence": decision.evidence, "round": next_loop}
-    if decision.action == "stop":
-        result.update(workflow_status="failed", termination_reason=stage + "_review_stopped")
-    elif next_loop >= state["config"].max_loop:
-        result.update(workflow_status="failed", termination_reason="max_review_loop_reached")
+                                         "evidence": decision.evidence, "round": state.get("static_review_retries", 0) if state.get("repair_source") == "static_review" else state["loop_count"] + 1}
     return result
 
 
+
 def _reviewer_system_prompt(openfoam_target: str) -> str:
-    """Add a native-version constraint without changing legacy review prompts."""
-    if openfoam_target != "esi-v2006":
-        return REVIEWER_SYSTEM_PROMPT
-    return (
-        REVIEWER_SYSTEM_PROMPT
-        + " The target is native ESI/OpenCFD OpenFOAM v2006. Diagnose and repair "
-        "only with ESI v2006 conventions from the supplied ESI tutorial reference; "
-        "do not propose Foundation v10 syntax or post-generation translation."
-    )
+    """Use the same target contract as generation, rewriting and static review."""
+    return REVIEWER_SYSTEM_PROMPT + "\n" + generation_contract(openfoam_target)

@@ -8,7 +8,7 @@ import asyncio
 from copy import deepcopy
 import os
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastmcp import FastMCP, Context
 from pydantic import BaseModel, Field
@@ -26,7 +26,9 @@ from services.input_writer import initial_write
 from services.run_local import run_allrun_and_collect_errors
 
 from utils import FoamPydantic, read_case_foamfiles, scan_case_directory
+from services.case_inputs import read_case_inputs
 from services.review import generate_rewrite_plan, review_error_logs
+from services.static_review import StaticReviewReport, review_case_inputs
 from translation.esi_translator import convert_case_to_esi_if_needed
 from services.visualization import visualize_case
 from services.output_safety import prepare_output_directory
@@ -86,6 +88,8 @@ class PlanResponse(BaseModel):
     case_solver: str = Field(description="OpenFOAM solver to use")
     case_domain: str = Field(description="Simulation domain (e.g., 'fluid', 'solid')")
     case_category: str = Field(description="Case category (e.g., 'tutorial', 'advanced')")
+    tutorial_reference: str = Field(default="", description="Retrieved target-version tutorial evidence for generation and review")
+    allrun_reference: str = Field(default="", description="Retrieved execution examples for generation and review")
 
 
 @mcp.tool(name="plan")
@@ -130,7 +134,9 @@ async def plan(
             case_name=plan_data["case_name"],
             case_solver=plan_data["case_solver"],
             case_domain=plan_data["case_domain"],
-            case_category=plan_data["case_category"]
+            case_category=plan_data["case_category"],
+            tutorial_reference=plan_data.get("tutorial_reference") or "",
+            allrun_reference=plan_data.get("allrun_reference") or "",
         )
         
     except Exception as e:
@@ -150,6 +156,12 @@ class GenerateFilesRequest(BaseModel):
     case_solver: str = Field(description="OpenFOAM solver to use")
     case_domain: str = Field(description="Simulation domain")
     case_category: str = Field(description="Case category")
+    execution_mode: Optional[Literal["careful", "fast"]] = Field(
+        default=None, description="Generation preset; standalone static_review is a separate explicit step",
+    )
+    input_writer_generation_mode: Optional[Literal["sequential_dependency", "parallel_no_context"]] = Field(
+        default=None, description="Explicit override of the preset's file generation strategy",
+    )
     overwrite_output: bool = Field(
         default=False,
         description="Allow replacing an existing Foam-Agent-owned output directory.",
@@ -177,6 +189,11 @@ async def input_writer(
     """
     try:
         await ctx.info(f"Generating OpenFOAM files for case: {request.case_name}")
+        config = deepcopy(global_config)
+        if request.execution_mode is not None:
+            config.execution_mode = request.execution_mode
+        if request.input_writer_generation_mode is not None:
+            config.input_writer_generation_mode = request.input_writer_generation_mode
         require_target_corpus(global_config)
 
         # Resolve case directory
@@ -263,7 +280,8 @@ async def input_writer(
             similar_case_advice=similar_case_advice,
             progress_callback=progress_callback,
             openfoam_fork=generation_convention(global_config),
-            config=global_config,
+            generation_mode=config.generation_mode,
+            config=config,
         )
         if result.get('error_logs'):
             raise RuntimeError(str(result['error_logs']))
@@ -352,7 +370,9 @@ async def run(
                 # Format: "file: error_content"
                 file_name = err.get("file", "unknown")
                 error_content = err.get("error_content", str(err))
-                errors.append(f"{file_name}: {error_content}")
+                diagnostic_context = err.get("diagnostic_context")
+                errors.append(f"{file_name}: {error_content}" +
+                              (f"\n\n{diagnostic_context}" if diagnostic_context else ""))
             else:
                 errors.append(str(err))
         
@@ -440,8 +460,7 @@ async def review(
         
         # Read current foamfiles from case directory for review context
         await ctx.info("Reading OpenFOAM files for review context...")
-        from utils import read_case_foamfiles
-        foamfiles = read_case_foamfiles(request.case_dir)
+        foamfiles, omitted = read_case_inputs(request.case_dir)
         await ctx.info(f"Read {len(foamfiles.list_foamfile)} file(s) for review")
         
         # Review results - directly call review_error_logs
@@ -452,6 +471,7 @@ async def review(
             user_requirement=request.user_requirement,
             history_text=None,
             openfoam_target=generation_convention(global_config),
+            omitted_files=omitted,
         )
         
         await ctx.info(f"Review completed, found {len(request.errors)} error(s)")
@@ -545,7 +565,7 @@ async def apply_fixes(
         # This standalone tool retains an explicit, file-scoped repair plan.
         from services.input_writer import rewrite_files
 
-        foamfiles = read_case_foamfiles(request.case_dir)
+        foamfiles, omitted = read_case_inputs(request.case_dir)
         rewrite_plan = generate_rewrite_plan(
             foamfiles=foamfiles,
             error_logs=request.error_logs,
@@ -563,6 +583,8 @@ async def apply_fixes(
             foamfiles=foamfiles,
             openfoam_fork=generation_convention(global_config),
             script_phase="all",
+            omitted_files=omitted,
+            static_repair=not request.error_logs,
         )
         if (result.get('rewrite_plan') or {}).get('target_files') and result.get('error_logs'):
             raise RuntimeError(str(result['error_logs']))
@@ -584,6 +606,32 @@ async def apply_fixes(
     except Exception as e:
         await ctx.error(f"Failed to apply fixes: {str(e)}")
         raise
+
+
+# ============================================================================
+# Tool: static_review
+# ============================================================================
+
+class StaticReviewRequest(BaseModel):
+    case_dir: str = Field(pattern=r"\S", description="Case directory to inspect without executing or modifying it")
+    user_requirement: str = Field(description="Original simulation requirement to check against")
+    tutorial_reference: str = Field(default="", description="Existing target-version tutorial reference from plan")
+    allrun_reference: str = Field(default="", description="Existing target-version execution examples from plan")
+
+
+@mcp.tool(name="static_review")
+async def static_review(request: StaticReviewRequest, ctx: Context) -> StaticReviewReport:
+    """Read current inputs and report definite errors and warnings before running."""
+    await ctx.info(f"Statically reviewing case: {request.case_dir}")
+    report, _ = await asyncio.to_thread(
+        review_case_inputs,
+        case_dir=request.case_dir,
+        user_requirement=request.user_requirement,
+        openfoam_fork=generation_convention(global_config),
+        tutorial_reference=request.tutorial_reference,
+        allrun_reference=request.allrun_reference,
+    )
+    return report
 
 
 # ============================================================================
@@ -615,6 +663,15 @@ class RunCaseRequest(BaseModel):
         default=False,
         description="Allow replacement of an existing Foam-Agent-owned output directory",
     )
+    execution_mode: Optional[Literal["careful", "fast"]] = Field(
+        default=None, description="careful (default) reviews before initial mesh and solver execution; fast skips static review",
+    )
+    input_writer_generation_mode: Optional[Literal["sequential_dependency", "parallel_no_context"]] = Field(
+        default=None, description="Explicit file generation override, independent of static review",
+    )
+    max_static_review_retries: Optional[int] = Field(
+        default=None, ge=0, description="Static repair rounds shared by both initial stages (default 10); independent of max_loop",
+    )
 
 
 class RunCaseResponse(BaseModel):
@@ -627,6 +684,9 @@ class RunCaseResponse(BaseModel):
     report_dir: Optional[str] = Field(description="Directory containing import and workflow reports")
     errors: List[Any] = Field(description="Terminal execution or workflow errors")
     termination_reason: Optional[str] = Field(description="Reason the workflow stopped, if it failed")
+    static_review: Optional[StaticReviewReport] = Field(
+        default=None, description="Aggregated initial mesh/solver static reviews; not repeated after runtime repairs",
+    )
 
 
 @mcp.tool(name="run_case")
@@ -641,6 +701,10 @@ async def run_case(request: RunCaseRequest, ctx: Context) -> RunCaseResponse:
         config = deepcopy(global_config)
         config.case_dir = request.output_dir
         config.overwrite_case_dir = request.overwrite_output
+        for name in ("execution_mode", "input_writer_generation_mode", "max_static_review_retries"):
+            value = getattr(request, name)
+            if value is not None:
+                setattr(config, name, value)
         if request.openfoam_target is not None:
             config.openfoam_target = normalise_openfoam_target(request.openfoam_target)
 
@@ -670,6 +734,7 @@ async def run_case(request: RunCaseRequest, ctx: Context) -> RunCaseResponse:
             report_dir=result.get("case_import_report_dir"),
             errors=list(result.get("error_logs") or []),
             termination_reason=termination_reason,
+            static_review=result.get("static_review_report"),
         )
     except Exception as e:
         await ctx.error(f"Failed to run existing case: {str(e)}")

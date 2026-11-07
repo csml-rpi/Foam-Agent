@@ -5,7 +5,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from utils import retrieve_faiss, parse_directory_structure, save_file, read_case_text
 from config import Config
-from openfoam_target import generation_convention, configured_openfoam_target
+from openfoam_target import generation_convention, configured_openfoam_target, generation_contract
 from models import ExistingCasePlan, StageOperation
 from .stage_plan import OPERATION_CONTRACT
 from . import global_llm_service
@@ -16,7 +16,7 @@ class CaseSummaryModel(BaseModel):
     case_name: str = Field(description="name of the case")
     case_domain: str = Field(description="domain of the case")
     case_category: str = Field(description="category of the case")
-    case_solver: str = Field(description="solver of the case")
+    case_solver: str = Field(description="Exact solver named by the user; infer only when unspecified")
 
 
 class SubtaskModel(BaseModel):
@@ -28,7 +28,7 @@ class SubtaskModel(BaseModel):
 
 
 class OpenFOAMPlanModel(BaseModel):
-    subtasks: List[SubtaskModel]
+    subtasks: List[SubtaskModel] = Field(description="Input files in actual dependency order")
     operations: List[StageOperation]
 
 
@@ -82,12 +82,11 @@ def parse_requirement_to_case_info(
         f"Note: case domain must be one of {case_stats.get('case_domain', [])}."
         f"Note: case category must be one of {case_stats.get('case_category', [])}."
         f"Note: case solver must be one of {case_stats.get('case_solver', [])}."
-        + (
-            " The selected native runtime is ESI/OpenCFD OpenFOAM v2006. "
-            "Choose only a solver present in the supplied v2006 case statistics."
-            if openfoam_target == "esi-v2006"
-            else ""
-        )
+        + "\n" + generation_contract(openfoam_target)
+        + "\nExtract explicit choices from the user requirement before inferring missing details. "
+        "When the user names a solver available in the supplied list, preserve that exact solver name; "
+        "do not substitute a more familiar solver or choose one to match a tutorial. "
+        "Infer a solver only when the user has not specified one. "
     )
     parse_user_prompt = f"User requirement: {user_requirement}."
     llm_client = llm_service if llm_service is not None else global_llm_service
@@ -247,13 +246,13 @@ def _log_top3(label: str, items: List[Dict[str, Any]]) -> None:
 
 def _rerank_candidates(
     candidates: List[Dict[str, Any]],
-    case_solver: str,
+    case_domain: str = "",
 ) -> List[Dict[str, Any]]:
     def key(item: Dict[str, Any]) -> tuple:
-        solver_match = 1 if item.get("case_solver") == case_solver else 0
+        domain_match = int(_normalise_metadata(item.get("case_domain")) == _normalise_metadata(case_domain))
         score = item.get("score")
         score_val = 0.0 if score is None else float(score)
-        return (-solver_match, score_val)
+        return (-domain_match, score_val)
 
     return sorted(candidates, key=key)
 
@@ -319,19 +318,25 @@ def retrieve_references(case_name: str,
     )
     print(f"Retrieved {len(faiss_structure_all)} candidates from FAISS.")
 
-    # Hard constraint: domain must match; solver match is a ranking preference.
+    # Solver names determine input contracts more precisely than an inferred
+    # tutorial domain. Keep exact solver matches even when that domain is wrong.
+    solver_matched = [
+        candidate for candidate in faiss_structure_all
+        if case_solver and candidate.get("case_solver") == case_solver
+    ]
     domain_matched = [
         candidate for candidate in faiss_structure_all
         if _normalise_metadata(candidate.get("case_domain")) == _normalise_metadata(case_domain)
     ]
-    _log_top3("Domain-matched structure candidates", domain_matched)
+    candidates = solver_matched or domain_matched
+    _log_top3("Solver-matched structure candidates" if solver_matched else "Domain-matched structure candidates", candidates)
 
-    if not domain_matched:
-        print(f"No suitable similar case found under domain={case_domain}.")
+    if not candidates:
+        print(f"No suitable similar case found for solver={case_solver}, domain={case_domain}.")
         return "", "", "", "", _build_advice(user_requirement, case_info, "", subtasks or [], llm_service)
 
-    # Rerank by solver match, then semantic score.
-    ranked = _rerank_candidates(domain_matched, case_solver)
+    # Domain breaks ties between solver matches; semantic distance breaks the rest.
+    ranked = _rerank_candidates(candidates, case_domain)
     selected = ranked[0]
     dir_structure = _extract_directory_structure(selected)
     if not dir_structure:
@@ -395,17 +400,12 @@ def decompose_to_subtasks(
         "You are an experienced Planner specializing in OpenFOAM projects. "
         "Your task is to break down the following user requirement into a series of smaller, manageable subtasks. "
         "For each subtask, identify the file name of the OpenFOAM input file (foamfile) and the corresponding folder name where it should be stored. "
+        "Order files by actual dependencies rather than their folders. "
         "Use the supplied structured schema. For each task, declare stage as mesh or solver, "
         "action as create or modify, and concrete changes where needed. Solver includes execution scripts. "
         "Make sure that your output is valid JSON and strictly adheres to the provided schema."
         "Make sure you generate all the necessary files for the user's requirements."
-        + OPERATION_CONTRACT
-        + (
-            " The target is native ESI/OpenCFD OpenFOAM v2006. Select only "
-            "the file and dictionary layout present in the supplied v2006 reference."
-            if openfoam_target == "esi-v2006"
-            else ""
-        )
+        + OPERATION_CONTRACT + "\n" + generation_contract(openfoam_target)
     )
 
     decompose_user_prompt = (

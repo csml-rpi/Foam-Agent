@@ -15,7 +15,10 @@ from openfoam_target import database_path_for_config, generation_convention, run
 from utils import load_case_files, run_command, run_openfoam_utility, _EXPLICIT_FOAM_ERROR_RE
 from .input_writer import initial_write, build_allrun, rewrite_files
 from .case_paths import safe_case_relative_from_text, safe_case_relative_path
-from .mesh import copy_custom_mesh, handle_gmsh_mesh, _FAILED_MESH_CHECKS_RE
+from .mesh import copy_custom_mesh, handle_gmsh_mesh, prepare_gmsh_script, prepare_custom_mesh, _FAILED_MESH_CHECKS_RE
+from .static_review import review_stage_inputs, finish_static_repair
+from .case_workspace import CaseWorkspace
+from .review_history import ReviewHistory
 from .plan import SubtaskModel, retrieve_mesh_reference
 from models import StageOperation
 from .stage_plan import OPERATION_CONTRACT, MESH_STAGE_CONTRACT, mesh_operation_updates, check_mesh_plan, check_stage_inputs, check_stage_script, script_commands, replace_pending_tasks, resolve_file_tasks, pending_file_creates, unwritten_file_errors, stage_outcome
@@ -207,7 +210,7 @@ def _write_mesh_files(state):
         + f"\nExisting case files; preserve settings not requested to change:\n{state.get('foamfiles') or ''}",
         case_solver=state.get("case_solver") or "",
         openfoam_fork=generation_convention(config),
-        generation_mode=config.input_writer_generation_mode,
+        generation_mode=config.generation_mode,
         reuse_generated_dir=config.reuse_generated_dir,
         llm_service=state["llm_service"], config=config,
         allrun_phase='mesh',
@@ -217,15 +220,14 @@ def _write_mesh_files(state):
     )
 
 
-def _run_mesh_commands(state):
+def _prepare_mesh_script(state):
     config = state["config"]
     case = Path(state["case_dir"])
     action = state["mesh_script_action"]
     commands = script_commands(state['mesh_operations'])
     evidence = {"action": action, "executed": False, "commands": commands}
-    state["mesh_execution"] = evidence
     if action == "none":
-        return {"error_logs": [], "mesh_execution": evidence}
+        return {"error_logs": []}
     if action == "run_existing":
         if not (case / "Allmesh").is_file():
             return {"error_logs": [{"file": "Allmesh", "error_content": "run_existing requires an Allmesh script."}],
@@ -249,8 +251,23 @@ def _run_mesh_commands(state):
     else:
         raise ValueError(f"Unknown mesh_script_action: {action}")
     script_errors = check_stage_script(str(case), state['mesh_operations'], 'mesh')
-    if script_errors:
-        return {'error_logs': script_errors, 'mesh_execution': evidence}
+    return {'error_logs': script_errors}
+
+
+def _run_mesh_commands(state):
+    config = state["config"]
+    case = Path(state["case_dir"])
+    commands = script_commands(state['mesh_operations'])
+    evidence = {"action": state["mesh_script_action"], "executed": False, "commands": commands}
+    state["mesh_execution"] = evidence
+    if state.get("mesh_inputs_prepared"):
+        prepared = {"error_logs": check_stage_script(str(case), state['mesh_operations'], 'mesh')
+                    if state["mesh_script_action"] != "none" else []}
+    else:
+        prepared = _prepare_mesh_script(state)
+    if prepared["error_logs"] or state["mesh_script_action"] == "none":
+        return {**prepared, "mesh_execution": evidence}
+    script = {"allrun_path": str(case / "Allmesh")}
     old, observations = _mesh_log_snapshot(case)
     # RunFunctions skips a utility when log.<application>[.<suffix>] exists.
     # Rotate only conventional case-root logs. Nested files and mesh sources
@@ -333,7 +350,7 @@ def gmsh_meshing(state):
         + f"\n<mesh_boundary_plan>{state['mesh_boundary_plan']}</mesh_boundary_plan>"
         + f"\n<approved_operations>{state['mesh_operations']}</approved_operations>\nFollow the approved operations; do not independently select commands.",
         state["case_dir"], timeout=state['config'].max_time_limit,
-        script_prepared='generate_mesh.py' in state['written_files'],
+        script_prepared=state.get('mesh_inputs_prepared', False) or 'generate_mesh.py' in state['written_files'],
         llm_service=state["llm_service"],
         openfoam_target=runtime_openfoam_target(state["config"]),
         repair_feedback=state.get("review_analysis") or "",
@@ -360,8 +377,8 @@ def custom_meshing(state):
         source, state["case_dir"],
         timeout=state['config'].max_time_limit,
         openfoam_target=runtime_openfoam_target(state["config"]),
-        retry=bool(state.get("repairing_mesh")),
-        source_written=any((Path(state["case_dir"]) / name).resolve() == source_path
+        retry=state.get("mesh_inputs_prepared", False) or bool(state.get("repairing_mesh")),
+        source_written=not state.get("mesh_inputs_prepared", False) and any((Path(state["case_dir"]) / name).resolve() == source_path
                            for name in state.get("written_files") or []),
         **{key: value for key, value in _native_mesh_runners(state).items() if key == "utility_runner"},
     )
@@ -391,6 +408,7 @@ def _rewrite_mesh(state):
         openfoam_fork=generation_convention(state["config"]),
         case_solver=state.get("case_solver") or "", llm_service=state["llm_service"],
         script_phase='mesh', allrun_reference=state['mesh_reference']['script'],
+        static_repair=state.get('repair_source') == 'static_review',
         operations=state['mesh_operations'] if state['mesh_script_action'] != 'none' else None,
     )
 
@@ -496,6 +514,8 @@ def _mesh_boundary_info(case, directories):
 
 def execute_meshing(state, backend):
     current = dict(state)
+    if current.get("case_input_source_dir"):
+        CaseWorkspace(current["case_dir"], current["case_input_source_dir"]).restore_inputs()
     current.setdefault("mesh_jobs", [])
     current["mesh_execution"] = {"action": current["mesh_script_action"], "executed": False}
     current['written_files'] = []
@@ -516,8 +536,11 @@ def execute_meshing(state, backend):
     )
     current["rewrite_plan"] = {"target_files": [t for t in targets if t["stage"] == "mesh"]}
     reconstructed_sources = []
+    edits = {"updated_files": [], "file_diffs": []}
     try:
         written = _write_mesh_files(current)
+        edits['updated_files'].extend(written.get('written_files', []))
+        edits['file_diffs'].extend(written.get('file_diffs', []))
         result.update(written)
         current.update(written)
         receipts = written['written_files'] if current.get('mesh_subtasks') else []
@@ -533,13 +556,55 @@ def execute_meshing(state, backend):
                 # Creation returns only new files; edits also need existing case contents.
                 current.update(load_case_files(current))
             rewritten = _rewrite_mesh(current)
+            edits['updated_files'].extend(rewritten.get('updated_files', []))
+            edits['file_diffs'].extend(rewritten.get('file_diffs', []))
             result.update(rewritten)
             current.update(rewritten)
             current['written_files'] = list(dict.fromkeys(
                 [*written.get('written_files', []), *rewritten.get('written_files', [])]))
             result['written_files'] = current['written_files']
             if not rewritten.get("error_logs"):
-                dependency_errors = check_stage_inputs(current["case_dir"], current["mesh_operations"], "mesh")
+                if current["mesh_type"] == "gmsh_mesh":
+                    prepared_script = 'generate_mesh.py' in current['written_files']
+                    generated = prepare_gmsh_script(
+                        current["user_requirement"] + f"\n<mesh_reference>{current['mesh_reference']}</mesh_reference>"
+                        + f"\n<mesh_boundary_plan>{current['mesh_boundary_plan']}</mesh_boundary_plan>"
+                        + f"\n<approved_operations>{current['mesh_operations']}</approved_operations>",
+                        current["case_dir"], script_prepared=prepared_script,
+                        llm_service=current["llm_service"], openfoam_target=runtime_openfoam_target(current["config"]),
+                        repair_feedback=current.get("review_analysis") or "",
+                    )
+                    edits['updated_files'].extend(generated['updated_files'])
+                    edits['file_diffs'].extend(generated['file_diffs'])
+                    current['written_files'].append('generate_mesh.py')
+                if current["mesh_type"] == "custom_mesh" and current.get("mesh_source"):
+                    prepare_custom_mesh(current["mesh_source"], current["case_dir"],
+                        retry=bool(current.get("repairing_mesh")),
+                        source_written=any((Path(current["case_dir"]) / name).resolve() ==
+                            Path(current["mesh_source"]).resolve() for name in current['written_files']))
+                    current['written_files'].append('geometry.msh')
+                prepared = _prepare_mesh_script(current)
+                if current['mesh_script_action'] == 'build_and_run' and not prepared['error_logs']:
+                    current['written_files'].append('Allmesh')
+                result['written_files'] = list(dict.fromkeys(current['written_files']))
+                if current.get('case_input_source_dir'):
+                    CaseWorkspace(current['case_dir'], current['case_input_source_dir']).update_inputs(result['written_files'])
+                result.update(finish_static_repair(current, "mesh", {
+                    **result, **edits,
+                    'error_logs': prepared['error_logs'],
+                }))
+                current.update(result)
+                if not prepared['error_logs']:
+                    review = review_stage_inputs(current, "mesh")
+                    result.update(review)
+                    current.update(review)
+                    if current.get('termination_reason'):
+                        return result
+                    if current.get('repair_source') == 'static_review' and current.get('static_review_stage') == 'mesh':
+                        result['mesh_resume_state'] = {**resume, 'pending': pending, 'previous_mesh': previous_mesh}
+                        return result
+                dependency_errors = prepared['error_logs'] or check_stage_inputs(current["case_dir"], current["mesh_operations"], "mesh")
+                current['mesh_inputs_prepared'] = True
                 result.update({"error_logs": dependency_errors} if dependency_errors else backend(current))
                 current.update(result)
                 if not current.get("error_logs") and current.get("final_reconstruction"):
@@ -554,6 +619,12 @@ def execute_meshing(state, backend):
         result["error_logs"] = [{"file": "Allmesh", "error_content": "\n".join(native_output)}]
         result["mesh_execution"] = current["mesh_execution"]
     finally:
+        result.update(edits)
+        result['last_repair'] = {'stage': 'mesh', **edits}
+        if state.get('repair_source') == 'runtime':
+            ReviewHistory(current['case_dir'], current.get('case_import_report_dir')).append(
+                'file_repair', stage='mesh', source='runtime',
+                runtime_loop=current.get('loop_count', 0), **edits)
         result["loop_count"] = current.get("loop_count", 0)
         if "cluster_info" in current:
             result["cluster_info"] = current["cluster_info"]
@@ -588,6 +659,10 @@ def execute_meshing(state, backend):
     result.update(stage_outcome(current, "mesh", {"error_logs": current.get("error_logs", []), "execution": current.get("mesh_execution")}))
     current.update(result)
     if not current.get("error_logs"):
+        if current.get("case_input_source_dir"):
+            CaseWorkspace(current["case_dir"], current["case_input_source_dir"]).capture_inputs()
+            ReviewHistory(current["case_dir"], current.get("case_import_report_dir")).append(
+                "input_source_updated", stage="mesh", source_dir=current["case_input_source_dir"])
         info = result["mesh_info"]
         impact_reason = ""
         if current.get("solver_planned"):

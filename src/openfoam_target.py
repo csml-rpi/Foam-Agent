@@ -165,3 +165,45 @@ def require_target_corpus(config: Any) -> None:
             "FOAMAGENT_EMBEDDING_MODEL_PATH for local Hugging Face weights. "
             "Only rebuild with init_database.py if this target/model has no prebuilt indices."
         )
+
+def generation_contract(openfoam_fork: str) -> str:
+    """Return version/fork constraints shared by initial writes and rewrites.
+
+    The contract is intentionally solver-level rather than case-level: it contains
+    no geometry, material, boundary, or operating values from a particular case.
+    """
+    fork = (openfoam_fork or "foundation").strip().lower()
+    if fork == "foundation":
+        constraints = [
+            "The target runtime is Foundation OpenFOAM v10 from openfoam.org.",
+            "Use only Foundation OpenFOAM v10 solver, file, field, dictionary, and boundary-condition conventions.",
+            "Do not use or mix in ESI/OpenCFD openfoam.com conventions from versioned releases such as v20xx, v21xx, v22xx, v23xx, or v24xx.",
+            "If a reference case conflicts with Foundation OpenFOAM v10, ignore the conflicting syntax and follow Foundation v10.",
+        ]
+    elif fork == "esi-v2006":
+        constraints = [
+            "The target runtime is ESI/OpenCFD OpenFOAM v2006 from openfoam.com.",
+            "Generate a native ESI v2006 case directly from the supplied ESI v2006 tutorial references.",
+            "Use only ESI v2006 solver, file, dictionary, function-object, and boundary-condition conventions.",
+            "Do not use Foundation OpenFOAM v10 conventions and do not rely on any post-generation translator.",
+            "Keep all generated files internally consistent with the ESI v2006 solver selected by the planner.",
+        ]
+    elif fork == "esi":
+        constraints = [
+            "The configured target runtime is ESI/OpenCFD OpenFOAM from openfoam.com.",
+            "Use ESI-compatible solver, file, field, dictionary, and boundary-condition conventions consistently.",
+            "Do not mix Foundation-only conventions into the generated files.",
+        ]
+    else:
+        constraints = [
+            f"The configured OpenFOAM fork is {fork!r}.",
+            "Keep all generated files internally consistent with that configured fork and do not mix conventions from another fork.",
+        ]
+
+    constraints.append(
+        "When a supplied tutorial matches this target and selected solver, preserve its "
+        "applicable dictionary structure and value notation while adapting requested physical "
+        "values. Do not replace native tutorial syntax based only on memory; use the actual "
+        "runtime parser errors to establish needed corrections."
+    )
+    return "\n".join(f"- {constraint}" for constraint in constraints)

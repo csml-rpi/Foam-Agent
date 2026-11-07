@@ -5,9 +5,28 @@ from services.run_hpc import HpcWorkflowStop, run_stage_hpc, check_logs_for_erro
 from services.run_local import _cleanup_run_artifacts, _execution_output
 from services.solver_execution import snapshot_result_fields
 from openfoam_target import runtime_openfoam_target
+from services.review_history import ReviewHistory
+from services.case_workspace import prepare_case_workspace
+from services.case_inputs import case_input_fingerprint
 
 
 def hpc_runner_node(state):
+    workspace = prepare_case_workspace(
+        state["case_dir"], state.get("case_import_report_dir"), state.get("case_input_source_dir"))
+    state = {**state, "case_input_source_dir": str(workspace.source_dir) if workspace else None}
+    history = ReviewHistory(state["case_dir"], state.get("case_import_report_dir"))
+    fingerprint = case_input_fingerprint(state["case_dir"])
+    history.append("run_started", stage="solver", runner="hpc", input_fingerprint=fingerprint,
+                   runtime_loop=state.get("loop_count", 0))
+    result = _run_hpc(state)
+    result.update(case_input_source_dir=state["case_input_source_dir"],
+                  last_run_input_fingerprint=fingerprint)
+    history.append("run_result", stage="solver", runner="hpc", input_fingerprint=fingerprint,
+                   job_id=result.get("job_id"), error_logs=result.get("error_logs") or [])
+    return result
+
+
+def _run_hpc(state):
     current = dict(state)
     case = current["case_dir"]
     errors = check_stage_inputs(case, current["solver_operations"], "solver")

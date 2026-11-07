@@ -87,6 +87,8 @@ def route_after_meshing(state: GraphState):
         return END
     if state.get("error_logs"):
         return "mesh_reviewer"
+    if state.get("repair_source") == "static_review" and state.get("static_review_stage") == "mesh":
+        return "meshing_planner"
     return "solver_planner" if not state.get("solver_planned") or state.get("replan_solver") else "input_writer"
 
 
@@ -104,6 +106,21 @@ def route_after_input_writer(state: GraphState):
     if state.get("repairing_mesh"):
         return "meshing_planner"
 
+    return _route_execution(state)
+
+
+def _route_execution(state: GraphState):
+    if (getattr(state.get("config"), "static_review_enabled", False)
+            and not state.get("static_review_complete", {}).get("solver")):
+        return "static_review"
+    return _route_runner(state)
+
+
+def route_after_static_review(state: GraphState):
+    if state.get("termination_reason") or state.get("workflow_status") == "failed":
+        return END
+    if state.get("repair_source") == "static_review":
+        return "meshing_planner" if state.get("repairing_mesh") else "input_writer"
     return _route_runner(state)
 
 

@@ -1,6 +1,6 @@
 # Foam-Agent <a href="https://arxiv.org/abs/2505.04997"><img src="https://img.shields.io/badge/arXiv-2505.04997-b31b1b.svg" alt="Paper"></a>
 
-Foam-Agent automates OpenFOAM simulations from a natural language prompt or an existing case. Its agents plan the case, prepare meshes and input files, run locally or through Slurm, repair errors, and optionally visualize results.
+Foam-Agent automates OpenFOAM simulations from a natural language prompt or an existing case. Its agents plan the case, prepare meshes and input files, review them before execution, run locally or through Slurm, repair errors, and optionally visualize results.
 
 - **OpenFOAM targets:** Foundation v10 by default, with a separate native ESI/OpenCFD v2006 target.
 - **Tutorial retrieval:** FAISS indices provide references from the selected target's tutorials.
@@ -82,7 +82,22 @@ An [existing directory or ZIP](docs/usage.md#existing-cases) is also supported w
 
 The default LLM uses a Codex OAuth cache. An API key requires selecting its provider and model explicitly, as in Quick Start. Docker builds bundle the default embedding weights. Local Python installations may download them on first use; prebuilt tutorial indices come through Git LFS and must match the embedding model. See [installation checks and offline setup](docs/usage.md#installation-checks-and-offline-use).
 
-Settings live in `src/config.py`; see [configuration](docs/usage.md#configuration) for credentials, the legacy ESI translation switch, generation modes, and retry limits. Native ESI v2006 requires its matching runtime/image and corpus.
+Choose an execution mode with `--execution_mode` (or `Config.execution_mode`):
+
+| Mode | File generation | Before each stage's first execution |
+|---|---|---|
+| `careful` (default) | Sequential in planned dependency order | Mesh/solver LLM static review |
+| `fast` | Independent parallel generation | Run directly |
+
+Both modes repair runtime errors. Static review requests only definite, necessary
+corrections, with `--max_static_review_retries 10` repair rounds shared by both
+initial stages, separate from runtime `max_loop`. A later stage still reviews when
+no repairs remain. Reaching the limit or making no edits proceeds to native
+execution checks; review service failures stop. Later attempts use runtime review only.
+`--input_writer_generation_mode sequential_dependency|parallel_no_context`
+overrides generation independently. See [configuration and reports](docs/usage.md#execution-modes-and-static-review).
+
+Settings live in `src/config.py`; see [configuration](docs/usage.md#configuration) for credentials, the legacy ESI translation switch, and retry limits. Native ESI v2006 requires its matching runtime/image and corpus.
 
 ## MCP Integration
 

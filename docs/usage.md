@@ -69,7 +69,54 @@ Each `--output` is a dedicated task directory; use a new directory for a new tas
 | `FOAMAGENT_OPENFOAM_TARGET` | Explicit native target: `foundation-v10` or `esi-v2006` | Unset; Foundation path |
 | `FOAMAGENT_OPENFOAM_FORK` | Legacy fork routing: `foundation` or translated `esi` | `foundation` |
 
-Other `Config` fields use Python configuration or an exposed CLI/API parameter. Defaults include `max_loop=25` and `max_time_limit=3600` seconds. Unless explicitly set, `recursion_limit` is `6 * max(1, max_loop) + 8` (158 with the default repair budget). `input_writer_generation_mode` selects `sequential_dependency` (default, files share context) or `parallel_no_context` (independent parallel generation).
+Other `Config` fields use Python configuration or an exposed CLI/API parameter. Defaults include `max_loop=25` and `max_time_limit=3600` seconds. Unless explicitly set, `recursion_limit` is `6 * max(1, max_loop) + 8` (158 with the default repair budget). `input_writer_generation_mode=None` follows the execution preset; explicit `sequential_dependency` shares file context and `parallel_no_context` generates independently within each stage.
+
+### Execution modes and static review
+
+`execution_mode="careful"` is the default. Each stage generates files in the
+Planner's dependency order and reviews its final inputs before its first execution.
+Mesh review sees mesh dictionaries, generated Gmsh code, Allmesh and declared
+operations before any mesh command or Slurm submission. Solver review follows
+successful mesh handoff and physical input generation, using actual regional
+boundary evidence before local/HPC Allrun execution. Mesh review does not require
+future solver files. Both modes retain native checks and runtime repair.
+
+```bash
+python foambench_main.py --prompt_path requirements.txt --output output/careful
+python foambench_main.py --prompt_path requirements.txt --output output/fast --execution_mode fast
+```
+
+`fast` generates independently in parallel within each stage and skips static
+review. Mesh handoff still precedes solver planning. Set
+`--input_writer_generation_mode sequential_dependency|parallel_no_context` or the
+same Python `Config` field to override generation independently of review.
+
+Static review uses the configured LLM to find definite, necessary input defects,
+then verifies proposed errors in a second call. References provide target-version
+syntax evidence, not replacement physical values. Unverified claims become
+warnings for execution. Binary, oversized, hidden or linked inputs not inspected
+are disclosed; gzip text inputs are decoded within the same context limits.
+Passing review does not establish mesh quality, convergence or physical correctness.
+
+`max_static_review_retries` defaults to `10`, shared by the two initial stages and
+separate from runtime `max_loop`. Each requested repair uses one allowance, not
+one per model call. A stage proceeds to normal execution checks when review passes,
+no inputs/operations change, or the shared limit is reached. A later stage still
+reviews and retains findings when no repair allowance remains. `0` reviews each
+stage without static repairs. Service/response failures stop with
+`static_review_failed`. Once a stage's initial review ends, native failures go to
+its Mesh/Solver Reviewer without restarting static review. The graph adds one
+initial solver-review node and budgets up to five node visits per static repair
+for the longest mesh-detour route, in addition to the configured base recursion limit.
+
+Reports live in `CASE/.foamagent/` for generated cases and `OUTPUT/report/` for
+imports. `mesh_static_review.json` and `solver_static_review.json` retain each
+stage's last initial review; `static_review.json` aggregates them in the existing
+report format. Corresponding stage reference files and
+`static_review_references.json` retain the evidence used. `review_history.jsonl`
+stores phase-labelled proposals, verification decisions, repairs and runtime results.
+Standalone MCP tools use an explicit [`static_review`](mcp.md#workflows) call;
+full `run_case` follows both initial stage reviews in careful mode.
 
 ### Authentication
 
@@ -148,6 +195,13 @@ Workflow planners declare literal shell operations, including arguments, setup, 
 Solver planning receives current case files, actual mesh execution evidence and the separately retrieved solver script references. References remain guidance to reconcile with the request and actual files. Workflow runners activate the selected native runtime and execute Bash from the case directory with failure propagation enabled; operation planners receive these execution facts when deciding what shell setup is needed.
 
 A zero script exit alone is not simulation success. Local and HPC runners check the current attempt for explicit errors, skipped RunFunctions commands, normal native completion (`Exec` and `End`) of the application declared in `system/controlDict`, and a valid result field. Result fields must be newly created or rewritten during the current Allrun attempt, including at time zero and when rewritten contents are identical. Existing unchanged initial fields do not establish success. This check covers the whole script and does not attribute writes to individual commands. Standalone MCP `run` executes the supplied Allrun directly without a separate model call to identify solver commands. Serial, processor-local, collated, compressed and region fields are supported. Keep native solver output in root-level `log*` files or standard output. These checks establish execution completion; they do not establish numerical accuracy or enforce a benchmark's prescribed comparison time.
+
+Full workflows keep editable clean inputs under the report directory's
+`inputs/workflow-*/`. Writer repairs these sources and restores them to the working
+case. Mesh retries restore clean inputs, synchronize explicit file edits and
+commit successful mesh handoffs before solver execution. Failed execution outputs
+are not recaptured as clean inputs. Supplied binary/private assets are preserved;
+review context limits do not limit the stored inputs. Standalone execution remains direct.
 
 Local and HPC solver execution clear previous run artifacts, nonzero time directories and processor directories from `work/` before each attempt, after successful mesh handoff. Initial directories representing time zero, such as `0/` and `0.0/`, and the final `constant/polyMesh` are retained. Compressed `.gz` dictionaries, initial fields and mesh boundaries are read into planning and repair context; edits preserve the selected file's compression. Use `original/` to recover the imported input; this workflow does not resume prior results. The case's solver-only `Allrun` executes from `work/`, locally or through Slurm.
 
@@ -252,10 +306,10 @@ Pydantic validation, or explicitly select another method supported by that backe
 authentication errors are not silently downgraded. Test with `--check-llm` before
 starting a workflow. JSON validation checks response structure, not CFD correctness.
 
-The Codex subscription backend uses schema-in-prompt validation and supports
-`auto` and `json_prompt`. Native `json_schema`, `function_calling` and `json_mode`
-settings are rejected during client initialization; use a backend that supports
-the requested native method instead.
+The Codex subscription backend uses native strict JSON Schema with `auto` or
+`json_schema`, followed by local Pydantic validation. Use `json_prompt` explicitly
+for schema-in-prompt compatibility. `function_calling` and `json_mode` are not
+supported by this client. Authentication errors are not silently downgraded.
 
 ## Docker Builds
 

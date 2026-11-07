@@ -17,6 +17,7 @@ from nodes.input_writer_node import input_writer_node
 from nodes.local_runner_node import local_runner_node
 from nodes.mesh_reviewer_node import mesh_reviewer_node
 from nodes.solver_reviewer_node import solver_reviewer_node
+from nodes.static_review_node import static_review_node
 from nodes.visualization_node import visualization_node
 from nodes.hpc_runner_node import hpc_runner_node
 from nodes.preparation_node import preparation_node
@@ -28,6 +29,7 @@ from router_func import (
     route_after_input_writer,
     route_after_runner,
     route_after_reviewer,
+    route_after_static_review,
 )
 from logger import close_logging
 from services.plan import DEFAULT_IMPORTED_REQUIREMENT
@@ -56,6 +58,7 @@ def create_foam_agent_graph() -> StateGraph:
     workflow.add_node("hpc_runner", hpc_runner_node)
     workflow.add_node("mesh_reviewer", mesh_reviewer_node)
     workflow.add_node("solver_reviewer", solver_reviewer_node)
+    workflow.add_node("static_review", static_review_node)
     workflow.add_node("visualization", visualization_node)
     workflow.add_node("preparation", preparation_node)
     
@@ -70,6 +73,7 @@ def create_foam_agent_graph() -> StateGraph:
     workflow.add_conditional_edges("local_runner", route_after_runner)
     workflow.add_conditional_edges("mesh_reviewer", route_after_reviewer)
     workflow.add_conditional_edges("solver_reviewer", route_after_reviewer)
+    workflow.add_conditional_edges("static_review", route_after_static_review)
     workflow.add_conditional_edges("preparation", route_after_preparation)
     workflow.add_edge("visualization", END)
     
@@ -126,6 +130,17 @@ def initialize_state(
         review_analysis=None,
         rewrite_plan=None,
         input_writer_mode="initial",
+        repair_source=None,
+        input_omissions=None,
+        last_repair=None,
+        failed_run_inputs={},
+        case_input_source_dir=None,
+        static_review_report=None,
+        static_review_retries=0,
+        static_review_complete={},
+        static_review_reports={},
+        static_review_repair=None,
+        static_review_stage=None,
         requires_hpc=None,
         requires_visualization=requires_visualization,
         job_id=None,
@@ -182,7 +197,7 @@ def main(
         print("<workflow_start>Starting Foam-Agent...</workflow_start>")
 
         # Invoke the graph
-        result = app.invoke(initial_state, config={"recursion_limit": config.recursion_limit})
+        result = app.invoke(initial_state, config={"recursion_limit": config.workflow_recursion_limit})
 
         termination_reason = result.get("termination_reason")
         if result.get("workflow_status") == "partial_success":
@@ -212,6 +227,19 @@ if __name__ == "__main__":
     # python main.py
     parser = argparse.ArgumentParser(
         description="Run the OpenFOAM workflow"
+    )
+    parser.add_argument(
+        "--execution_mode", choices=["careful", "fast"], default="careful",
+        help="careful (default): dependency-aware generation and initial mesh/solver static review; fast: parallel generation without static review.",
+    )
+    parser.add_argument(
+        "--input_writer_generation_mode",
+        choices=["sequential_dependency", "parallel_no_context"], default=None,
+        help="Override file generation independently of static review.",
+    )
+    parser.add_argument(
+        "--max_static_review_retries", type=int, default=10,
+        help="Static repair rounds shared by initial mesh/solver reviews (default: 10), independent of max_loop.",
     )
     parser.add_argument(
         "--prompt_path",
@@ -278,7 +306,14 @@ if __name__ == "__main__":
     print(f"args: {args}")
     
     # Initialize configuration.
-    config = Config()
+    try:
+        config = Config(
+            execution_mode=args.execution_mode,
+            input_writer_generation_mode=args.input_writer_generation_mode,
+            max_static_review_retries=args.max_static_review_retries,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if args.openfoam_target is not None:
         try:
