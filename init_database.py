@@ -214,7 +214,7 @@ def main():
     if args.embedding_model:
         embedding_args += f" --embedding_model={shlex.quote(args.embedding_model)}"
 
-    selected_model = args.embedding_model or "Qwen/Qwen3-Embedding-0.6B"
+    selected_model = args.embedding_model or "text-embedding-3-small"
     selected_index_dir = _embedding_index_dir(database_dir, selected_model)
 
     manifest_path = raw_dir / "foamagent_target.json"
