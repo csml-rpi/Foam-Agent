@@ -25,7 +25,7 @@ class StageReviewDecision(RewritePlan):
     diagnosis: str
     evidence: List[str]
     reason: str
-    operations: Optional[List[StageOperation]] = Field(description="Complete replacement of this stage's operations, or null to retain; Mesh Reviewer may also declare deferred solver operations")
+    operations: Optional[List[StageOperation]] = Field(description="Use null for file-only repairs to retain the existing program. Supply a complete replacement only to correct execution or its declared dependencies; Mesh Reviewer may also declare deferred solver operations")
     operation_request: Optional[str] = Field(description="Concrete mesh-planning or cross-stage request, or null")
 
     @model_validator(mode="after")
@@ -347,6 +347,9 @@ def _review_stage(state, stage, schema):
         "The diagnosis, evidence, decision and tasks must agree. Operations replace this review "
         "stage's plan; null preserves it. A mesh request from Solver Reviewer is planned by "
         "Meshing Planner. File writes alone do not prove an error resolved. "
+        "For a dictionary or field-only repair, use operations=null rather than restating "
+        "the retained script. Replace operations only when the execution plan or its declared "
+        "dependencies also need an evidenced correction. "
         "Merge pending and new instructions for the same file into one coherent task. Schema:\n"
         + json.dumps(schema.model_json_schema())
     )

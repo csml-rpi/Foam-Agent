@@ -330,6 +330,8 @@ def review_stage_inputs(state, stage):
                 "Do not perform another diagnosis or invent additional issues. Preserve unrelated work. "
                 "Use repair_solver for physical files and solver operations. Use repair_mesh with an "
                 "explicit request when actual mesh work is necessary. Declare file stages by purpose. "
+                "For file-only corrections use operations=null to retain the existing program; "
+                "do not restate its complete script in each operation. "
                 "Allrun changes require its complete updated operations. Use stop with no tasks when "
                 "no justified correction remains. " + OPERATION_CONTRACT,
                 SolverReviewDecision,
