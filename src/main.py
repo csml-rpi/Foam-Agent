@@ -1,3 +1,4 @@
+from logger import print
 from typing import Optional
 from langgraph.graph import StateGraph, START, END
 import argparse
@@ -31,7 +32,7 @@ from router_func import (
     route_after_reviewer,
     route_after_static_review,
 )
-from logger import close_logging
+from logger import close_logging, logging_context
 from services.plan import DEFAULT_IMPORTED_REQUIREMENT
 
 
@@ -156,7 +157,6 @@ def initialize_state(
         case_import_report_dir=None,
         case_context=None,
         workflow_status="planning",
-        error_fingerprints=[],
         target_mismatch=False,
         requires_meshing=False,
         requires_input_writer=False,
@@ -167,6 +167,7 @@ def initialize_state(
         print("<custom_mesh_path>None</custom_mesh_path>")
     return state
 
+@logging_context()
 def main(
     user_requirement: str,
     config: Config,

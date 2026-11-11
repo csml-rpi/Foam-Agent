@@ -4,7 +4,9 @@ import sys
 import argparse
 import shlex
 import json
+import shutil
 from pathlib import Path
+from scripts.verify_target_corpus import _is_lfs_pointer
 
 ESI_V2006_SOURCE_URL = "https://dl.openfoam.com/source/v2006/OpenFOAM-v2006.tgz"
 ESI_V2006_SOURCE_MD5 = "1226d48e74a4c78f12396cb586c331d8"
@@ -32,6 +34,10 @@ REQUIRED_RAW_CORPUS_FILES = (
     "openfoam_allrun_scripts.txt",
     "openfoam_tutorials_structure.txt",
     "openfoam_tutorials_details.txt",
+)
+FAISS_INDEX_NAMES = (
+    "openfoam_command_help", "openfoam_allrun_scripts",
+    "openfoam_tutorials_structure", "openfoam_tutorials_details",
 )
 
 def parse_args():
@@ -90,7 +96,7 @@ def parse_args():
     )
     return parser.parse_args()
 
-def run_command(command_str):
+def run_command(command_str, *, openfoam_root=None):
     """
     Execute a command string using the current terminal's input/output,
     with the working directory set to the directory of the current file.
@@ -98,9 +104,17 @@ def run_command(command_str):
     Parameters:
         command_str (str): The command to execute, e.g. "python main.py --output_dir xxxx" 
                            or "bash xxxxx.sh".
+        openfoam_root: Source this installation before raw tutorial tools run.
     """
     # Split the command string into a list of arguments
     args = shlex.split(command_str)
+    if openfoam_root is not None:
+        args = [
+            "bash", "--noprofile", "--norc", "-c",
+            'foamagent_bashrc="$1"; shift; foamagent_command=("$@"); set --; '
+            'source "$foamagent_bashrc" || exit $?; exec "${foamagent_command[@]}"',
+            "foamagent-corpus", str(Path(openfoam_root) / "etc/bashrc"), *args,
+        ]
     # Set the working directory to the directory of the current file
     cwd = os.path.dirname(os.path.abspath(__file__))
     
@@ -124,31 +138,44 @@ def _embedding_index_dir(database_dir: Path, embedding_model: str) -> Path:
     return database_dir / "faiss" / embedding_model.replace("/", "_").replace(":", "_")
 
 
+def _corpus_file_is_complete(path: Path) -> bool:
+    return path.is_file() and path.stat().st_size > 0 and not _is_lfs_pointer(path)
+
+
 def _raw_corpus_is_complete(raw_dir: Path) -> bool:
     return all(
-        (raw_dir / filename).is_file() for filename in REQUIRED_RAW_CORPUS_FILES
+        _corpus_file_is_complete(raw_dir / filename) for filename in REQUIRED_RAW_CORPUS_FILES
     )
 
 
 def _faiss_index_is_complete(index_dir: Path) -> bool:
     return (
-        (index_dir / "index.faiss").is_file()
-        and (index_dir / "index.pkl").is_file()
+        _corpus_file_is_complete(index_dir / "index.faiss")
+        and _corpus_file_is_complete(index_dir / "index.pkl")
     )
 
 
-def _read_openfoam_version(openfoam_root: str) -> str:
-    """Read the API version from a trusted OpenFOAM installation.
-
-    ``foamEtcFile`` is part of the selected runtime and can report its API
-    without sourcing a full interactive shell environment.  This avoids an ESI
-    v2006 packaging issue where sourcing ``bashrc`` with Python pipe capture
-    can terminate the shell before it prints ``WM_PROJECT_VERSION``.
-    """
-    bashrc = Path(openfoam_root).expanduser() / "etc" / "bashrc"
+def _read_openfoam_version(openfoam_root: str, openfoam_target: str = FOUNDATION_V10) -> str:
+    """Probe the selected installation using its native version contract."""
+    root = Path(openfoam_root).expanduser().resolve()
+    bashrc = root / "etc" / "bashrc"
     if not bashrc.is_file():
         raise ValueError(f"OpenFOAM bashrc not found at: {bashrc}")
-    foam_etc_file = Path(openfoam_root).expanduser() / "bin" / "foamEtcFile"
+    if openfoam_target == FOUNDATION_V10:
+        environment = os.environ.copy()
+        environment.pop("WM_PROJECT_VERSION", None)
+        result = subprocess.run(
+            ["bash", "--noprofile", "--norc", "-c",
+             'source "$1" > /dev/null && [ "$WM_PROJECT_DIR" -ef "$2" ] '
+             '&& printf "%s\\n" "$WM_PROJECT_VERSION"',
+             "foamagent-version", str(bashrc), str(root)],
+            check=True, capture_output=True, text=True, env=environment,
+        )
+        return result.stdout.strip()
+
+    # ESI v2006 exposes its API directly. Its packaged bashrc can terminate a
+    # noninteractive capture shell before a version print, so retain this API.
+    foam_etc_file = root / "bin" / "foamEtcFile"
     if not foam_etc_file.is_file():
         raise ValueError(f"OpenFOAM foamEtcFile not found at: {foam_etc_file}")
     result = subprocess.run(
@@ -181,7 +208,6 @@ def main():
     raw_dir = database_dir / "raw"
     database_arg = shlex.quote(str(database_dir))
     output_arg = shlex.quote(str(raw_dir))
-    openfoam_arg = shlex.quote(str(WM_PROJECT_DIR))
     embedding_args = ""
     if args.embedding_provider:
         embedding_args += f" --embedding_provider={shlex.quote(args.embedding_provider)}"
@@ -191,7 +217,38 @@ def main():
     selected_model = args.embedding_model or "Qwen/Qwen3-Embedding-0.6B"
     selected_index_dir = _embedding_index_dir(database_dir, selected_model)
 
-    runtime_version = _read_openfoam_version(str(WM_PROJECT_DIR))
+    manifest_path = raw_dir / "foamagent_target.json"
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (not isinstance(manifest, dict)
+                or manifest.get("openfoam_target") != args.openfoam_target
+                or str(manifest.get("wm_project_version", "")).lstrip("vV")
+                != TARGET_RUNTIME_VERSIONS[args.openfoam_target]):
+            raise ValueError(
+                f"Corpus manifest {manifest_path} does not match {args.openfoam_target}. "
+                "Use a separate directory for each native target."
+            )
+    elif (all((raw_dir / filename).is_file() for filename in REQUIRED_RAW_CORPUS_FILES)
+          or (database_dir / "faiss").is_dir()):
+        raise ValueError(
+            f"Cannot establish the target of existing corpus assets without {manifest_path}. "
+            "Use a separate directory to build a corpus with a verified native target."
+        )
+
+    existing_assets = [raw_dir / filename for filename in REQUIRED_RAW_CORPUS_FILES]
+    if not args.raw_only:
+        existing_assets.extend(selected_index_dir / index / filename
+            for index in FAISS_INDEX_NAMES
+            for filename in ("index.faiss", "index.pkl"))
+    unavailable = [path for path in existing_assets if path.is_file() and not _corpus_file_is_complete(path)]
+    if unavailable and not args.force:
+        raise ValueError(
+            "Existing corpus assets are empty or unhydrated Git LFS pointers: "
+            + ", ".join(map(str, unavailable))
+            + ". Run git lfs pull, or pass --force to explicitly rebuild this target/model."
+        )
+
+    runtime_version = _read_openfoam_version(str(WM_PROJECT_DIR), args.openfoam_target)
     normalized_version = runtime_version.lstrip("vV")
     expected_version = TARGET_RUNTIME_VERSIONS[args.openfoam_target]
     if normalized_version != expected_version:
@@ -204,6 +261,7 @@ def main():
     # Keep parser input tied to the requested native runtime even if the
     # parent shell previously sourced another OpenFOAM distribution.
     runtime_root = Path(WM_PROJECT_DIR).expanduser().resolve()
+    openfoam_arg = shlex.quote(str(runtime_root))
     os.environ["WM_PROJECT_DIR"] = str(runtime_root)
     tutorials_path = (
         Path(args.tutorials_path).expanduser().resolve()
@@ -217,57 +275,29 @@ def main():
         )
     os.environ["FOAM_TUTORIALS"] = str(tutorials_path)
     raw_dir.mkdir(parents=True, exist_ok=True)
-    (raw_dir / "foamagent_target.json").write_text(
-        json.dumps(
-            {
-                "openfoam_target": args.openfoam_target,
-                "wm_project_version": (
-                    f"v{normalized_version}" if args.openfoam_target == ESI_V2006 else normalized_version
-                ),
-                "source": TARGET_SOURCES[args.openfoam_target],
-            },
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
 
     SCRIPTS = []
     
     # Preprocess the OpenFOAM tutorials
-    if args.force or not _raw_corpus_is_complete(raw_dir):
-        SCRIPTS.append(
+    regenerate_raw = args.force or not _raw_corpus_is_complete(raw_dir)
+    if regenerate_raw:
+        SCRIPTS.append((
             f"{shlex.quote(sys.executable)} database/script/tutorial_parser.py "
             f"--output_dir={output_arg} --wm_project_dir={openfoam_arg} "
-            f"--tutorials_dir={shlex.quote(os.environ.get('FOAM_TUTORIALS', ''))}"
-        )
+            f"--tutorials_dir={shlex.quote(os.environ.get('FOAM_TUTORIALS', ''))}",
+            runtime_root,
+        ))
 
     # (Re)build FAISS indices
     # The embedding-model directory is part of the index identity.  Checking
     # only for *any* FAISS index made a second provider/model silently reuse a
     # missing target index instead of building it.
     python_executable = shlex.quote(sys.executable)
-    if not args.raw_only and (
-        args.force
-        or not _faiss_index_is_complete(selected_index_dir / "openfoam_command_help")
-    ):
-        SCRIPTS.append(f"{python_executable} database/script/faiss_command_help.py --database_path={database_arg}{embedding_args}")
-    if not args.raw_only and (
-        args.force
-        or not _faiss_index_is_complete(selected_index_dir / "openfoam_allrun_scripts")
-    ):
-        SCRIPTS.append(f"{python_executable} database/script/faiss_allrun_scripts.py --database_path={database_arg}{embedding_args}")
-    if not args.raw_only and (
-        args.force
-        or not _faiss_index_is_complete(selected_index_dir / "openfoam_tutorials_structure")
-    ):
-        SCRIPTS.append(f"{python_executable} database/script/faiss_tutorials_structure.py --database_path={database_arg}{embedding_args}")
-    if not args.raw_only and (
-        args.force
-        or not _faiss_index_is_complete(selected_index_dir / "openfoam_tutorials_details")
-    ):
-        SCRIPTS.append(f"{python_executable} database/script/faiss_tutorials_details.py --database_path={database_arg}{embedding_args}")
+    if not args.raw_only:
+        for index in FAISS_INDEX_NAMES:
+            if regenerate_raw or not _faiss_index_is_complete(selected_index_dir / index):
+                builder = index.removeprefix("openfoam_")
+                SCRIPTS.append((f"{python_executable} database/script/faiss_{builder}.py --database_path={database_arg}{embedding_args}", None))
 
     if not SCRIPTS:
         print("All database files already exist. No initialization needed.")
@@ -275,8 +305,46 @@ def main():
         return
 
     print("Starting database initialization...")
-    for script in SCRIPTS:
-        run_command(script)
+    for script, openfoam_root in SCRIPTS:
+        if openfoam_root is not None:
+            # Every embedding variant depends on the raw files this command
+            # replaces. Invalidate before extraction, which can fail part-way.
+            index_root = database_dir / "faiss"
+            if index_root.is_symlink():
+                raise ValueError(f"Cannot invalidate corpus indices through symbolic link: {index_root}")
+            index_paths = [path for index in FAISS_INDEX_NAMES
+                           for path in index_root.glob(f"*/{index}")]
+            for path in index_paths:
+                for component in (path.parent, path):
+                    if component.is_symlink():
+                        raise ValueError(f"Cannot invalidate corpus indices through symbolic link: {component}")
+            for path in index_paths:
+                shutil.rmtree(path)
+        run_command(script, openfoam_root=openfoam_root)
+        if openfoam_root is not None:
+            if not _raw_corpus_is_complete(raw_dir):
+                unavailable = [raw_dir / filename for filename in REQUIRED_RAW_CORPUS_FILES
+                               if not _corpus_file_is_complete(raw_dir / filename)]
+                raise ValueError(
+                    "Raw corpus generation left missing, empty or unhydrated Git LFS assets: "
+                    + ", ".join(map(str, unavailable))
+                )
+            # A manifest describes the raw corpus actually generated, not
+            # merely the native installation selected for this invocation.
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "openfoam_target": args.openfoam_target,
+                        "wm_project_version": (
+                            f"v{normalized_version}" if args.openfoam_target == ESI_V2006 else normalized_version
+                        ),
+                        "source": TARGET_SOURCES[args.openfoam_target],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ) + "\n",
+                encoding="utf-8",
+            )
     print("Database initialization completed successfully.")
 
 if __name__ == "__main__":

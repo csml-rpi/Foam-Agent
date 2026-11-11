@@ -4,16 +4,17 @@ from openfoam_target import generation_convention
 import json
 import re
 from pathlib import Path
-from .case_import import snapshot_files
 from typing import List, Optional, Tuple, Any, Literal
 from pydantic import BaseModel, Field, ValidationError, model_validator
 from models import PlannedFileChange, StageOperation
 from .stage_plan import OPERATION_CONTRACT, MESH_STAGE_CONTRACT, mesh_operation_updates, replace_pending_tasks, resolve_file_tasks, script_commands, check_stage_operations
 from .case_paths import safe_case_relative_from_text, safe_case_path
-from .case_inputs import case_input_fingerprint, format_case_inputs
+from .case_inputs import case_input_fingerprint, format_case_inputs, canonical_input_protections
 from openfoam_target import generation_contract
-from . import global_llm_service
+from . import get_llm_service
 from utils import case_file_key, resolve_case_file
+from .execution_logs import declared_startup_inputs, check_execution_outputs, diagnostic_outputs
+from .run_hpc import hpc_execution_outputs
 
 
 class RewritePlan(BaseModel):
@@ -83,6 +84,20 @@ REVIEWER_SYSTEM_PROMPT = (
 )
 
 
+def _review_context_excerpt(text, omission_notice):
+    """Keep the existing context allowance without replacing full evidence."""
+    if len(text) > 64_000:
+        return omission_notice + "\n" + text[-64_000:]
+    return text
+
+
+def _applied_changes_context(last_repair):
+    return _review_context_excerpt(
+        json.dumps(last_repair or {}, ensure_ascii=False),
+        "[Earlier edit details omitted; complete diffs remain in the journal.]",
+    )
+
+
 def review_error_logs(
     tutorial_reference: str,
     foamfiles: Any,
@@ -102,9 +117,7 @@ def review_error_logs(
         advice = similar_case_advice.model_dump() if hasattr(similar_case_advice, "model_dump") else similar_case_advice
         advice_text = f"<similar_case_advice>{advice}</similar_case_advice>\n"
 
-    applied_changes = json.dumps(last_repair or {}, ensure_ascii=False)
-    if len(applied_changes) > 64_000:
-        applied_changes = "[Earlier edit details omitted; complete diffs remain in the journal.]\n" + applied_changes[-64_000:]
+    applied_changes = _applied_changes_context(last_repair)
     source_block = (
         f"<source_input_overrides>{json.dumps(source_inputs, ensure_ascii=False)}</source_input_overrides>\n"
         if source_inputs is not None else ""
@@ -122,7 +135,7 @@ def review_error_logs(
         "Diagnose this latest attempt. Current files and errors take precedence over previous suggestions."
     )
 
-    llm_client = llm_service if llm_service is not None else global_llm_service
+    llm_client = get_llm_service(llm_service)
     system_prompt = _reviewer_system_prompt(openfoam_target)
     if source_inputs is not None:
         system_prompt += (
@@ -183,7 +196,7 @@ def generate_rewrite_plan(
         "Return strict JSON now with key target_files only."
     )
 
-    llm_client = llm_service if llm_service is not None else global_llm_service
+    llm_client = get_llm_service(llm_service)
     response = llm_client.invoke(
         planner_user_prompt,
         planner_system_prompt,
@@ -198,32 +211,18 @@ def error_fingerprint(state: dict[str, Any]) -> Optional[str]:
     if ("last_run_input_fingerprint" in state and not state.get("repairing_mesh")
             and (state.get("solver_execution") or {}).get("executed") is not False):
         inputs = state["last_run_input_fingerprint"]
-        if inputs is None:
-            return None
     else:
-        files = snapshot_files(case, exclude_runtime=True)
-        inputs = {name: digest for name, digest in files.items() if not _is_runtime_artifact(name)}
-    if "submit_job.slurm" in inputs:
-        # Keep real submission-script edits visible, but an otherwise identical
-        # script gets a fresh wrapper directory on every stage attempt.
-        case = Path(state["case_dir"]).resolve()
-        try:
-            script = (case / "submit_job.slurm").read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
-            pass
-        else:
-            for stage in ("mesh", "solver"):
-                jobs_root = case / ".foamagent" / (stage + "-jobs")
-                for job in state.get(stage + "_jobs") or []:
-                    if not job.get("script"):
-                        continue
-                    attempt = Path(job["script"]).parent
-                    if attempt.parent == jobs_root:
-                        script = script.replace(
-                            attempt.relative_to(case).as_posix(),
-                            f".foamagent/{stage}-jobs/<attempt>",
-                        )
-            inputs["submit_job.slurm"] = hashlib.sha256(script.encode("utf-8")).hexdigest()
+        if (not state.get("repairing_mesh")
+                and (state.get("solver_execution") or {}).get("executed") is False
+                and state.get("case_input_source_dir")):
+            case = Path(state["case_input_source_dir"]).resolve()
+        inputs = case_input_fingerprint(case, protected_inputs=canonical_input_protections(
+            state.get('case_input_source_dir'), declared_startup_inputs([
+            *state.get('mesh_operations', []), *state.get('solver_operations', []),
+            *state.get('pending_solver_operations', []),
+        ])))
+    if inputs is None:
+        return None
     payload = {
         # Diagnostic tails retain volatile process metadata for the Reviewer,
         # but do not change the identity of an otherwise identical failure.
@@ -240,25 +239,6 @@ def error_fingerprint(state: dict[str, Any]) -> Optional[str]:
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
-
-
-def _is_runtime_artifact(relative: str) -> bool:
-    path = Path(relative)
-    top = path.parts[0] if path.parts else ""
-    try:
-        written_time = float(top) != 0
-    except ValueError:
-        pass
-    else:
-        if written_time:
-            return True
-    return (
-        ".foamagent" in path.parts
-        or top in {"postProcessing", "VTK", "dynamicCode"}
-        or re.fullmatch(r"processor(?:\d+|s\d+(?:_\d+-\d+)?)", top) is not None
-        or path.name.startswith("log")
-        or path.name in {"Allrun.out", "Allrun.err", "Allmesh.out", "Allmesh.err"}
-    )
 
 
 def _solver_startup_paths(case_dir, operations):
@@ -313,10 +293,12 @@ def _review_stage(state, stage, schema):
         initial_review_exit = _end_initial_review(state, stage, "execution_error")
         state = {**state, **initial_review_exit}
     journal = ReviewHistory(state["case_dir"], state.get("case_import_report_dir"))
-    foamfiles, omitted = read_case_inputs(state["case_dir"])
+    protected = canonical_input_protections(
+        state.get('case_input_source_dir'), declared_startup_inputs(state[stage + '_operations']))
+    foamfiles, omitted = read_case_inputs(state["case_dir"], protected_inputs=protected)
     source_context = None
     if state.get("case_input_source_dir"):
-        sources, source_omitted = read_case_inputs(state["case_input_source_dir"])
+        sources, source_omitted = read_case_inputs(state["case_input_source_dir"], protected_inputs=protected)
         executed = {(f.folder_name, f.file_name): f.content for f in foamfiles.list_foamfile}
         source_context = {"files": {
             "/".join(p for p in (f.folder_name, f.file_name) if p): f.content
@@ -325,11 +307,14 @@ def _review_stage(state, stage, schema):
         }, "omitted_files": source_omitted}
     reference = state["mesh_reference"] if stage == "mesh" else {
         "content": state.get("tutorial_reference"), "script": state.get("allrun_reference")}
+    stage_history = _review_context_excerpt(
+        str(history), "[Earlier stage history omitted; complete records remain in workflow state.]",
+    )
     user = (
         f"<stage>{stage}</stage>\n<user_requirement>{state['user_requirement']}</user_requirement>\n"
         f"<reference>{reference}</reference>\n<current_files>{format_case_inputs(foamfiles)}</current_files>\n"
         f"<omitted_files>{omitted}</omitted_files>\n<source_inputs>{source_context}</source_inputs>\n"
-        f"<last_repair>{state.get('last_repair')}</last_repair>\n"
+        f"<last_repair>{_applied_changes_context(state.get('last_repair'))}</last_repair>\n"
         f"<current_errors>{errors}</current_errors>\n<actual_mesh>{state.get('mesh_info')}</actual_mesh>\n"
         f"<mesh_execution>{state.get('mesh_execution')}</mesh_execution>\n"
         f"<boundary_plan>{state.get('mesh_boundary_plan')}</boundary_plan>\n"
@@ -339,7 +324,7 @@ def _review_stage(state, stage, schema):
         f"<pending_physical_tasks>{state.get('pending_solver_subtasks')}</pending_physical_tasks>\n"
         f"<pending_solver_operations>{state['pending_solver_operations']}</pending_solver_operations>\n"
         f"<cross_stage_request>{state.get('cross_stage_request')}</cross_stage_request>\n"
-        f"<stage_history>{history}</stage_history>\n<repeated_failure>{repeated}</repeated_failure>"
+        f"<stage_history>{stage_history}</stage_history>\n<repeated_failure>{repeated}</repeated_failure>"
     )
     system = _reviewer_system_prompt(generation_convention(state["config"])) + OPERATION_CONTRACT + (
         MESH_STAGE_CONTRACT + " You are the Mesh Reviewer. Diagnose mesh tools, backend execution and handoff. "
@@ -443,7 +428,9 @@ def apply_stage_decision(state, stage, decision):
                         and not check_stage_operations(payload['operations'], 'solver')):
                     result['rewrite_plan']['execution_plan_repaired'] = True
                 previous_inputs = _solver_startup_paths(state['case_dir'], state['solver_operations'])
-                if (any(not path.is_file() for path in previous_inputs) and previous_inputs !=
+                outputs = (hpc_execution_outputs('solver') if state.get('requires_hpc') else ['Allrun.out', 'Allrun.err']) + diagnostic_outputs(state['case_dir'])
+                previous_conflicts = check_execution_outputs(outputs, declared_startup_inputs(state['solver_operations']))
+                if ((any(not path.is_file() for path in previous_inputs) or previous_conflicts) and previous_inputs !=
                         _solver_startup_paths(state['case_dir'], payload['operations'])):
                     result['rewrite_plan']['dependencies_changed'] = True
     if decision.operation_request:

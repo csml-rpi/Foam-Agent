@@ -1,3 +1,4 @@
+from logger import print
 # utils.py
 import re
 import json
@@ -15,8 +16,9 @@ from pathlib import Path
 import requests
 import time
 import random
-import shutil
 import gzip
+import zlib
+from threading import Lock
 from config import Config
 from openfoam_target import database_path_for_config, require_target_corpus
 try:
@@ -34,6 +36,7 @@ except ImportError:
 
 FAISSCacheKey = tuple[str, str, str, str]
 FAISS_DB_CACHE: Dict[FAISSCacheKey, Dict[str, Any]] = {}
+_FAISS_DB_CACHE_LOCK = Lock()
 
 
 def _faiss_cache_key(config: Config) -> FAISSCacheKey:
@@ -118,9 +121,10 @@ def _ensure_faiss_dbs_loaded(config: Optional[Config] = None) -> Dict[str, Any]:
     # An empty mapping is also a cached result: repeatedly attempting to
     # load a missing index set is expensive and obscures the original
     # configuration error.
-    if cache_key not in FAISS_DB_CACHE:
-        FAISS_DB_CACHE[cache_key] = load_faiss_dbs(cfg)
-    return FAISS_DB_CACHE[cache_key]
+    with _FAISS_DB_CACHE_LOCK:
+        if cache_key not in FAISS_DB_CACHE:
+            FAISS_DB_CACHE[cache_key] = load_faiss_dbs(cfg)
+        return FAISS_DB_CACHE[cache_key]
 
 class FoamfilePydantic(BaseModel):
     file_name: str = Field(description="File basename only, such as epsilon or fvSolution; its directory belongs in folder_name")
@@ -422,7 +426,7 @@ class LLMService:
         Expected shape (v1):
           {"profiles": {"openai-codex:default": {"access": "...", "accountId": "...", ...}}}
 
-        We also fall back to "openai-codex" or any first profile that looks usable.
+        We also accept "openai-codex" and explicitly identified Codex profiles.
         """
         import json
 
@@ -443,9 +447,11 @@ class LLMService:
                 if isinstance(token, str) and token.strip():
                     return token.strip(), account_id if isinstance(account_id, str) else None
 
-        # Fallback: scan any profile entry that has an 'access' string
-        for _, v in profiles.items():
-            if isinstance(v, dict):
+        # A different provider's access token cannot authenticate with Codex.
+        for key, v in profiles.items():
+            if isinstance(v, dict) and (
+                key.startswith("openai-codex:") or v.get("provider") == "openai-codex"
+            ):
                 token = v.get("access")
                 account_id = v.get("accountId")
                 if isinstance(token, str) and token.strip():
@@ -590,8 +596,8 @@ class LLMService:
             except requests.exceptions.RequestException:
                 print("Ollama is not running, starting it...")
                 subprocess.Popen(["ollama", "serve"], 
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE)
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
                 # Wait for service to start
                 time.sleep(5)  # Give it 3 seconds to initialize
 
@@ -604,6 +610,9 @@ class LLMService:
             )
         elif self.model_provider.lower() == "deepseek":
             from langchain_openai import ChatOpenAI
+            api_key = (os.getenv("DEEPSEEK_API_KEY") or "").strip()
+            if not api_key:
+                raise ValueError("model_provider='deepseek' requires DEEPSEEK_API_KEY.")
             reasoning = os.getenv("FOAMAGENT_REASONING_EFFORT", "max")
             if reasoning not in ("low", "medium", "high", "max"):
                 reasoning = "max"
@@ -612,7 +621,7 @@ class LLMService:
                 model=self.model_version,
                 temperature=self.temperature,
                 base_url="https://api.deepseek.com/v1",
-                api_key=os.getenv("DEEPSEEK_API_KEY"),
+                api_key=api_key,
                 reasoning_effort=reasoning,
                 extra_body={"thinking": {"type": "enabled"}},
             )
@@ -1006,7 +1015,6 @@ class GraphState(TypedDict):
     workflow_status: str
     visualization_error: Optional[str]
     workflow_message: Optional[str]
-    error_fingerprints: List[str]
     target_mismatch: bool
 
 def tokenize(text: str) -> str:
@@ -1021,13 +1029,6 @@ def save_file(path: str, content: str) -> None:
     with open(path, 'w') as f:
         f.write(content)
     print(f"Saved file at {path}")
-
-def read_file(path: str) -> str:
-    if os.path.exists(path):
-        with open(path, 'r') as f:
-            return f.read()
-    return ""
-
 
 def case_file_key(path: str | Path) -> str:
     """The same OpenFOAM file can have plain and gzip representations."""
@@ -1055,16 +1056,29 @@ def read_case_text(path: str | Path, *, errors: str = "strict", limit: int | Non
     return data.decode("utf-8", errors=errors)
 
 
+def reject_symbolic_links(path: str | Path) -> None:
+    """Inspect lexical components before any resolution can hide a link."""
+    path = Path(path).absolute()
+    for component in (*reversed(path.parents), path):
+        if component.is_symlink():
+            raise ValueError(f"Case paths must not contain symbolic links: {component}")
+
+
+def validate_case_text_target(path: str | Path) -> None:
+    plain = Path(case_file_key(path))
+    compressed = Path(str(plain) + ".gz")
+    for candidate in (plain, compressed):
+        reject_symbolic_links(candidate)
+        if candidate.exists() and not candidate.is_file():
+            raise IsADirectoryError(f"Case file variant is not a regular file: {candidate}")
+
+
 def save_case_text(path: str | Path, content: str) -> Path:
     """Preserve an existing gzip input on logical-path edits and remove stale variants."""
     requested = Path(path)
+    validate_case_text_target(requested)
     plain = Path(case_file_key(requested))
     compressed = Path(str(plain) + ".gz")
-    for candidate in (plain, compressed):
-        if candidate.is_symlink():
-            raise ValueError(f"Case file variants must not be symbolic links: {candidate}")
-        if candidate.exists() and not candidate.is_file():
-            raise IsADirectoryError(f"Case file variant is not a regular file: {candidate}")
     actual = requested if requested.suffix == ".gz" else resolve_case_file(requested)
     actual.parent.mkdir(parents=True, exist_ok=True)
     opener = gzip.open if actual.suffix == ".gz" else open
@@ -1076,70 +1090,37 @@ def save_case_text(path: str | Path, content: str) -> Path:
     print(f"Saved file at {actual}")
     return actual
 
-def remove_files(directory: str, prefix: str) -> None:
-    for file in os.listdir(directory):
-        if file.startswith(prefix):
-            os.remove(os.path.join(directory, file))
-    print(f"Removed files with prefix '{prefix}' in {directory}")
-
-def remove_file(path: str) -> None:
-    if os.path.lexists(path):
-        os.remove(path)
-        print(f"Removed file {path}")
+def _time_directory_value(name: str) -> float | None:
+    """Parse native decimal/hex scalar names without invalid file-name whitespace."""
+    if not name.isascii() or "_" in name or name != name.strip():
+        return None
+    try:
+        return (float.fromhex(name) if name.lstrip("+-").lower().startswith("0x")
+                else float(name))
+    except ValueError:
+        return None
+    except OverflowError:
+        return float("-inf" if name.startswith("-") else "inf")
 
 
 def _is_numeric_name(name: str) -> bool:
     """Return whether a case entry name represents an OpenFOAM time value."""
-    try:
-        float(name)
-    except ValueError:
-        return False
-    return True
+    return _time_directory_value(name) is not None
 
 
 def is_initial_time_dir(name: str) -> bool:
     """Accept every numeric spelling of time zero, including 0.0 and 0e0."""
-    try:
-        return float(name) == 0
-    except ValueError:
-        return False
+    return _time_directory_value(name) == 0
 
 
-def remove_numeric_folders(case_dir: str) -> None:
-    """
-    Remove all folders in case_dir that represent numeric values, including those with decimal points,
-    except for initial time-zero folders.
-    
-    Args:
-        case_dir (str): The directory path to process
-    """
-    for item in os.listdir(case_dir):
-        item_path = os.path.join(case_dir, item)
-        if is_initial_time_dir(item):
-            continue
-        # Never follow a numeric symlink while cleaning solver output.  A
-        # retry must remove the link itself, not traverse or delete its target.
-        if os.path.islink(item_path):
-            if _is_numeric_name(item):
-                try:
-                    os.unlink(item_path)
-                    print(f"Removed numeric symlink: {item_path}")
-                except OSError as e:
-                    print(f"Error removing symlink {item_path}: {str(e)}")
-            continue
-        if os.path.isdir(item_path) and _is_numeric_name(item):
-            try:
-                shutil.rmtree(item_path)
-                print(f"Removed numeric folder: {item_path}")
-            except OSError as e:
-                print(f"Error removing folder {item_path}: {str(e)}")
+# Fixed native output/cache roots; ordinary names sharing a prefix remain inputs.
+SOLVER_OUTPUT_DIRECTORIES = {"postProcessing", "VTK", "dynamicCode"}
+_PROCESSOR_DIRECTORY_RE = re.compile(r"processor(?:[0-9]+|s[0-9]+(?:_[0-9]+-[0-9]+)?)")
 
 
-# Directories an OpenFOAM run writes into the case, which are output rather than input:
-# every written time step ("0.02", "100", ...), the per-rank copies decomposePar makes,
-# and the post-processing trees. Time zero and `0.orig` are kept -- those are the initial
-# conditions, which are part of the case.
-SOLVER_OUTPUT_PREFIXES = ("processor", "postProcessing", "VTK", "dynamicCode")
+def is_processor_dir(name: str) -> bool:
+    """Recognize native uncollated/collated partitions and legacy processors."""
+    return name == "processors" or _PROCESSOR_DIRECTORY_RE.fullmatch(name) is not None
 
 
 def is_solver_output_dir(name: str) -> bool:
@@ -1152,12 +1133,9 @@ def is_solver_output_dir(name: str) -> bool:
     """
     if name == "0.orig" or is_initial_time_dir(name):
         return False
-    if name.startswith(SOLVER_OUTPUT_PREFIXES):
+    if is_processor_dir(name) or name in SOLVER_OUTPUT_DIRECTORIES:
         return True
-    try:
-        return float(name) != 0  # Numeric zero spellings are initial fields too.
-    except ValueError:
-        return False
+    return _is_numeric_name(name)
 
 
 def scan_case_directory(case_dir: str) -> Dict[str, List[str]]:
@@ -1167,7 +1145,7 @@ def scan_case_directory(case_dir: str) -> Dict[str, List[str]]:
     This function collects the files in each input directory (typically
     'system', 'constant', '0', etc.), including regional inputs for a case
     declaring constant/regionProperties. Bulk mesh files are read separately.
-    Directories the solver wrote (time steps, processor*, postProcessing) are skipped:
+    Directories the solver wrote (time steps, native partitions, postProcessing) are skipped:
     they are output, not case definition, and embedding them overflows every prompt.
     
     Args:
@@ -1201,7 +1179,7 @@ def scan_case_directory(case_dir: str) -> Dict[str, List[str]]:
     for root, dirs, files in os.walk(case_dir):
         current_depth = root.rstrip(os.sep).count(os.sep)
         dirs[:] = [d for d in dirs if not d.startswith('.')]
-        # Do not descend into solver output; a processor* tree holds a full copy of the
+        # Do not descend into solver output; a native partition holds a full copy of the
         # mesh and every field, and reading it is pure cost.
         if current_depth == base_depth:
             dirs[:] = [d for d in dirs if not is_solver_output_dir(d)]
@@ -1285,10 +1263,31 @@ def read_case_foamfiles(case_dir: str, dir_structure: Optional[Dict[str, List[st
                 ))
             except UnicodeDecodeError:
                 print(f"Warning: Skipping file due to encoding error: {file_path}")
-            except (OSError, EOFError) as e:
+            except (OSError, EOFError, zlib.error) as e:
                 print(f"Warning: Error reading file {file_path}: {e}")
     
     return FoamPydantic(list_foamfile=foamfile_list)
+
+def native_job_info_setup(job_info_dir):
+    """Enable native per-process termination records without changing case inputs."""
+    import shlex
+    return (
+        'foamagent_control_dict=${FOAM_CONTROLDICT:-}\n'
+        'if [ -z "$foamagent_control_dict" ]; then\n'
+        '    foamagent_etc_files=$(foamEtcFile -all controlDict) || exit $?\n'
+        '    mapfile -t foamagent_etc_files <<< "$foamagent_etc_files"\n'
+        '    for ((foamagent_i=${#foamagent_etc_files[@]}-1; foamagent_i>=0; foamagent_i--)); do\n'
+        '        foamagent_control_dict+=$\'\\n\'"$(cat -- "${foamagent_etc_files[foamagent_i]}")" || exit $?\n'
+        '    done\n'
+        'fi\n'
+        'foamagent_info_switches="writeJobInfo 1;"\n'
+        'if [ "${WM_PROJECT_VERSION:-}" = "10" ]; then\n'
+        '    foamagent_info_switches+=" writeJobControl 1;"\n'
+        'fi\n'
+        'export FOAM_CONTROLDICT="$foamagent_control_dict"$\'\\n\'"InfoSwitches { $foamagent_info_switches }"\n'
+        f'export FOAM_JOB_DIR={shlex.quote(str(job_info_dir))}\n'
+    )
+
 
 def run_command(
     script_path: str,
@@ -1299,6 +1298,7 @@ def run_command(
     *,
     openfoam_target: str = "",
     fail_fast: bool = False,
+    job_info_dir: str | None = None,
 ) -> Dict[str, Any]:
     print(f"Executing script {script_path} in {working_dir}")
     script = Path(script_path).expanduser().resolve()
@@ -1337,11 +1337,18 @@ def run_command(
         'active WM_PROJECT_VERSION=${WM_PROJECT_VERSION:-unset}" >&2; exit 64; '
         'fi; '
         'fi; '
+        + (native_job_info_setup(job_info_dir) if job_info_dir is not None else '')
         + ('exec bash -e -o pipefail "$foamagent_script"' if fail_fast
            else 'exec bash "$foamagent_script"')
     )
 
     timed_out = False
+
+    for output in (out_file, err_file):
+        reject_symbolic_links(output)
+        path = Path(output)
+        if path.exists() and not path.is_file():
+            raise ValueError(f"Execution output is not a regular file: {path}")
 
     with open(out_file, 'w') as out, open(err_file, 'w') as err:
         process = subprocess.Popen(
@@ -1368,11 +1375,14 @@ def run_command(
             process.wait(timeout=max_time_limit)
         except subprocess.TimeoutExpired:
             timed_out = True
+        finally:
+            # The session can retain helpers after its leader has exited.
             try:
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             process.wait()
+        if timed_out:
             timeout_message = (
                 f"OpenFOAM execution exceeded the {max_time_limit} second timeout.\n"
             )
@@ -1380,13 +1390,48 @@ def run_command(
             err.write(timeout_message)
             print(f"Execution timed out: {script_path}")
 
-    
-
     print(f"Executed script {script_path}")
     return {
         "returncode": process.returncode,
         "timed_out": timed_out,
     }
+
+
+def run_owned_process(command, *, cwd, timeout, check=False, text=False):
+    """Capture a local script and stop its owned helpers before returning."""
+    import io
+    import tempfile
+
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        with subprocess.Popen(command, cwd=cwd, stdout=out, stderr=err,
+                              text=text, start_new_session=True) as process:
+            timed_out = False
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+            finally:
+                # The group may still contain background helpers after its
+                # leader exits, including PyVista's background Xvfb process.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+            out.seek(0)
+            err.seek(0)
+            if timed_out:
+                raise subprocess.TimeoutExpired(command, timeout, output=out.read(), stderr=err.read())
+            if text:
+                with io.TextIOWrapper(out, encoding=process.encoding, errors=process.errors) as stdout, \
+                        io.TextIOWrapper(err, encoding=process.encoding, errors=process.errors) as stderr:
+                    output, errors = stdout.read(), stderr.read()
+            else:
+                output, errors = out.read(), err.read()
+    result = subprocess.CompletedProcess(command, process.returncode, output, errors)
+    if check:
+        result.check_returncode()
+    return result
 
 
 def run_openfoam_utility(
@@ -1398,7 +1443,7 @@ def run_openfoam_utility(
 ) -> subprocess.CompletedProcess[str]:
     """Execute one OpenFOAM utility with the requested native runtime.
 
-    Legacy callers retain direct ``subprocess.run`` behaviour. Native target
+    Legacy callers execute their command directly. Native target
     mesh preprocessing happens before an ``Allrun`` exists, so it sources and
     validates the selected installation itself.
     """
@@ -1408,13 +1453,11 @@ def run_openfoam_utility(
     run_kwargs = {
         "cwd": working_dir,
         "check": True,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
         "text": True,
         "timeout": timeout,
     }
     if openfoam_target not in {"foundation-v10", "esi-v2006"}:
-        return subprocess.run(command, **run_kwargs)
+        return run_owned_process(command, **run_kwargs)
 
     openfoam_dir = os.getenv("WM_PROJECT_DIR")
     if not openfoam_dir:
@@ -1437,7 +1480,7 @@ def run_openfoam_utility(
         'esac; '
         'exec "${foamagent_command[@]}"'
     )
-    return subprocess.run(
+    return run_owned_process(
         [
             "bash",
             "-c",
@@ -1451,40 +1494,25 @@ def run_openfoam_utility(
     )
 
 
-_EXPLICIT_FOAM_ERROR_RE = re.compile(r"ERROR:(.*)", re.DOTALL)
-
-
 def check_foam_errors(directory: str) -> list:
     """Collect explicit OpenFOAM errors without imposing completion heuristics."""
-    error_logs: list[dict] = []
-    for file_name in os.listdir(directory):
-        if not file_name.startswith("log"):
-            continue
-        filepath = os.path.join(directory, file_name)
-        try:
-            with open(filepath, encoding="utf-8") as log_file:
-                content = log_file.read()
-        except OSError:
-            error_logs.append(
-                {
-                    "file": file_name,
-                    "error_content": f"Could not read log file: {filepath}",
-                }
-            )
-            continue
-        match = _EXPLICIT_FOAM_ERROR_RE.search(content)
-        if match:
-            error_logs.append(
-                {"file": file_name, "error_content": match.group(0).strip()}
-            )
-    return error_logs
+    from services.execution_logs import current_execution_logs, scan_execution_log
+    root = Path(directory)
+    errors = []
+    for path in current_execution_logs(root, {}):
+        errors.extend({"file": path.relative_to(root).as_posix(), "error_content": error}
+                      for error in scan_execution_log(path)["errors"][:32 - len(errors)])
+        if len(errors) == 32:
+            break
+    return errors
 
 def parse_context(text: str) -> str:
-    match = re.search(r'FoamFile\s*\{.*?(?=```|$)', text, re.DOTALL | re.IGNORECASE)
-    if match:
-        return match.group(0).strip()
-    
-    print("Warning: Could not parse context; returning original text.")
+    """Remove a complete outer code fence, preserving the file's full contents."""
+    lines = text.strip().splitlines(keepends=True)
+    if (len(lines) >= 2
+            and re.fullmatch(r"```[^`]*", lines[0].strip())
+            and lines[-1].strip() == "```"):
+        return "".join(lines[1:-1])
     return text
 
 def retrieve_faiss(
@@ -1587,8 +1615,8 @@ def parse_directory_structure(data: str) -> dict:
     dir_blocks = re.findall(r'<dir>(.*?)</dir>', data, re.DOTALL)
 
     for block in dir_blocks:
-        # Extract the directory name (everything after "directory name:" until the first period)
-        dir_name_match = re.search(r'directory name:\s*(.*?)\.', block)
+        # Match the producer's delimiter so dots remain part of directory names.
+        dir_name_match = re.search(r'directory name:\s*(.*?)\. File names in this directory:', block)
         # Extract the list of file names within square brackets
         files_match = re.search(r'File names in this directory:\s*\[(.*?)\]', block)
         
@@ -1604,6 +1632,9 @@ def parse_directory_structure(data: str) -> dict:
 
 def load_case_files(state: dict[str, Any]) -> dict[str, Any]:
     """Read the shared file state on import or mesh changes."""
+    from services.case_inputs import read_case_inputs, canonical_input_protections
+    from services.execution_logs import declared_startup_inputs
+
     case_dir = state.get("case_dir")
     if not case_dir:
         return {}
@@ -1623,30 +1654,25 @@ def load_case_files(state: dict[str, Any]) -> dict[str, Any]:
                 boundary = resolve_case_file(region / "polyMesh/boundary")
                 if boundary.is_file():
                     input_directory[boundary.parent.relative_to(Path(case_dir)).as_posix()] = [boundary.name]
-    foamfiles = read_case_foamfiles(case_dir, input_directory)
+    protected = canonical_input_protections(state.get('case_input_source_dir'), declared_startup_inputs([
+        *state.get('mesh_operations', []), *state.get('solver_operations', []),
+        *state.get('pending_solver_operations', []),
+    ]))
+    selected = [Path(folder) / name for folder, names in input_directory.items() for name in names]
+    foamfiles, omitted = read_case_inputs(
+        case_dir, protected_inputs=protected, selected_paths=[*selected, *protected])
     return {
         "dir_structure": directory,
         "foamfiles": foamfiles,
+        "input_omissions": omitted,
     }
 
 
 def _case_input_directory(directory: dict[str, list[str]]) -> dict[str, list[str]]:
     """Keep LLM context focused on dictionaries and the active field directory."""
-    selected = {
+    return {
         name: files
         for name, files in directory.items()
         if name.partition(os.sep)[0] in {"system", "constant"}
         or is_initial_time_dir(name.partition(os.sep)[0])
     }
-    if any(is_initial_time_dir(name.partition(os.sep)[0]) for name in selected):
-        return selected
-    numeric: list[tuple[float, str]] = []
-    for name in directory:
-        try:
-            numeric.append((float(name), name))
-        except ValueError:
-            continue
-    if numeric:
-        latest_name = max(numeric)[1]
-        selected[latest_name] = directory[latest_name]
-    return selected

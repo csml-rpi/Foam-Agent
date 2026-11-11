@@ -1,6 +1,6 @@
 # MCP Guide
 
-Foam-Agent exposes planning, file generation, execution, repair, and visualization as MCP tools. Complete [local installation](usage.md#local-installation) and [authentication](usage.md#authentication) before starting the server. Select an [OpenFOAM target](usage.md#openfoam-targets-and-corpora) with its matching runtime and corpus.
+Foam-Agent exposes planning, file generation, execution, repair, and visualization as MCP tools. Install project dependencies, configure model credentials, and select a matching OpenFOAM runtime and corpus.
 
 ## Client Setup
 
@@ -26,9 +26,10 @@ The console command defaults to stdio. To serve HTTP:
 foamagent-mcp --transport http --host 0.0.0.0 --port 7860
 ```
 
-For Docker, first [build the runtime image](usage.md#docker-builds):
+For Docker, build the runtime image and start the server:
 
 ```bash
+docker build --platform linux/amd64 -f docker/Dockerfile -t foamagent:local .
 mkdir -p runs
 docker run -it \
   -e FOAMAGENT_MODEL_PROVIDER=openai \
@@ -92,8 +93,7 @@ For an existing case, call `run_case` with:
 (default `careful`), `input_writer_generation_mode`, and `max_static_review_retries`
 (default `10`). These overrides apply to that invocation; individual tools use
 the server's target configuration. Standalone `input_writer` accepts the mode and
-generation override. See [execution modes](usage.md#execution-modes-and-static-review)
-and [existing cases](usage.md#existing-cases).
+generation override.
 
 All paths refer to the server's filesystem. Generated `input_writer` cases default to `runs/<case_name>/` in the repository; the Docker mount above exposes those results on the host. For `run_case`, mount its inputs and use an `output_dir` inside a mounted writable directory to retain the results.
 
@@ -112,18 +112,21 @@ To apply corrections, format error findings as `review_analysis` text and pass
 `error_logs=[]` to `apply_fixes`. Clients control review/repair rounds; standalone review is
 read-only and leaves history persistence to the client.
 
-Full `run_case` uses the [static review policy and reports](usage.md#execution-modes-and-static-review)
-with mesh and solver initial reviews sharing one repair allowance. It retains
-canonical inputs under `report/inputs/workflow-*/`. Writer updates these sources;
-successful mesh handoffs synchronize the current mesh before execution restores
-inputs into `work/`. Standalone `run` executes
-the supplied case directly.
+Full `run_case` reviews mesh and solver inputs in careful mode, sharing one static
+repair budget. It retains canonical inputs under `report/inputs/workflow-*/`.
+Writer edits and successful mesh handoffs update these sources; execution restores
+them into `work/`. Standalone `run` executes the supplied case directly.
 
-Individual tools do not execute the complete graph. `run` is local-only and executes directly, without automatic static review; there is no standalone meshing or HPC tool. Use the CLI graph for generated-case Gmsh/custom-mesh and HPC routing; use `run_case` for the imported-case graph, including automatic static review in careful mode and its configured repair limits. [HPC monitoring limits](usage.md#hpc-execution-and-monitoring) apply to that graph.
+Individual tools do not execute the complete graph. `run` is local-only and executes directly, without automatic static review; there is no standalone meshing or HPC tool. Use the CLI graph for generated-case Gmsh/custom-mesh and HPC routing; use `run_case` for the imported-case graph, including automatic static review in careful mode and its configured repair limits.
 
-`run` executes the supplied Allrun directly without rewriting its commands or asking a model to locate solver invocations. Success requires a zero exit status, normal native solver completion and a new or rewritten result field from the current execution, including time zero. Result changes are checked across the whole Allrun; individual commands are not observed separately.
+Standalone `run` executes Allrun directly. Success requires zero exit, normal native
+solver completion and a result field created or rewritten during this attempt,
+including time zero.
 
-Standalone `review` reads the case and supplied errors, but uses fixed `simpleFoam`/`fluid`/`tutorial` metadata and the directory basename for retrieval rather than inferring the solver.
+Standalone `review` retrieves references using the current `system/controlDict`
+application and directory basename. Simple literal applications work without a
+native runtime; preprocessing requires the native parser. If unresolved, review
+continues with the files/errors and reports the missing solver reference.
 
 Structured execution errors keep `file` and `error_content`; an optional
 `diagnostic_context` carries recent process logs. Preserve it when forwarding
@@ -134,7 +137,7 @@ string-based error list and includes this context in each corresponding string.
 
 ## Claude Code Skill
 
-Cloned repositories include the [`/foam` skill](../.claude/skills/foam.md):
+Cloned repositories include the `/foam` skill:
 
 ```text
 /foam Simulate lid-driven cavity flow at Re=1000

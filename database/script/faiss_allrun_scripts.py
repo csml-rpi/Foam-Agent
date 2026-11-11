@@ -80,7 +80,7 @@ def main():
 
         # Extract directory structure
         dir_match = re.search(r"<directory_structure>(.*?)</directory_structure>", match, re.DOTALL)
-        dir_structure = dir_match.group(0).strip() if dir_match else "Unknown"
+        dir_structure = dir_match.group(1).strip() if dir_match else "Unknown"
 
         # Extract metadata fields from index_content
         case_name = extract_field("case name", index_content)

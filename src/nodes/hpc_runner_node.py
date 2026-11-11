@@ -5,25 +5,16 @@ from services.run_hpc import HpcWorkflowStop, run_stage_hpc, check_logs_for_erro
 from services.run_local import _cleanup_run_artifacts, _execution_output
 from services.solver_execution import snapshot_result_fields
 from openfoam_target import runtime_openfoam_target
-from services.review_history import ReviewHistory
-from services.case_workspace import prepare_case_workspace
-from services.case_inputs import case_input_fingerprint
+from services.execution_logs import declared_startup_inputs, snapshot_execution_logs
+from services.solver_attempts import prepare_solver_attempt, record_solver_attempt
+from services.case_inputs import canonical_input_protections
 
 
 def hpc_runner_node(state):
-    workspace = prepare_case_workspace(
-        state["case_dir"], state.get("case_import_report_dir"), state.get("case_input_source_dir"))
-    state = {**state, "case_input_source_dir": str(workspace.source_dir) if workspace else None}
-    history = ReviewHistory(state["case_dir"], state.get("case_import_report_dir"))
-    fingerprint = case_input_fingerprint(state["case_dir"])
-    history.append("run_started", stage="solver", runner="hpc", input_fingerprint=fingerprint,
-                   runtime_loop=state.get("loop_count", 0))
-    result = _run_hpc(state)
-    result.update(case_input_source_dir=state["case_input_source_dir"],
-                  last_run_input_fingerprint=fingerprint)
-    history.append("run_result", stage="solver", runner="hpc", input_fingerprint=fingerprint,
-                   job_id=result.get("job_id"), error_logs=result.get("error_logs") or [])
-    return result
+    state, skipped = prepare_solver_attempt(state, 'hpc')
+    if skipped:
+        return state
+    return record_solver_attempt(state, _run_hpc(state), 'hpc')
 
 
 def _run_hpc(state):
@@ -32,11 +23,14 @@ def _run_hpc(state):
     errors = check_stage_inputs(case, current["solver_operations"], "solver")
     if not errors:
         errors = check_stage_script(case, current['solver_operations'], 'solver')
+    protected = canonical_input_protections(
+        current.get('case_input_source_dir'), declared_startup_inputs(current['solver_operations']))
     if errors:
         return {**stage_outcome(state, "solver", {"executed": False, "error_logs": errors}),
                 "error_logs": errors, "solver_execution": {"executed": False, "error_logs": errors}}
-    _cleanup_run_artifacts(case)
+    _cleanup_run_artifacts(case, protected_inputs=protected)
     fields_before = snapshot_result_fields(case)
+    logs_before = snapshot_execution_logs(case)
     try:
         result = run_stage_hpc(current, str(Path(case) / "Allrun"), "solver", current["config"].max_time_limit)
     except HpcWorkflowStop as stop:
@@ -45,16 +39,18 @@ def _run_hpc(state):
     except Exception as error:
         return {"error_logs": [{"file": "Allrun", "error_content": str(error)}],
                 "solver_jobs": current.get("solver_jobs", []), "loop_count": current.get("loop_count", 0)}
-    errors = check_logs_for_errors(case, fields_before=fields_before,
+    errors = check_logs_for_errors(case, fields_before=fields_before, logs_before=logs_before,
+                                   protected_inputs=protected,
                                    openfoam_target=runtime_openfoam_target(current["config"]),
-                                   timeout=current["config"].max_time_limit)
+                                   timeout=current["config"].max_time_limit,
+                                   job_info_dir=result.get('job_info_dir'))
     if result.get("returncode"):
         # Attempt paths and job IDs remain in solver_jobs; the repair input is
         # the actual failure, so identical retries retain the same fingerprint.
         details = (
             f"HPC Allrun exited with return code {result['returncode']}; "
             f"Slurm state: {result.get('status')}.\n"
-            f"{result.get('diagnostic') or ''}\n{_execution_output(case)}"
+            f"{result.get('diagnostic') or ''}\n{_execution_output(case, logs_before)}"
         )
         errors.append({"file": "Allrun", "error_content": details.strip()})
     return {**stage_outcome(current, "solver", {"execution": result, "error_logs": errors}),

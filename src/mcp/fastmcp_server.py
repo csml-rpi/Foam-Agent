@@ -4,10 +4,11 @@ This module provides a modern MCP server implementation using FastMCP,
 exposing OpenFOAM simulation capabilities through clean, well-typed interfaces.
 """
 
-import asyncio
 from copy import deepcopy
 import os
 import json
+import subprocess
+import zlib
 from typing import Any, Dict, List, Literal, Optional
 
 from fastmcp import FastMCP, Context
@@ -22,8 +23,12 @@ from services.plan import (
     retrieve_references,
     generate_simulation_plan,
 )
-from services.input_writer import initial_write
+from services.input_writer import initial_write, normalise_initial_subtasks
+from services.stage_plan import check_file_targets
+from services.execution_logs import check_execution_outputs
+from services import get_llm_service
 from services.run_local import run_allrun_and_collect_errors
+from services.solver_execution import read_case_application
 
 from utils import FoamPydantic, read_case_foamfiles, scan_case_directory
 from services.case_inputs import read_case_inputs
@@ -33,6 +38,8 @@ from translation.esi_translator import convert_case_to_esi_if_needed
 from services.visualization import visualize_case
 from services.output_safety import prepare_output_directory
 from config import Config
+from logger import setup_logging, LOG_FILENAMES
+from .dispatch import run_tool
 from openfoam_target import (
     runtime_openfoam_target,
     database_path_for_config,
@@ -91,19 +98,12 @@ class PlanResponse(BaseModel):
     tutorial_reference: str = Field(default="", description="Retrieved target-version tutorial evidence for generation and review")
     allrun_reference: str = Field(default="", description="Retrieved execution examples for generation and review")
 
-
-@mcp.tool(name="plan")
-async def plan(
+def _plan(
     request: PlanRequest,
-    ctx: Context
+    notify
 ) -> PlanResponse:
-    """Plan the simulation structure by analyzing requirements and generating subtasks.
-
-    This function uses AI to break down user requirements into manageable subtasks
-    for OpenFOAM file generation.
-    """
     try:
-        await ctx.info("Planning simulation structure from user requirements")
+        notify('info', "Planning simulation structure from user requirements")
         require_target_corpus(global_config)
         
         # Load case statistics, available domains, categories, and solvers
@@ -120,7 +120,7 @@ async def plan(
             config=global_config,
         )
         
-        await ctx.info(f"Generated {len(plan_data['subtasks'])} subtasks")
+        notify('info', f"Generated {len(plan_data['subtasks'])} subtasks")
         
         # Keep legacy path keys while preserving the planner's file instructions.
         subtasks = [
@@ -140,8 +140,22 @@ async def plan(
         )
         
     except Exception as e:
-        await ctx.error(f"Failed to plan simulation: {str(e)}")
+        notify('error', f"Failed to plan simulation: {str(e)}")
         raise
+
+
+
+@mcp.tool(name="plan")
+async def plan(
+    request: PlanRequest,
+    ctx: Context
+) -> PlanResponse:
+    """Plan the simulation structure by analyzing requirements and generating subtasks.
+
+    This function uses AI to break down user requirements into manageable subtasks
+    for OpenFOAM file generation.
+    """
+    return await run_tool(_plan, request, ctx)
 
 
 # ============================================================================
@@ -174,21 +188,12 @@ class GenerateFilesResponse(BaseModel):
     foamfiles: FoamPydantic = Field(description="Generated OpenFOAM files with metadata")
     allrun_script: str = Field(description="Path to the generated Allrun script")
 
-
-@mcp.tool(name="input_writer")
-async def input_writer(
+def _input_writer(
     request: GenerateFilesRequest,
-    ctx: Context
+    notify
 ) -> GenerateFilesResponse:
-    """Generate OpenFOAM input files based on subtasks and requirements.
-
-    This function creates all necessary OpenFOAM input files (system/, constant/, 0/).
-    It generates Foundation v10 files by default. Explicit native ESI v2006 uses
-    its own corpus and conventions; the separate FOAMAGENT_OPENFOAM_FORK=esi
-    compatibility mode still applies best-effort post-generation translation.
-    """
     try:
-        await ctx.info(f"Generating OpenFOAM files for case: {request.case_name}")
+        notify('info', f"Generating OpenFOAM files for case: {request.case_name}")
         config = deepcopy(global_config)
         if request.execution_mode is not None:
             config.execution_mode = request.execution_mode
@@ -199,12 +204,11 @@ async def input_writer(
         # Resolve case directory
         case_dir = resolve_case_dir(
             case_name=request.case_name,
-            case_dir="",
-            run_times=global_config.run_times
+            case_dir=config.case_dir,
+            run_times=config.run_times,
+            run_directory=config.run_directory,
         )
-        prepare_output_directory(case_dir, overwrite=request.overwrite_output)
-
-        await ctx.info(f"Case directory: {case_dir}")
+        notify('info', f"Case directory: {case_dir}")
 
         # Build case info from request
         case_info = {
@@ -214,7 +218,7 @@ async def input_writer(
             "case_category": request.case_category
         }
 
-        await ctx.info(f"Case info: {case_info}")
+        notify('info', f"Case info: {case_info}")
 
         # Convert subtasks format from {file, folder} to {file_name, folder_name}
         converted_subtasks = []
@@ -234,7 +238,18 @@ async def input_writer(
             else:
                 raise ValueError(f"Invalid subtask type: {type(st)}. Expected dict, got {st}")
 
+        converted_subtasks = normalise_initial_subtasks(converted_subtasks)
+        targets = ["/".join(part for part in (st['folder_name'], st['file_name']) if part)
+                   for st in converted_subtasks]
+        target_errors = check_file_targets(None, [*targets, *([] if 'Allrun' in targets else ['Allrun'])])
+        target_errors.extend(check_execution_outputs(LOG_FILENAMES, targets))
+        if target_errors:
+            raise ValueError(str(target_errors))
+        prepare_output_directory(case_dir, overwrite=request.overwrite_output)
+        setup_logging(case_dir)
+
         # Retrieve references
+        client = get_llm_service(config=config)
         tutorial_reference, _, _, allrun_reference, similar_case_advice = retrieve_references(
             case_name=case_info["case_name"],
             case_solver=case_info["case_solver"],
@@ -244,30 +259,15 @@ async def input_writer(
             config=global_config,
             user_requirement=request.user_requirement,
             subtasks=converted_subtasks,
+            llm_service=client,
         )
 
-        await ctx.info(f"converted_subtasks: {converted_subtasks}")
-
-        # Create a sync callback that bridges to async ctx.report_progress.
-        # initial_write() is synchronous and will run in a worker thread via
-        # asyncio.to_thread(), so we use run_coroutine_threadsafe to schedule
-        # progress notifications on the event loop from that thread.
-        loop = asyncio.get_running_loop()
+        notify('info', f"converted_subtasks: {converted_subtasks}")
 
         def progress_callback(current: int, total: int, message: str) -> None:
-            future = asyncio.run_coroutine_threadsafe(
-                ctx.report_progress(current, total, message),
-                loop
-            )
-            try:
-                future.result(timeout=5.0)
-            except Exception:
-                pass  # Don't fail generation if progress reporting fails
+            notify("report_progress", current, total, message)
 
-        # Run blocking initial_write in a thread to keep the event loop free
-        # for sending progress notifications
-        result = await asyncio.to_thread(
-            initial_write,
+        result = initial_write(
             case_dir=case_dir,
             subtasks=converted_subtasks,
             user_requirement=request.user_requirement,
@@ -282,11 +282,12 @@ async def input_writer(
             openfoam_fork=generation_convention(global_config),
             generation_mode=config.generation_mode,
             config=config,
+            llm_service=client,
         )
         if result.get('error_logs'):
             raise RuntimeError(str(result['error_logs']))
 
-        await ctx.info(f"result: {result}")
+        notify('info', f"result: {result}")
 
         # Get foamfiles from result
         foamfiles = result.get("foamfiles")
@@ -307,7 +308,7 @@ async def input_writer(
         allrun_script = os.path.join(case_dir, "Allrun")
 
         num_files = len(foamfiles.list_foamfile) if hasattr(foamfiles, "list_foamfile") else 0
-        await ctx.info(f"Generated {num_files} OpenFOAM files in {case_dir}")
+        notify('info', f"Generated {num_files} OpenFOAM files in {case_dir}")
 
         return GenerateFilesResponse(
             case_dir=case_dir,
@@ -316,8 +317,30 @@ async def input_writer(
         )
 
     except Exception as e:
-        await ctx.error(f"Failed to generate OpenFOAM files: {str(e)}")
+        notify('error', f"Failed to generate OpenFOAM files: {str(e)}")
         raise
+
+
+
+@mcp.tool(name="input_writer")
+async def input_writer(
+    request: GenerateFilesRequest,
+    ctx: Context
+) -> GenerateFilesResponse:
+    """Generate OpenFOAM input files based on subtasks and requirements.
+
+    This function creates all necessary OpenFOAM input files (system/, constant/, 0/).
+    It generates Foundation v10 files by default. Explicit native ESI v2006 uses
+    its own corpus and conventions; the separate FOAMAGENT_OPENFOAM_FORK=esi
+    compatibility mode still applies best-effort post-generation translation.
+    """
+    return await run_tool(
+        _input_writer, request, ctx,
+        case_dir=lambda: resolve_case_dir(
+            request.case_name, case_dir=global_config.case_dir,
+            run_times=global_config.run_times, run_directory=global_config.run_directory,
+        ),
+    )
 
 
 # ============================================================================
@@ -336,21 +359,12 @@ class RunSimulationResponse(BaseModel):
     errors: List[str] = Field(description="List of errors found")
     log_files: Dict[str, str] = Field(description="Paths to log files")
 
-
-@mcp.tool(name="run")
-async def run(
+def _run(
     request: RunSimulationRequest,
-    ctx: Context
+    notify
 ) -> RunSimulationResponse:
-    """Run the OpenFOAM simulation locally.
-
-    This function executes the Allrun script and collects any errors. Foundation
-    v10 is the default runtime. An explicit ESI v2006 target sources and checks
-    its native runtime; legacy FOAMAGENT_OPENFOAM_FORK=esi remains a separately
-    translated compatibility path.
-    """
     try:
-        await ctx.info(f"Running simulation in directory: {request.case_dir}")
+        notify('info', f"Running simulation in directory: {request.case_dir}")
         
         # Validate case directory exists
         if not os.path.exists(request.case_dir):
@@ -389,7 +403,7 @@ async def run(
         
         status = "success" if not errors else "failed"
         
-        await ctx.info(f"Simulation {status} with {len(errors)} error(s)")
+        notify('info', f"Simulation {status} with {len(errors)} error(s)")
         
         return RunSimulationResponse(
             status=status,
@@ -398,8 +412,24 @@ async def run(
         )
             
     except Exception as e:
-        await ctx.error(f"Failed to run simulation: {str(e)}")
+        notify('error', f"Failed to run simulation: {str(e)}")
         raise
+
+
+
+@mcp.tool(name="run")
+async def run(
+    request: RunSimulationRequest,
+    ctx: Context
+) -> RunSimulationResponse:
+    """Run the OpenFOAM simulation locally.
+
+    This function executes the Allrun script and collects any errors. Foundation
+    v10 is the default runtime. An explicit ESI v2006 target sources and checks
+    its native runtime; legacy FOAMAGENT_OPENFOAM_FORK=esi remains a separately
+    translated compatibility path.
+    """
+    return await run_tool(_run, request, ctx, case_dir=request.case_dir, log_output=True)
 
 
 # ============================================================================
@@ -417,6 +447,72 @@ class ReviewResponse(BaseModel):
     """Response from simulation review."""
     analysis: str = Field(description="Analysis of simulation errors")
 
+def _review(
+    request: ReviewRequest,
+    notify
+) -> ReviewResponse:
+    try:
+        notify('info', f"Reviewing errors for case directory: {request.case_dir}")
+        
+        # Validate case directory exists
+        if not os.path.exists(request.case_dir):
+            raise ValueError(f"Case directory does not exist: {request.case_dir}")
+
+        try:
+            case_solver = read_case_application(
+                request.case_dir, openfoam_target=runtime_openfoam_target(global_config),
+                timeout=global_config.max_time_limit,
+            )
+        except (OSError, UnicodeError, EOFError, zlib.error, ValueError,
+                subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError) as error:
+            details = "\n".join(str(part) for part in
+                                (error, getattr(error, "stdout", ""), getattr(error, "stderr", "")) if part)
+            tutorial_reference = (
+                "No solver tutorial reference was retrieved: the application in system/controlDict "
+                f"could not be established: {details}. "
+                "Diagnose the supplied files and errors without assuming a solver."
+            )
+        else:
+            require_target_corpus(global_config)
+            tutorial_reference, _, _, _, _ = retrieve_references(
+                case_name=os.path.basename(os.path.normpath(request.case_dir)),
+                case_solver=os.path.basename(case_solver),
+                case_domain="",
+                case_category="",
+                searchdocs=global_config.searchdocs,
+                config=global_config,
+            )
+        
+        # Read current foamfiles from case directory for review context
+        notify('info', "Reading OpenFOAM files for review context...")
+        foamfiles, omitted = read_case_inputs(request.case_dir)
+        notify('info', f"Read {len(foamfiles.list_foamfile)} file(s) for review")
+        
+        # Review results - directly call review_error_logs
+        client = get_llm_service(config=global_config)
+        review_content, _ = review_error_logs(
+            tutorial_reference=tutorial_reference,
+            foamfiles=foamfiles,
+            error_logs=request.errors,
+            user_requirement=request.user_requirement,
+            history_text=None,
+            openfoam_target=generation_convention(global_config),
+            omitted_files=omitted,
+            llm_service=client,
+        )
+        
+        notify('info', f"Review completed, found {len(request.errors)} error(s)")
+        
+        # Format response (suggestions and issues are empty as review_error_logs only returns analysis)
+        return ReviewResponse(
+            analysis=review_content
+        )
+        
+    except Exception as e:
+        notify('error', f"Failed to review results: {str(e)}")
+        raise
+
+
 
 @mcp.tool(name="review")
 async def review(
@@ -430,60 +526,7 @@ async def review(
     when that native target is selected. Legacy translated ESI cases remain
     best-effort.
     """
-    try:
-        await ctx.info(f"Reviewing errors for case directory: {request.case_dir}")
-        require_target_corpus(global_config)
-        
-        # Validate case directory exists
-        if not os.path.exists(request.case_dir):
-            raise ValueError(f"Case directory does not exist: {request.case_dir}")
-
-        # Extract case name from case_dir for reference lookup
-        case_name = os.path.basename(request.case_dir)
-        
-        # Get tutorial reference
-        case_info = {
-            "case_name": case_name,
-            "case_solver": "simpleFoam",  # Default
-            "case_domain": "fluid",
-            "case_category": "tutorial"
-        }
-        
-        tutorial_reference, _, _, _, _ = retrieve_references(
-            case_name=case_info["case_name"],
-            case_solver=case_info["case_solver"],
-            case_domain=case_info["case_domain"],
-            case_category=case_info["case_category"],
-            searchdocs=global_config.searchdocs,
-            config=global_config,
-        )
-        
-        # Read current foamfiles from case directory for review context
-        await ctx.info("Reading OpenFOAM files for review context...")
-        foamfiles, omitted = read_case_inputs(request.case_dir)
-        await ctx.info(f"Read {len(foamfiles.list_foamfile)} file(s) for review")
-        
-        # Review results - directly call review_error_logs
-        review_content, _ = review_error_logs(
-            tutorial_reference=tutorial_reference,
-            foamfiles=foamfiles,
-            error_logs=request.errors,
-            user_requirement=request.user_requirement,
-            history_text=None,
-            openfoam_target=generation_convention(global_config),
-            omitted_files=omitted,
-        )
-        
-        await ctx.info(f"Review completed, found {len(request.errors)} error(s)")
-        
-        # Format response (suggestions and issues are empty as review_error_logs only returns analysis)
-        return ReviewResponse(
-            analysis=review_content
-        )
-        
-    except Exception as e:
-        await ctx.error(f"Failed to review results: {str(e)}")
-        raise
+    return await run_tool(_review, request, ctx)
 
 
 # ============================================================================
@@ -503,51 +546,12 @@ class ApplyFixesResponse(BaseModel):
     updated_files: List[str] = Field(description="List of file paths that were updated")
     status: str = Field(description="Fix application status ('ok' or 'no_changes')")
 
-
-@mcp.tool(name="apply_fixes")
-async def apply_fixes(
+def _apply_fixes(
     request: ApplyFixesRequest,
-    ctx: Context
+    notify
 ) -> ApplyFixesResponse:
-    """Apply fixes to the OpenFOAM case files based on review analysis.
-
-    This tool rewrites OpenFOAM files to fix errors identified during review.
-    It must be called after the 'review' tool has provided analysis.
-    Fix generation follows the active target convention: Foundation v10 by default,
-    native ESI v2006 when `FOAMAGENT_OPENFOAM_TARGET=esi-v2006` is selected, and
-    best-effort translation when the legacy `FOAMAGENT_OPENFOAM_FORK=esi` mode is used.
-    
-    The tool directly calls rewrite_files which handles:
-    - Reading current foamfiles and directory structure from case_dir
-    - Using LLM to generate corrected file contents based on review_analysis
-    - Writing updated files back to the case directory
-    
-    Workflow:
-    1. First call 'review' tool to get review_analysis
-    2. Then call 'apply_fixes' with the review_analysis to rewrite files
-    
-    Args:
-        request: ApplyFixesRequest containing:
-            - case_dir: Path to the OpenFOAM case directory
-            - error_logs: List of error messages from simulation
-            - review_analysis: Analysis and fix suggestions from review tool (required)
-            - user_requirement: Original user requirements (optional)
-    
-    Returns:
-        ApplyFixesResponse with list of updated files and status
-    
-    Raises:
-        ValueError: If case directory does not exist or review_analysis is empty
-        RuntimeError: If fix application fails
-    
-    Example:
-        # Two-step workflow (review first, then fix)
-        review_resp = await review(case_dir, errors, user_requirement)
-        fix_resp = await apply_fixes(case_dir, errors, review_resp.analysis, user_requirement)
-    """
     try:
-        await ctx.info(f"Applying fixes for case directory: {request.case_dir}")
-        require_target_corpus(global_config)
+        notify('info', f"Applying fixes for case directory: {request.case_dir}")
         
         # Validate case directory exists
         if not os.path.exists(request.case_dir):
@@ -560,18 +564,20 @@ async def apply_fixes(
                 "to get review analysis, then provide it to this tool."
             )
         
-        await ctx.info("Rewriting OpenFOAM files based on review analysis...")
+        notify('info', "Rewriting OpenFOAM files based on review analysis...")
         
         # This standalone tool retains an explicit, file-scoped repair plan.
         from services.input_writer import rewrite_files
 
         foamfiles, omitted = read_case_inputs(request.case_dir)
+        client = get_llm_service(config=global_config)
         rewrite_plan = generate_rewrite_plan(
             foamfiles=foamfiles,
             error_logs=request.error_logs,
             review_analysis=request.review_analysis,
             user_requirement=request.user_requirement,
             openfoam_target=generation_convention(global_config),
+            llm_service=client,
         )
 
         result = rewrite_files(
@@ -585,6 +591,7 @@ async def apply_fixes(
             script_phase="all",
             omitted_files=omitted,
             static_repair=not request.error_logs,
+            llm_service=client,
         )
         if (result.get('rewrite_plan') or {}).get('target_files') and result.get('error_logs'):
             raise RuntimeError(str(result['error_logs']))
@@ -596,7 +603,7 @@ async def apply_fixes(
         
         status = "ok" if written_files else "no_changes"
         
-        await ctx.info(f"Successfully applied fixes. Updated {len(written_files)} file(s)")
+        notify('info', f"Successfully applied fixes. Updated {len(written_files)} file(s)")
         
         return ApplyFixesResponse(
             updated_files=written_files,
@@ -604,8 +611,53 @@ async def apply_fixes(
         )
         
     except Exception as e:
-        await ctx.error(f"Failed to apply fixes: {str(e)}")
+        notify('error', f"Failed to apply fixes: {str(e)}")
         raise
+
+
+
+@mcp.tool(name="apply_fixes")
+async def apply_fixes(
+    request: ApplyFixesRequest,
+    ctx: Context
+) -> ApplyFixesResponse:
+    """Apply fixes to the OpenFOAM case files based on review analysis.
+
+    This tool rewrites OpenFOAM files to fix errors identified during review.
+    It must be called after the 'review' tool has provided analysis.
+    Fix generation follows the active target convention: Foundation v10 by default,
+    native ESI v2006 when `FOAMAGENT_OPENFOAM_TARGET=esi-v2006` is selected, and
+    ESI generation conventions when the legacy `FOAMAGENT_OPENFOAM_FORK=esi` mode is used.
+
+    The tool directly calls rewrite_files which handles:
+    - Reading current foamfiles and directory structure from case_dir
+    - Using LLM to generate corrected file contents based on review_analysis
+    - Writing updated files back to the case directory
+
+    Workflow:
+    1. First call 'review' tool to get review_analysis
+    2. Then call 'apply_fixes' with the review_analysis to rewrite files
+
+    Args:
+        request: ApplyFixesRequest containing:
+            - case_dir: Path to the OpenFOAM case directory
+            - error_logs: List of error messages from simulation
+            - review_analysis: Analysis and fix suggestions from review tool (required)
+            - user_requirement: Original user requirements (optional)
+
+    Returns:
+        ApplyFixesResponse with list of updated files and status
+
+    Raises:
+        ValueError: If case directory does not exist or review_analysis is empty
+        RuntimeError: If fix application fails
+
+    Example:
+        # Two-step workflow (review first, then fix)
+        review_resp = await review(case_dir, errors, user_requirement)
+        fix_resp = await apply_fixes(case_dir, errors, review_resp.analysis, user_requirement)
+    """
+    return await run_tool(_apply_fixes, request, ctx, case_dir=request.case_dir, log_output=True)
 
 
 # ============================================================================
@@ -618,20 +670,24 @@ class StaticReviewRequest(BaseModel):
     tutorial_reference: str = Field(default="", description="Existing target-version tutorial reference from plan")
     allrun_reference: str = Field(default="", description="Existing target-version execution examples from plan")
 
-
-@mcp.tool(name="static_review")
-async def static_review(request: StaticReviewRequest, ctx: Context) -> StaticReviewReport:
-    """Read current inputs and report definite errors and warnings before running."""
-    await ctx.info(f"Statically reviewing case: {request.case_dir}")
-    report, _ = await asyncio.to_thread(
-        review_case_inputs,
+def _static_review(request: StaticReviewRequest, notify) -> StaticReviewReport:
+    notify('info', f"Statically reviewing case: {request.case_dir}")
+    report, _ = review_case_inputs(
         case_dir=request.case_dir,
         user_requirement=request.user_requirement,
         openfoam_fork=generation_convention(global_config),
         tutorial_reference=request.tutorial_reference,
         allrun_reference=request.allrun_reference,
+        config=global_config,
     )
     return report
+
+
+
+@mcp.tool(name="static_review")
+async def static_review(request: StaticReviewRequest, ctx: Context) -> StaticReviewReport:
+    """Read current inputs and report definite errors and warnings before running."""
+    return await run_tool(_static_review, request, ctx)
 
 
 # ============================================================================
@@ -688,10 +744,7 @@ class RunCaseResponse(BaseModel):
         default=None, description="Aggregated initial mesh/solver static reviews; not repeated after runtime repairs",
     )
 
-
-@mcp.tool(name="run_case")
-async def run_case(request: RunCaseRequest, ctx: Context) -> RunCaseResponse:
-    """Import an existing case or ZIP and execute the shared repair workflow."""
+def _run_case(request: RunCaseRequest, notify) -> RunCaseResponse:
     try:
         if not request.case_path.strip():
             raise ValueError("case_path is required.")
@@ -708,13 +761,12 @@ async def run_case(request: RunCaseRequest, ctx: Context) -> RunCaseResponse:
         if request.openfoam_target is not None:
             config.openfoam_target = normalise_openfoam_target(request.openfoam_target)
 
-        await ctx.info(f"Importing and running existing case: {request.case_path}")
+        notify('info', f"Importing and running existing case: {request.case_path}")
 
         # Import lazily so starting the MCP server does not execute CLI-only code.
         from main import main as run_workflow
 
-        result = await asyncio.to_thread(
-            run_workflow,
+        result = run_workflow(
             request.user_requirement,
             config,
             request.custom_mesh_path,
@@ -725,7 +777,7 @@ async def run_case(request: RunCaseRequest, ctx: Context) -> RunCaseResponse:
         termination_reason = result.get("termination_reason")
         failed = result.get("workflow_status") == "failed" or bool(termination_reason)
         status = "partial_success" if result.get("workflow_status") == "partial_success" else ("failed" if failed else "success")
-        await ctx.info(f"Existing-case workflow finished with status: {status}")
+        notify('info', f"Existing-case workflow finished with status: {status}")
         return RunCaseResponse(
             status=status,
             message=result.get("workflow_message"),
@@ -737,8 +789,15 @@ async def run_case(request: RunCaseRequest, ctx: Context) -> RunCaseResponse:
             static_review=result.get("static_review_report"),
         )
     except Exception as e:
-        await ctx.error(f"Failed to run existing case: {str(e)}")
+        notify('error', f"Failed to run existing case: {str(e)}")
         raise
+
+
+
+@mcp.tool(name="run_case")
+async def run_case(request: RunCaseRequest, ctx: Context) -> RunCaseResponse:
+    """Import an existing case or ZIP and execute the shared repair workflow."""
+    return await run_tool(_run_case, request, ctx, case_dir=request.output_dir)
 
 
 # ============================================================================
@@ -757,6 +816,42 @@ class VisualizationResponse(BaseModel):
     artifacts: List[str] = Field(description="List of generated visualization files")
     script: str = Field(description="Visualization script")
 
+def _visualization(
+    request: VisualizationRequest,
+    notify
+) -> VisualizationResponse:
+    try:
+        notify('info', f"Generating visualization for case directory: {request.case_dir}")
+        
+        # Validate case directory exists
+        if not os.path.exists(request.case_dir):
+            raise ValueError(f"Case directory does not exist: {request.case_dir}")
+        
+        result = visualize_case(
+            request.case_dir,
+            request.quantity,
+            max_loop=max(1, min(global_config.max_loop, 2)),
+            timeout_s=max(1, min(global_config.max_time_limit, 180)),
+            config=global_config,
+        )
+        visualization_result = result["pyvista_visualization"]
+        if not visualization_result["success"]:
+            raise RuntimeError(visualization_result["error"])
+        artifacts = result["plot_outputs"]
+        script = visualization_result["script"]
+        
+        notify('info', f"Generated {len(artifacts)} visualization artifact(s)")
+        
+        return VisualizationResponse(
+            artifacts=artifacts,
+            script=script
+        )
+        
+    except Exception as e:
+        notify('error', f"Failed to generate visualization: {str(e)}")
+        raise
+
+
 
 @mcp.tool(name="visualization")
 async def visualization(
@@ -770,35 +865,7 @@ async def visualization(
     preceding workflow tools; native ESI v2006 uses the same target selection as
     planning, generation, execution, and review.
     """
-    try:
-        await ctx.info(f"Generating visualization for case directory: {request.case_dir}")
-        
-        # Validate case directory exists
-        if not os.path.exists(request.case_dir):
-            raise ValueError(f"Case directory does not exist: {request.case_dir}")
-        
-        result = visualize_case(
-            request.case_dir,
-            request.quantity,
-            max_loop=max(1, min(global_config.max_loop, 2)),
-            timeout_s=max(1, min(global_config.max_time_limit, 180)),
-        )
-        visualization_result = result["pyvista_visualization"]
-        if not visualization_result["success"]:
-            raise RuntimeError(visualization_result["error"])
-        artifacts = result["plot_outputs"]
-        script = visualization_result["script"]
-        
-        await ctx.info(f"Generated {len(artifacts)} visualization artifact(s)")
-        
-        return VisualizationResponse(
-            artifacts=artifacts,
-            script=script
-        )
-        
-    except Exception as e:
-        await ctx.error(f"Failed to generate visualization: {str(e)}")
-        raise
+    return await run_tool(_visualization, request, ctx, case_dir=request.case_dir, log_output=True)
 
 
 

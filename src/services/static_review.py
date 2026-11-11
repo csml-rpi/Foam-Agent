@@ -10,12 +10,13 @@ from pydantic import BaseModel, Field
 
 from utils import FoamPydantic
 from logger import log_review
-from . import global_llm_service
-from .case_paths import safe_case_relative_from_text
-from .case_inputs import read_case_inputs as read_review_inputs
+from . import get_llm_service
+from .case_paths import safe_case_path, safe_case_relative_from_text
+from .case_inputs import read_case_inputs as read_review_inputs, canonical_input_protections
 from openfoam_target import generation_contract
 from openfoam_target import generation_convention
 from .review_history import ReviewHistory
+from .execution_logs import declared_startup_inputs
 
 
 class StaticReviewFinding(BaseModel):
@@ -65,9 +66,12 @@ def review_case_inputs(
     similar_case_advice: Any = None,
     record_event: Callable[..., None] | None = None,
     stage_context: dict | None = None,
+    config: Any = None,
+    protected_inputs=(),
 ) -> tuple[StaticReviewReport, FoamPydantic]:
     """Review current disk contents without executing or changing the case."""
-    foamfiles, omitted = read_review_inputs(case_dir)
+    protected = [*protected_inputs, *(declared_startup_inputs(stage_context['operations']) if stage_context else ())]
+    foamfiles, omitted = read_review_inputs(case_dir, protected_inputs=protected)
     system_prompt = (
         "You are reviewing an OpenFOAM case BEFORE execution. Find only necessary, "
         "provable corrections to the current case, preserving the original requirement. "
@@ -118,7 +122,7 @@ def review_case_inputs(
             "do not require those intermediate outputs before their producers run. "
             "Classify work by declared purpose and effect, never by filenames or patch names."
         )
-    client = llm_service if llm_service is not None else global_llm_service
+    client = get_llm_service(llm_service, config)
     result = client.invoke(
         json.dumps(payload, ensure_ascii=False), system_prompt,
         pydantic_obj=StaticReviewResult,
@@ -265,9 +269,18 @@ def review_stage_inputs(state, stage):
                   "allrun_reference": reference.get("script") or "",
                   "similar_case_advice": state.get("similar_case_advice") if stage == "solver" else None}
     result = {}
+    reports_to_write = None
     try:
+        # Check the report group before model work or the first report write.
+        reports_to_write = {
+            name: safe_case_path(history.directory, "", name)
+            for name in (f"{stage}_static_review.json", "static_review.json",
+                         f"{stage}_static_review_references.json", "static_review_references.json")
+        }
         report, foamfiles = review_case_inputs(
             case_dir=state["case_dir"], user_requirement=state["user_requirement"],
+            config=state['config'],
+            protected_inputs=canonical_input_protections(state.get('case_input_source_dir')),
             openfoam_fork=generation_convention(state["config"]), llm_service=state["llm_service"],
             review_context=history.context(stage=stage, events={"static_review", "file_repair", "static_review_exit"}),
             record_event=partial(history.append, stage=stage, iteration=retries + 1),
@@ -282,12 +295,12 @@ def review_stage_inputs(state, stage):
         result.update(static_review_reports=reports, static_review_report=_combined_report(reports),
                       input_omissions=report.omitted_files, foamfiles=foamfiles)
         history.append("static_review", stage=stage, iteration=retries + 1, report=report.model_dump())
-        (history.directory / f"{stage}_static_review.json").write_text(report.model_dump_json(indent=2) + "\n")
-        (history.directory / "static_review.json").write_text(json.dumps(result["static_review_report"], indent=2) + "\n")
+        reports_to_write[f"{stage}_static_review.json"].write_text(report.model_dump_json(indent=2) + "\n")
+        reports_to_write["static_review.json"].write_text(json.dumps(result["static_review_report"], indent=2) + "\n")
         advice = references["similar_case_advice"]
         saved_references = {**references, "similar_case_advice": advice.model_dump() if hasattr(advice, "model_dump") else advice}
-        (history.directory / f"{stage}_static_review_references.json").write_text(json.dumps(saved_references, indent=2) + "\n")
-        reference_path = history.directory / "static_review_references.json"
+        reports_to_write[f"{stage}_static_review_references.json"].write_text(json.dumps(saved_references, indent=2) + "\n")
+        reference_path = reports_to_write["static_review_references.json"]
         phase_references = json.loads(reference_path.read_text()) if reference_path.is_file() else {}
         phase_references[stage] = saved_references
         reference_path.write_text(json.dumps(phase_references, indent=2) + "\n")
@@ -335,8 +348,9 @@ def review_stage_inputs(state, stage):
         log_review(message, "static_review_failed")
         try:
             history.append("static_review_failed", stage=stage, error=message)
-            (history.directory / f"{stage}_static_review.json").write_text(json.dumps({"error": message}) + "\n")
-        except OSError:
+            if reports_to_write is not None:
+                safe_case_path(history.directory, "", f"{stage}_static_review.json").write_text(json.dumps({"error": message}) + "\n")
+        except (OSError, ValueError):
             pass  # The workflow message retains the diagnosis, as in the initial review node.
         result.update(workflow_status="failed", termination_reason="static_review_failed", workflow_message=message)
     return result

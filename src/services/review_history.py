@@ -4,6 +4,7 @@ import json
 from collections.abc import Collection
 from datetime import datetime, timezone
 from pathlib import Path
+from .case_paths import safe_case_path
 
 
 class ReviewHistory:
@@ -16,17 +17,19 @@ class ReviewHistory:
         # Journaling must not create a missing case before the runner validates it.
         if not self.case_directory.is_dir():
             return
-        self.directory.mkdir(parents=True, exist_ok=True)
+        path = safe_case_path(self.directory, "", self.path.name)
+        path.parent.mkdir(parents=True, exist_ok=True)
         entry = {"timestamp": datetime.now(timezone.utc).isoformat(), "event": event, **details}
-        with self.path.open("a", encoding="utf-8") as handle:
+        with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     def context(self, max_bytes: int = 64_000, *, events: Collection[str] | None = None,
                 stage: str | None = None) -> str:
         """Keep the full journal on disk; supply only its recent tail to the LLM."""
-        if not self.path.exists():
+        path = safe_case_path(self.directory, "", self.path.name)
+        if not path.exists():
             return ""
-        with self.path.open("rb") as handle:
+        with path.open("rb") as handle:
             handle.seek(0, 2)
             start = max(0, handle.tell() - max_bytes)
             handle.seek(start)

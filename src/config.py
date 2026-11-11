@@ -1,3 +1,4 @@
+from logger import print
 # config.py
 import os
 from dataclasses import dataclass

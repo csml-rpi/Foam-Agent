@@ -1,4 +1,5 @@
 """Plan physical and solver files after Meshing has prepared the actual mesh."""
+from logger import print
 
 from pathlib import Path
 
@@ -41,6 +42,7 @@ def solver_planner_node(state):
             f"<mesh_execution>{state.get('mesh_execution')}</mesh_execution>\n"
             f"<current_directory>{state['dir_structure']}</current_directory>\n"
             f"<current_files>{state['foamfiles']}</current_files>\n"
+            f"<omitted_files>{state.get('input_omissions') or {}}</omitted_files>\n"
             f"<solver_reference>{state['tutorial_reference']}</solver_reference>\n"
             f"<solver_script_reference>{state['allrun_reference']}</solver_script_reference>\n"
             "Check that the actual mesh supports the requested physics and intended boundary "

@@ -2,6 +2,7 @@
 from models import StageOperation
 from utils import case_file_key, resolve_case_file
 from .case_paths import safe_case_relative_from_text, safe_case_relative_path, safe_case_path
+from .execution_logs import check_diagnostic_outputs
 
 
 OPERATION_CONTRACT = (
@@ -197,14 +198,17 @@ def resolve_file_tasks(creates, changes, replacements=()):
 
 
 def check_file_targets(case_dir, targets):
-    """File tasks cannot target an actual directory or another target's parent."""
+    """Check target conflicts; omit case_dir before replacing an old output tree."""
     paths = [safe_case_relative_from_text(target) for target in targets]
-    errors = []
+    errors = check_diagnostic_outputs(case_dir, [path.as_posix() for path in paths]) if case_dir is not None else []
     for path in paths:
-        target = safe_case_path(case_dir, str(path.parent), path.name)
-        if target.is_dir() or any(path in other.parents for other in paths):
+        target = safe_case_path(case_dir, str(path.parent), path.name) if case_dir is not None else None
+        if (target is not None and target.is_dir()) or any(path in other.parents for other in paths):
             errors.append({'file': path.as_posix(), 'error_content':
                            'Declared file task targets a directory. Declare individual file paths.'})
+        elif target is not None:
+            from utils import validate_case_text_target
+            validate_case_text_target(target)
     return errors
 
 

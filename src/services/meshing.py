@@ -1,4 +1,5 @@
 """Shared mesh planning and single-pass backend execution services."""
+from logger import print
 
 from pathlib import Path
 import shutil
@@ -12,29 +13,25 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from openfoam_target import database_path_for_config, generation_convention, runtime_openfoam_target
-from utils import load_case_files, run_command, run_openfoam_utility, _EXPLICIT_FOAM_ERROR_RE
+from utils import load_case_files, run_command, run_openfoam_utility, reject_symbolic_links, case_file_key, resolve_case_file, is_processor_dir, _is_numeric_name, is_initial_time_dir
 from .input_writer import initial_write, build_allrun, rewrite_files
-from .case_paths import safe_case_relative_from_text, safe_case_relative_path
-from .mesh import copy_custom_mesh, handle_gmsh_mesh, prepare_gmsh_script, prepare_custom_mesh, _FAILED_MESH_CHECKS_RE
+from .case_paths import safe_case_path, safe_case_relative_from_text, safe_case_relative_path
+from .mesh import copy_custom_mesh, handle_gmsh_mesh, prepare_gmsh_script, prepare_custom_mesh, _missing_mesh_files, _MESH_FILES
 from .static_review import review_stage_inputs, finish_static_repair
 from .case_workspace import CaseWorkspace
 from .review_history import ReviewHistory
 from .plan import SubtaskModel, retrieve_mesh_reference
 from models import StageOperation
 from .stage_plan import OPERATION_CONTRACT, MESH_STAGE_CONTRACT, mesh_operation_updates, check_mesh_plan, check_stage_inputs, check_stage_script, script_commands, replace_pending_tasks, resolve_file_tasks, pending_file_creates, unwritten_file_errors, stage_outcome
-from .run_hpc import HpcWorkflowStop
-
-
-_MESH_FILES = ("points", "faces", "owner", "neighbour", "boundary")
-_MESH_SOURCE_SUFFIXES = {
-    ".msh", ".stl", ".obj", ".ftr", ".nas", ".vtk", ".vtp", ".ply", ".off", ".geo", ".gz", ".emesh",
-}
+from .run_hpc import HpcWorkflowStop, hpc_execution_outputs
+from .execution_logs import archive_native_logs, declared_startup_inputs, snapshot_execution_logs, current_execution_logs, scan_execution_log, check_execution_outputs, check_diagnostic_outputs
+from .case_inputs import read_case_inputs, canonical_input_protections, _input_paths
+from .run_local import _execution_output
 
 
 class FinalReconstruction(BaseModel):
-    sources: list[str] = Field(min_length=1, description="Exact case-relative partition constant/polyMesh directories, including processorN, processorsN or processorsN_start-end layouts; not glob patterns")
-    argv: list[str] = Field(min_length=1, description="Native reconstruction argv producing constant/polyMesh from the declared partition sources, e.g. reconstructParMesh -constant")
-    target: Literal["constant/polyMesh"] = "constant/polyMesh"
+    sources: list[str] = Field(min_length=1, description="Exact case-relative partition polyMesh directories for every active region, including processorN, processorsN or processorsN_start-end layouts; not glob patterns")
+    argv: list[str] = Field(min_length=1, description="Native reconstruction argv producing all active constant meshes from the declared partition sources")
 
 
 class MeshBoundaryPlan(BaseModel):
@@ -61,19 +58,23 @@ def _unique_pending_repairs(tasks):
 
 
 def plan_meshing(state):
+    case = Path(state["case_dir"]).expanduser().resolve()
+    protected = canonical_input_protections(state.get('case_input_source_dir'), declared_startup_inputs([
+        *state['mesh_operations'], *state['solver_operations'], *state['pending_solver_operations'],
+    ]))
+    for key in ('mesh_source', 'custom_mesh_path'):
+        if state.get(key):
+            source = Path(state[key]).expanduser()
+            source = (source if source.is_absolute() else case / source).resolve()
+            if source.is_relative_to(case):
+                protected.append(source.relative_to(case).as_posix())
+    _, paths, _ = _input_paths(str(case), protected_inputs=protected)
+    files = sorted(path.relative_to(case).as_posix() for path in paths)
+    input_context = {**(state.get('case_context') or {}), 'files': files}
     reference = state.get("mesh_reference")
     if reference is None:
-        reference = retrieve_mesh_reference(state)
+        reference = retrieve_mesh_reference(state, input_context)
         print(f"<mesh_reference>{reference['case']}: {reference['reason']}</mesh_reference>")
-    case = Path(state["case_dir"])
-    original = case / "Allrun"
-    script = original.read_text(encoding="utf-8") if original.is_file() else ""
-    # Include root-level mesh sources and nested geometry, using current files
-    # rather than the import snapshot. Archived attempts are not input sources.
-    files = sorted(
-        path.relative_to(case).as_posix() for path in case.rglob("*")
-        if path.is_file() and ".foamagent" not in path.relative_to(case).parts
-    )
     prompt = (
         f"<user_requirement>{state['user_requirement']}</user_requirement>\n"
         f"<custom_mesh_path>{state.get('custom_mesh_path') or ''}</custom_mesh_path>\n"
@@ -81,13 +82,12 @@ def plan_meshing(state):
         f"<explicit_requirement>{state.get('user_requirement_explicit', True)}</explicit_requirement>\n"
         f"<case_files>{files}</case_files>\n"
         f"<case_contents>{state.get('foamfiles') or ''}</case_contents>\n"
+        f"<omitted_files>{state.get('input_omissions') or {}}</omitted_files>\n"
         f"<mesh_candidates>{mesh_candidates(case)}</mesh_candidates>\n"
         f"<actual_mesh>{state.get('mesh_info') or {}}</actual_mesh>\n"
         f"<mesh_reference>{reference}</mesh_reference>\n"
         f"<previous_boundary_plan>{state.get('mesh_boundary_plan') or []}</previous_boundary_plan>\n"
         f"<previous_mesh_execution>{state.get('mesh_execution') or {}}</previous_mesh_execution>\n"
-        f"<existing_allmesh>{(case / 'Allmesh').read_text() if (case / 'Allmesh').is_file() else ''}</existing_allmesh>\n"
-        f"<existing_allrun>{script}</existing_allrun>\n"
         f"<repair_analysis>{state.get('review_analysis') or ''}</repair_analysis>\n"
         f"<cross_stage_request>{state.get('cross_stage_request')}</cross_stage_request>\n"
         f"<previous_operations>{state.get('mesh_operations')}</previous_operations>\n"
@@ -101,17 +101,14 @@ def plan_meshing(state):
         OPERATION_CONTRACT + MESH_STAGE_CONTRACT + " Prepare the final mesh in constant/polyMesh for a single-region case, or constant/<region>/polyMesh for every active region declared by native constant/regionProperties. "
         "An unused assembly mesh at constant/polyMesh does not replace active regional meshes. "
         "Time-directory or unreconstructed parallel meshes require explicit overwrite/reconstruction operations. "
-        "For final parallel reconstruction of a single-region root mesh, declare final_reconstruction with exact partition source paths "
-        "and native argv that reconstructs them into constant/polyMesh. This runs separately AFTER all "
+        "For final parallel reconstruction, declare final_reconstruction with exact partition source paths for every active region "
+        "and native argv that reconstructs all active constant meshes. This runs separately AFTER all "
         "other mesh operations. Do not also put that final reconstruction in script operations or Allmesh; "
         "use normal file tasks to adjust an existing script if needed. Before this operation the executor "
-        "requires complete declared sources, removes the old serial target, and checks the newly written "
-        "target. Do not use final_reconstruction for commands that depend on the old serial target. "
+        "requires complete declared sources, backs up all old serial targets, and validates every newly written "
+        "target before committing the handoff together. Do not use final_reconstruction for commands that depend on old serial targets. "
         "Leave it null for serial reuse or modifications. Other time/parallel candidates must be explicitly "
         "resolved by the plan; they are not automatically deleted or selected by timestamp. "
-        "For active regional meshes, leave final_reconstruction null and declare native reconstruction "
-        "as ordered script operations with explicit region arguments, followed by explicit resolution "
-        "of the partition outputs before handoff. The root-only final_reconstruction cannot target regions. "
         "Plan only the mesh stage from the user requirement and actual supplied files. "
         "Declare mesh_script_action every time: none means no additional Allmesh execution "
         "after the backend; run_existing executes the existing or explicitly written Allmesh; "
@@ -193,7 +190,7 @@ def plan_meshing(state):
     }
 
 
-def _write_mesh_files(state):
+def _write_mesh_files(state, *, file_written_callback=None):
     tasks = list(state.get("mesh_subtasks") or [])
     case = Path(state["case_dir"])
     if not tasks:
@@ -207,7 +204,8 @@ def _write_mesh_files(state):
         + f"\n<approved_operations>{state['mesh_operations']}</approved_operations>\nFollow the approved operations; do not independently select commands.",
         tutorial_reference=state["mesh_reference"]["content"]
         + f"\n<mesh_script_reference>{state['mesh_reference']['script']}</mesh_script_reference>"
-        + f"\nExisting case files; preserve settings not requested to change:\n{state.get('foamfiles') or ''}",
+        + f"\nExisting case files; preserve settings not requested to change:\n{state.get('foamfiles') or ''}"
+        + f"\n<omitted_files>{state.get('input_omissions') or {}}</omitted_files>",
         case_solver=state.get("case_solver") or "",
         openfoam_fork=generation_convention(config),
         generation_mode=config.generation_mode,
@@ -217,6 +215,7 @@ def _write_mesh_files(state):
         # File-only edits with explicit none intent are not executed. A later
         # execution plan must approve their actual contents before running them.
         operations=state['mesh_operations'] if state['mesh_script_action'] != 'none' else None,
+        file_written_callback=file_written_callback,
     )
 
 
@@ -268,26 +267,20 @@ def _run_mesh_commands(state):
     if prepared["error_logs"] or state["mesh_script_action"] == "none":
         return {**prepared, "mesh_execution": evidence}
     script = {"allrun_path": str(case / "Allmesh")}
-    old, observations = _mesh_log_snapshot(case)
-    # RunFunctions skips a utility when log.<application>[.<suffix>] exists.
-    # Rotate only conventional case-root logs. Nested files and mesh sources
-    # can be utility inputs even when their names start with log.
-    sources = {(case / Path(source).expanduser()).resolve() for source in
-               (state.get("mesh_source"), state.get("custom_mesh_path")) if source}
-    old = {name: signature for name, signature in old.items()
-           if name in {"Allmesh.out", "Allmesh.err"} or (
-               Path(name).parent == Path(".") and name.startswith("log.")
-               and Path(name).suffix.lower() not in _MESH_SOURCE_SUFFIXES
-               and (case / name).resolve() not in sources
-           )}
-    if old:
-        history = Path(tempfile.mkdtemp(prefix="attempt-", dir=_mesh_history(case)))
-        for name in old:
-            destination = history / name
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(case / name), destination)
-    before, failures = _mesh_log_snapshot(case)
-    observations.extend(failures)
+    protected = canonical_input_protections(state.get('case_input_source_dir'), declared_startup_inputs([
+        *state['mesh_operations'], *state['solver_operations'], *state['pending_solver_operations'],
+    ]))
+    for source in (state.get("mesh_source"), state.get("custom_mesh_path")):
+        if source:
+            path = (case / source).resolve()
+            if path.is_relative_to(case.resolve()):
+                protected.append(path.relative_to(case.resolve()).as_posix())
+    conflicts = check_execution_outputs(
+        hpc_execution_outputs("mesh") if state.get("requires_hpc") else ["Allmesh.out", "Allmesh.err"], protected)
+    if conflicts:
+        return {"error_logs": conflicts, "mesh_execution": evidence}
+    archive_native_logs(case, protected_inputs=protected)
+    before = snapshot_execution_logs(case)
     runner = _mesh_script_runner(state)
     evidence.update(executed=True, script=script["allrun_path"])
     result = runner(
@@ -295,55 +288,33 @@ def _run_mesh_commands(state):
         str(case), config.max_time_limit, openfoam_target=runtime_openfoam_target(config),
         fail_fast=True,
     )
-    after, failures = _mesh_log_snapshot(case)
-    observations.extend(failures)
-    names = {name for name, signature in after.items() if before.get(name) != signature}
-    names.update({"Allmesh.out", "Allmesh.err"})
     output, errors = {}, []
-    for name in sorted(names):
-        try:
-            output[name] = (case / name).read_text(encoding="utf-8", errors="replace")
-        except OSError as error:
-            observations.append(f"Could not read {name}: {error}")
-            continue
-        if "already run on" in output[name] and "re-run" in output[name]:
-            errors.append({"file": name, "error_content": "Mesh command skipped due to an existing log: " + output[name]})
-        match = _EXPLICIT_FOAM_ERROR_RE.search(output[name])
-        if match:
-            errors.append({"file": name, "error_content": match.group(1).strip()})
-        if _FAILED_MESH_CHECKS_RE.search(output[name]):
-            errors.append({"file": name, "error_content": "checkMesh reported failed mesh checks.\n" + output[name]})
-    evidence.update(command_result=result, logs=output, observations=observations)
+    remaining = 64_000
+    for path in current_execution_logs(case, before, protected_inputs=protected):
+        name = path.relative_to(case).as_posix()
+        scanned = scan_execution_log(path)
+        if remaining:
+            output[name] = scanned['tail'][-remaining:]
+            remaining -= len(output[name])
+        errors.extend({'file': name, 'error_content': text}
+                      for text in scanned['errors'][:max(0, 32 - len(errors))])
+    evidence.update(command_result=result, logs=output, observations=[])
     if result.get("returncode") or result.get("timed_out"):
+        evidence['diagnostic_context'] = _execution_output(str(case), before)
         errors.append({"file": "Allmesh", "error_content": str(evidence)})
     return {"error_logs": errors, "mesh_execution": evidence}
 
 
-def _mesh_log_snapshot(case):
-    files, observations = {}, []
-    try:
-        for path in case.rglob("*"):
-            relative = path.relative_to(case)
-            if ".foamagent" in relative.parts or relative.as_posix() in {"workflow.log", "review.log"}:
-                continue
-            if path.name.startswith("log.") or path.suffix.lower() in {".log", ".out", ".err"}:
-                try:
-                    if path.is_file():
-                        stat = path.stat()
-                        files[path.relative_to(case).as_posix()] = (stat.st_size, stat.st_mtime_ns)
-                except OSError as error:
-                    observations.append(f"Could not inspect {path}: {error}")
-    except OSError as error:
-        observations.append(f"Could not scan mesh logs: {error}")
-    return files, observations
-
-
 def standard_meshing(state):
-    return {**_run_mesh_commands(state), "mesh_info": None}
+    result = _run_mesh_commands(state)
+    if result['mesh_execution']['executed'] and state.get('mesh_info'):
+        result['mesh_info'] = {**state['mesh_info'], 'check_mesh_passed': None}
+    return result
 
 
 def gmsh_meshing(state):
-    (Path(state["case_dir"]) / ".foamagent/mesh-source.json").unlink(missing_ok=True)
+    metadata = safe_case_path(state["case_dir"], "", ".foamagent")
+    (metadata / "mesh-source.json").unlink(missing_ok=True)
     result = handle_gmsh_mesh(
         state["user_requirement"]
         + f"\n<mesh_reference>{state['mesh_reference']}</mesh_reference>"
@@ -354,6 +325,8 @@ def gmsh_meshing(state):
         llm_service=state["llm_service"],
         openfoam_target=runtime_openfoam_target(state["config"]),
         repair_feedback=state.get("review_analysis") or "",
+        protected_inputs=canonical_input_protections(
+            state.get('case_input_source_dir'), declared_startup_inputs(state['mesh_operations'])),
         **_native_mesh_runners(state),
     )
     commands = script_commands(state['mesh_operations'])
@@ -371,7 +344,7 @@ def custom_meshing(state):
     """Use an existing polyMesh or convert a selected custom .msh input."""
     source = state.get("mesh_source")
     if not source:
-        return _run_mesh_commands(state)
+        return standard_meshing(state)
     source_path = Path(source).expanduser().resolve()
     result = copy_custom_mesh(
         source, state["case_dir"],
@@ -380,6 +353,8 @@ def custom_meshing(state):
         retry=state.get("mesh_inputs_prepared", False) or bool(state.get("repairing_mesh")),
         source_written=not state.get("mesh_inputs_prepared", False) and any((Path(state["case_dir"]) / name).resolve() == source_path
                            for name in state.get("written_files") or []),
+        protected_inputs=canonical_input_protections(
+            state.get('case_input_source_dir'), declared_startup_inputs(state['mesh_operations'])),
         **{key: value for key, value in _native_mesh_runners(state).items() if key == "utility_runner"},
     )
     if not result.get("error_logs"):
@@ -395,6 +370,9 @@ def custom_meshing(state):
 def _rewrite_mesh(state):
     if not (state.get("rewrite_plan") or {}).get("target_files"):
         return {}
+    inputs, omitted = read_case_inputs(
+        state['case_dir'], protected_inputs=canonical_input_protections(
+            state.get('case_input_source_dir'), declared_startup_inputs(state['mesh_operations'])))
     return rewrite_files(
         case_dir=state["case_dir"], error_logs=state.get("error_logs") or [],
         review_analysis=state.get("review_analysis") or "", rewrite_plan=state["rewrite_plan"],
@@ -403,10 +381,11 @@ def _rewrite_mesh(state):
         + f"\n<mesh_reference>{state['mesh_reference']}</mesh_reference>"
         + f"\n<mesh_boundary_plan>{state['mesh_boundary_plan']}</mesh_boundary_plan>"
         + f"\n<approved_operations>{state['mesh_operations']}</approved_operations>\nFollow the approved operations; do not independently select commands.",
-        foamfiles=state.get("foamfiles"),
+        foamfiles=inputs, omitted_files=omitted,
         dir_structure=state.get("dir_structure") or {},
         openfoam_fork=generation_convention(state["config"]),
         case_solver=state.get("case_solver") or "", llm_service=state["llm_service"],
+        config=state['config'],
         script_phase='mesh', allrun_reference=state['mesh_reference']['script'],
         static_repair=state.get('repair_source') == 'static_review',
         operations=state['mesh_operations'] if state['mesh_script_action'] != 'none' else None,
@@ -425,32 +404,74 @@ def _active_mesh_directories(case, config=None):
     target = runtime_openfoam_target(config) if config is not None else ""
     expand = target == "foundation-v10" or (not target and os.getenv("WM_PROJECT_VERSION") == "10")
     result = run_openfoam_utility(
-        ["foamDictionary", *(["-expand"] if expand else []), "constant/regionProperties", "-entry", "regions", "-value"],
+        ["foamDictionary", *(["-expand"] if expand else []), "constant/regionProperties", "-entry", "regions"],
         working_dir=str(case), timeout=config.max_time_limit if config is not None else 300,
         openfoam_target=target,
     )
     if result.returncode:
         raise subprocess.CalledProcessError(result.returncode, result.args, output=result.stdout, stderr=result.stderr)
+    # Expansion diagnostics precede the complete selected entry. Native lookup
+    # owns matching quoted keys, including patterns; its value is the inventory.
+    entry = re.search(r'(?:^|\n)(?:regions|"(?:\\.|[^"\\\n])+")\s+((?:\d+\s*)?\([^;]*\));\s*\Z',
+                      result.stdout)
+    if entry is None:
+        raise ValueError("Cannot resolve native regionProperties terminal entry: " + result.stdout)
     # Native regionProperties is a list of category/wordList pairs. Categories
     # identify the declared inventory; they do not assign boundary roles.
     groups = re.compile(r'([^()\s]+)\s+(?:(\d+)\s*)?\(([^()]*)\)')
-    matches = list(groups.finditer(result.stdout))
-    remainder = groups.sub('', result.stdout)
-    if not matches or not re.fullmatch(r'\s*(?:\d+\s*)?\(\s*\)\s*', remainder):
+    matches = list(groups.finditer(entry[1]))
+    remainder = groups.sub('', entry[1])
+    outer = re.fullmatch(r'\s*(?:(\d+)\s*)?\(\s*\)\s*', remainder)
+    if not matches or outer is None:
         raise ValueError("Cannot resolve native regionProperties region lists: " + result.stdout)
-    regions = []
+    if outer[1] is not None and int(outer[1]) != len(matches):
+        raise ValueError("regionProperties has an inconsistent category-list size")
+    regions, categories = [], {}
     for match in matches:
         names = shlex.split(match[3])
         if match[2] is not None and int(match[2]) != len(names):
             raise ValueError("regionProperties has an inconsistent region-list size")
+        category = shlex.split(match[1])[0]
+        # Foundation inserts the first category; ESI's typed table replaces it.
+        if expand:
+            categories.setdefault(category, names)
+        else:
+            categories[category] = names
+    for names in categories.values():
         for name in names:
             relative = safe_case_relative_from_text(name)
-            if len(relative.parts) != 1 or relative.as_posix() != name or name in regions:
-                raise ValueError(f"Invalid or duplicate active mesh region: {name}")
-            regions.append(name)
+            if len(relative.parts) != 1 or relative.as_posix() != name:
+                raise ValueError(f"Invalid active mesh region: {name}")
+            name = "" if name == "region0" else name
+            if name not in regions:
+                regions.append(name)
     if not regions:
         raise ValueError("regionProperties declares no active mesh regions")
     return {name: case / "constant" / name / "polyMesh" for name in regions}
+
+
+def _region_declaration_inputs(case, config):
+    """Retain the native declaration's current case-owned include files."""
+    target = runtime_openfoam_target(config)
+    expand = target == "foundation-v10" or (not target and os.getenv("WM_PROJECT_VERSION") == "10")
+    result = run_openfoam_utility(
+        ["foamDictionary", *(["-expand"] if expand else []), "constant/regionProperties", "-includes"],
+        working_dir=str(case), timeout=config.max_time_limit, openfoam_target=target,
+    )
+    if result.returncode:
+        raise subprocess.CalledProcessError(result.returncode, result.args, output=result.stdout, stderr=result.stderr)
+    inputs = []
+    for line in result.stdout.splitlines():
+        if not re.fullmatch(r'"(?:\\.|[^"\\])*"', line.strip()):
+            continue
+        name = shlex.split(line)[0]
+        source = case / name
+        if not source.resolve().is_relative_to(case):
+            continue  # Shared external metadata stays referenced in its existing location.
+        reject_symbolic_links(source)
+        source = resolve_case_file(source)
+        inputs.append(source.resolve().relative_to(case).as_posix())
+    return inputs
 
 
 def read_patch_bounds(case, regions=None):
@@ -506,16 +527,59 @@ def _mesh_boundary_info(case, directories):
                 patch_bounds = {key[len("defaultRegion/"):]: value for key, value in bounds.items()
                                 if key.startswith("defaultRegion/")}
         regions[name] = {"poly_mesh_path": str(mesh_dir), "boundary_text": text, "patch_bounds": patch_bounds}
-    if "" in regions:
+    if len(regions) == 1 and "" in regions:
         return regions[""]
     return {"regions": regions, "patch_bounds": {
-        f"{region}/{patch}": value for region, info in regions.items() for patch, value in info["patch_bounds"].items()}}
+        "/".join(part for part in (region, patch) if part): value
+        for region, info in regions.items() for patch, value in info["patch_bounds"].items()}}
+
+
+def _sync_mesh_file_writes(state, result, receipts, updated_files):
+    """Retain explicit writes before later preparation or native work can fail."""
+    state['written_files'] = list(dict.fromkeys([*state['written_files'], *receipts]))
+    result['written_files'] = state['written_files']
+    mesh_info = state.get('mesh_info')
+    if mesh_info:
+        meshes = mesh_info.get('regions', {'': mesh_info}).values()
+        if (any(case_file_key(name) == 'constant/regionProperties' for name in updated_files)
+                or any((Path(state['case_dir']) / name).is_relative_to(Path(mesh['poly_mesh_path']))
+                       for mesh in meshes if mesh.get('poly_mesh_path') for name in updated_files)):
+            state['mesh_info'] = {**mesh_info, 'check_mesh_passed': None}
+            result['mesh_info'] = state['mesh_info']
+    if receipts and state.get('case_input_source_dir'):
+        CaseWorkspace(state['case_dir'], state['case_input_source_dir']).update_inputs(receipts)
 
 
 def execute_meshing(state, backend):
     current = dict(state)
+    outputs = ["Allmesh.out", "Allmesh.err"] if current["mesh_script_action"] != "none" else []
+    if current.get("requires_hpc") and (
+            outputs or current["mesh_type"] == "gmsh_mesh"
+            or current["mesh_type"] == "custom_mesh" and current.get("mesh_source")
+            or current.get("final_reconstruction")):
+        outputs = hpc_execution_outputs("mesh")
+    protected = canonical_input_protections(current.get('case_input_source_dir'), declared_startup_inputs([
+        *current['mesh_operations'], *current['solver_operations'],
+        *current['pending_solver_operations'],
+    ]))
+    conflicts = (check_diagnostic_outputs(current['case_dir'], protected)
+                 or check_execution_outputs(outputs, protected))
+    if conflicts:
+        execution = {'action': current['mesh_script_action'], 'executed': False}
+        return {'error_logs': conflicts, 'repairing_mesh': True, 'mesh_execution': execution,
+                **stage_outcome(current, 'mesh', {'error_logs': conflicts, 'execution': execution})}
     if current.get("case_input_source_dir"):
-        CaseWorkspace(current["case_dir"], current["case_input_source_dir"]).restore_inputs()
+        future_inputs = declared_startup_inputs([
+            *current['solver_operations'], *current['pending_solver_operations'],
+        ])
+        solver_outputs = (hpc_execution_outputs('solver') if current.get('requires_hpc')
+                          else ['Allrun.out', 'Allrun.err'])
+        rejected = {error['file'] for error in check_execution_outputs(solver_outputs, future_inputs)}
+        # Solver Planner reconciles deferred operations after mesh handoff.
+        # Rejected future dependencies must not establish canonical ownership.
+        CaseWorkspace(current["case_dir"], current["case_input_source_dir"]).restore_inputs(
+            protected_inputs=[*declared_startup_inputs(current['mesh_operations']),
+                              *(name for name in future_inputs if name not in rejected)])
     current.setdefault("mesh_jobs", [])
     current["mesh_execution"] = {"action": current["mesh_script_action"], "executed": False}
     current['written_files'] = []
@@ -537,9 +601,14 @@ def execute_meshing(state, backend):
     current["rewrite_plan"] = {"target_files": [t for t in targets if t["stage"] == "mesh"]}
     reconstructed_sources = []
     edits = {"updated_files": [], "file_diffs": []}
+    def created_file_written(name, changed):
+        if changed:
+            edits['updated_files'].append(name)
+        _sync_mesh_file_writes(current, result, [name], [name] if changed else [])
+        current['mesh_subtasks'] = pending_file_creates(current.get('mesh_subtasks') or [], [name])
+        result['mesh_subtasks'] = current['mesh_subtasks']
     try:
-        written = _write_mesh_files(current)
-        edits['updated_files'].extend(written.get('written_files', []))
+        written = _write_mesh_files(current, file_written_callback=created_file_written)
         edits['file_diffs'].extend(written.get('file_diffs', []))
         result.update(written)
         current.update(written)
@@ -562,7 +631,8 @@ def execute_meshing(state, backend):
             current.update(rewritten)
             current['written_files'] = list(dict.fromkeys(
                 [*written.get('written_files', []), *rewritten.get('written_files', [])]))
-            result['written_files'] = current['written_files']
+            _sync_mesh_file_writes(current, result, rewritten.get('written_files', []),
+                                   rewritten.get('updated_files', []))
             if not rewritten.get("error_logs"):
                 if current["mesh_type"] == "gmsh_mesh":
                     prepared_script = 'generate_mesh.py' in current['written_files']
@@ -576,19 +646,20 @@ def execute_meshing(state, backend):
                     )
                     edits['updated_files'].extend(generated['updated_files'])
                     edits['file_diffs'].extend(generated['file_diffs'])
-                    current['written_files'].append('generate_mesh.py')
+                    _sync_mesh_file_writes(current, result, ['generate_mesh.py'], generated['updated_files'])
+                preparation_errors = []
                 if current["mesh_type"] == "custom_mesh" and current.get("mesh_source"):
-                    prepare_custom_mesh(current["mesh_source"], current["case_dir"],
+                    preparation_errors = prepare_custom_mesh(current["mesh_source"], current["case_dir"],
                         retry=bool(current.get("repairing_mesh")),
                         source_written=any((Path(current["case_dir"]) / name).resolve() ==
-                            Path(current["mesh_source"]).resolve() for name in current['written_files']))
-                    current['written_files'].append('geometry.msh')
-                prepared = _prepare_mesh_script(current)
+                            Path(current["mesh_source"]).resolve() for name in current['written_files']),
+                        protected_inputs=canonical_input_protections(
+                            current.get('case_input_source_dir'), declared_startup_inputs(current['mesh_operations'])))
+                    if not preparation_errors:
+                        _sync_mesh_file_writes(current, result, ['geometry.msh'], [])
+                prepared = {'error_logs': preparation_errors} if preparation_errors else _prepare_mesh_script(current)
                 if current['mesh_script_action'] == 'build_and_run' and not prepared['error_logs']:
-                    current['written_files'].append('Allmesh')
-                result['written_files'] = list(dict.fromkeys(current['written_files']))
-                if current.get('case_input_source_dir'):
-                    CaseWorkspace(current['case_dir'], current['case_input_source_dir']).update_inputs(result['written_files'])
+                    _sync_mesh_file_writes(current, result, ['Allmesh'], [])
                 result.update(finish_static_repair(current, "mesh", {
                     **result, **edits,
                     'error_logs': prepared['error_logs'],
@@ -604,6 +675,12 @@ def execute_meshing(state, backend):
                         result['mesh_resume_state'] = {**resume, 'pending': pending, 'previous_mesh': previous_mesh}
                         return result
                 dependency_errors = prepared['error_logs'] or check_stage_inputs(current["case_dir"], current["mesh_operations"], "mesh")
+                if not dependency_errors:
+                    dependency_errors = check_execution_outputs(outputs, canonical_input_protections(
+                        current.get('case_input_source_dir'), declared_startup_inputs([
+                            *current['mesh_operations'], *current['solver_operations'],
+                            *current['pending_solver_operations'],
+                        ])))
                 current['mesh_inputs_prepared'] = True
                 result.update({"error_logs": dependency_errors} if dependency_errors else backend(current))
                 current.update(result)
@@ -628,6 +705,8 @@ def execute_meshing(state, backend):
         result["loop_count"] = current.get("loop_count", 0)
         if "cluster_info" in current:
             result["cluster_info"] = current["cluster_info"]
+        if (current.get("mesh_execution") or {}).get("final_reconstruction", {}).get("status") == "rolled_back":
+            result["mesh_info"] = None
     if result.get("termination_reason"):
         return result
     current.update(result)
@@ -641,8 +720,12 @@ def execute_meshing(state, backend):
         current.update(result)
     if not current.get("error_logs"):
         try:
-            prior = {key: value for key, value in (current.get("mesh_info") or {}).items()
+            mesh_info = current.get("mesh_info") or {}
+            prior = {key: value for key, value in mesh_info.items()
                      if key not in {"regions", "poly_mesh_path", "boundary_text", "patch_bounds"}}
+            if (reconstructed_sources
+                    or set(mesh_directories) != set(mesh_info.get("regions", {"": mesh_info}))):
+                prior["check_mesh_passed"] = None
             result["mesh_info"] = {
                 **prior, **_mesh_boundary_info(Path(current["case_dir"]), mesh_directories),
             }
@@ -652,17 +735,28 @@ def execute_meshing(state, backend):
                     f"Cannot read actual mesh boundary from {mesh_directories}: {type(error).__name__}: {error}",
             }])
         current.update(result)
+    if not current.get("error_logs") and current.get("case_input_source_dir"):
+        try:
+            properties = Path(current["case_dir"]) / "constant/regionProperties"
+            declaration_inputs = (_region_declaration_inputs(Path(current["case_dir"]).resolve(), current["config"])
+                                  if properties.is_file() or properties.with_suffix(".gz").is_file() else [])
+            CaseWorkspace(current["case_dir"], current["case_input_source_dir"]).commit_mesh(
+                mesh_directories, declaration_inputs=declaration_inputs)
+        except (OSError, ValueError, subprocess.SubprocessError, RuntimeError) as error:
+            result["error_logs"] = [{"file": "mesh_handoff", "error_content": str(error)}]
+            current.update(result)
+        else:
+            ReviewHistory(current["case_dir"], current.get("case_import_report_dir")).append(
+                "input_source_updated", stage="mesh", source_dir=current["case_input_source_dir"])
     _finish_reconstruction(current)
+    if (current.get("mesh_execution") or {}).get("final_reconstruction", {}).get("status") == "rolled_back":
+        result["mesh_info"] = None
     result.update(load_case_files(current))
     if (current.get("mesh_execution") or {}).get("final_reconstruction", {}).get("status") == "complete":
         result["final_reconstruction"] = None
     result.update(stage_outcome(current, "mesh", {"error_logs": current.get("error_logs", []), "execution": current.get("mesh_execution")}))
     current.update(result)
     if not current.get("error_logs"):
-        if current.get("case_input_source_dir"):
-            CaseWorkspace(current["case_dir"], current["case_input_source_dir"]).capture_inputs()
-            ReviewHistory(current["case_dir"], current.get("case_import_report_dir")).append(
-                "input_source_updated", stage="mesh", source_dir=current["case_input_source_dir"])
         info = result["mesh_info"]
         impact_reason = ""
         if current.get("solver_planned"):
@@ -671,6 +765,7 @@ def execute_meshing(state, backend):
                 f"<previous_mesh>{previous_mesh}</previous_mesh>\n"
                 f"<actual_mesh>{info}</actual_mesh>\n"
                 f"<files>{current.get('foamfiles')}</files>\n"
+                f"<omitted_files>{current.get('input_omissions') or {}}</omitted_files>\n"
                 f"<execution>{current.get('mesh_execution')}</execution>\n"
                 f"<review_analysis>{current.get('review_analysis')}</review_analysis>\n"
                 f"<pending_repairs>{pending}</pending_repairs>",
@@ -704,31 +799,20 @@ def execute_meshing(state, backend):
     return result
 
 
-def _mesh_history(case):
-    path = case / ".foamagent/mesh-logs"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _missing_mesh_files(directory):
-    return [name for name in _MESH_FILES
-            if not ((directory / name).is_file() or (directory / (name + ".gz")).is_file())]
-
-
 def mesh_candidates(case):
     return [{"path": path.relative_to(case).as_posix(), "missing_files": _missing_mesh_files(path)}
             for path in sorted(case.rglob("polyMesh"))
             if path.is_dir() and ".foamagent" not in path.relative_to(case).parts]
 
 
-def _reconstruction_sources(case, declared):
+def _reconstruction_sources(case, declared, directories):
     """Check every native partition, including directories missing their mesh."""
     partitions, ranks, groups = [], [], []
     for path in case.iterdir():
-        match = re.fullmatch(r"processor(?:(\d+)|s(\d+)(?:_(\d+)-(\d+))?)", path.name)
+        match = re.fullmatch(r"processor(?:([0-9]+)|s([0-9]+)(?:_([0-9]+)-([0-9]+))?)", path.name)
         if not match:
             continue
-        partitions.append(path / "constant/polyMesh")
+        partitions.extend(path / directory.relative_to(case) for directory in directories.values())
         if match[1] is not None:
             ranks.append(int(match[1]))
         else:
@@ -763,15 +847,20 @@ def _reconstruction_sources(case, declared):
 
 def _restore_reconstruction(state):
     evidence = state["mesh_execution"]["final_reconstruction"]
-    target = Path(state["case_dir"]) / "constant/polyMesh"
     attempt = Path(evidence["attempt_path"])
-    if target.exists() or target.is_symlink():
-        failed = attempt / "failed-polyMesh"
-        target.rename(failed)
-        evidence["failed_target_path"] = str(failed)
-    if evidence["backup_path"]:
-        Path(evidence["backup_path"]).rename(target)
+    failed_targets = {}
+    for relative in evidence["prepared_targets"]:
+        target = Path(state["case_dir"]) / relative
+        if target.exists() or target.is_symlink():
+            failed = attempt / "failed" / relative
+            failed.parent.mkdir(parents=True, exist_ok=True)
+            target.rename(failed)
+            failed_targets[relative] = str(failed)
+        if relative in evidence["backup_paths"]:
+            Path(evidence["backup_paths"][relative]).rename(target)
+    evidence["failed_target_paths"] = failed_targets
     evidence["status"] = "rolled_back"
+    state["mesh_info"] = None
 
 
 def _finish_reconstruction(state):
@@ -781,38 +870,40 @@ def _finish_reconstruction(state):
     if state.get("error_logs"):
         _restore_reconstruction(state)
         return
-    if evidence["backup_path"]:
-        backup = Path(evidence["backup_path"])
-        if backup.is_symlink() or backup.is_file():
-            backup.unlink()
-        else:
-            shutil.rmtree(backup)
-    Path(evidence["attempt_path"]).rmdir()
+    shutil.rmtree(evidence["attempt_path"])
     evidence["status"] = "complete"
 
 
 def _run_final_reconstruction(state):
     plan = FinalReconstruction.model_validate(state["final_reconstruction"])
+    reject_symbolic_links(Path(state["case_dir"]).expanduser())
     case = Path(state["case_dir"]).resolve()
-    target = case / plan.target
-    if not target.parent.resolve().is_relative_to(case):
-        raise ValueError("Final reconstruction target escapes the working case")
-    sources = _reconstruction_sources(case, plan.sources)
-    if any((case / source).resolve() == target.resolve() for source in sources):
+    directories = _active_mesh_directories(case, state["config"])
+    for target in directories.values():
+        reject_symbolic_links(target.parent)
+        if not target.parent.resolve().is_relative_to(case):
+            raise ValueError("Final reconstruction target escapes the working case")
+    sources = _reconstruction_sources(case, plan.sources, directories)
+    if any((case / source).resolve() == target.resolve() for source in sources for target in directories.values()):
         raise ValueError("Reconstruction sources must be independent of the serial target")
-    root = target.parent / ".foamagent/reconstruction"
+    root = safe_case_path(case, '.foamagent', 'reconstruction')
     root.mkdir(parents=True, exist_ok=True)
     attempt = Path(tempfile.mkdtemp(prefix="attempt-", dir=root))
-    backup = attempt / "previous-polyMesh" if target.exists() or target.is_symlink() else None
-    if backup:
-        target.rename(backup)
     evidence = {**plan.model_dump(), "sources": sources, "status": "running",
-                "attempt_path": str(attempt), "backup_path": str(backup) if backup else None}
+                "attempt_path": str(attempt), "backup_paths": {}, "prepared_targets": []}
     state["mesh_execution"] = {
         **(state.get("mesh_execution") or {}),
         "final_reconstruction": evidence,
     }
     try:
+        for target in directories.values():
+            relative = target.relative_to(case).as_posix()
+            if target.exists() or target.is_symlink():
+                backup = attempt / "previous" / relative
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                target.rename(backup)
+                evidence["backup_paths"][relative] = str(backup)
+            evidence["prepared_targets"].append(relative)
         runner = _native_mesh_runners(state).get("utility_runner", run_openfoam_utility)
         completed = runner(plan.argv, working_dir=str(case), timeout=state["config"].max_time_limit,
                            openfoam_target=runtime_openfoam_target(state["config"]))
@@ -820,14 +911,15 @@ def _run_final_reconstruction(state):
         if completed.returncode:
             raise subprocess.CalledProcessError(completed.returncode, plan.argv,
                                                 output=completed.stdout, stderr=completed.stderr)
-        missing = _missing_mesh_files(target)
-        if missing:
-            raise ValueError(f"Final reconstruction did not produce complete {plan.target}: missing {missing}")
+        for target in directories.values():
+            missing = _missing_mesh_files(target)
+            if missing:
+                raise ValueError(f"Final reconstruction did not produce complete {target.relative_to(case)}: missing {missing}")
     except HpcWorkflowStop as stop:
         evidence.update(error=str(stop), termination_reason=stop.reason)
         if stop.reason in {"hpc_job_state_unconfirmed", "hpc_submission_unconfirmed"}:
             evidence["status"] = "state_unconfirmed"
-            stop.record["reconstruction_backup"] = evidence["backup_path"]
+            stop.record["reconstruction_backups"] = evidence["backup_paths"]
         else:
             _restore_reconstruction(state)
         raise
@@ -855,17 +947,14 @@ def validate_mesh_handoff(case, reconstructed_sources=(), *, mesh_directories=No
         if relative in active or relative == Path("constant/polyMesh"):
             continue
         if (any(directory in relative.parents for directory in [*active, Path("constant/polyMesh")])
-                or relative.parts[0].startswith("processor")):
+                or is_processor_dir(relative.parts[0])):
             pending.append(str(path))
-        else:
-            try:
-                # Time-zero mesh components override constant too. A cellMap-only
-                # directory from refineMesh -overwrite is auxiliary output.
-                if (float(relative.parts[0]) != 0
-                        or len(_missing_mesh_files(path)) < len(_MESH_FILES)):
-                    pending.append(str(path))
-            except ValueError:
-                pass
+        elif _is_numeric_name(relative.parts[0]):
+            # Time-zero mesh components override constant too. A cellMap-only
+            # directory from refineMesh -overwrite is auxiliary output.
+            if (not is_initial_time_dir(relative.parts[0])
+                    or len(_missing_mesh_files(path)) < len(_MESH_FILES)):
+                pending.append(str(path))
     if missing or pending:
         return [{"file": "mesh_handoff", "error_content":
                  f"Prepare final active meshes {[str(path) for path in mesh_directories.values()]} before solver planning. Missing files: {missing}; "
@@ -888,7 +977,7 @@ def _native_mesh_runners(state):
         return {}
     def run(args, **kwargs):
         case = Path(state["case_dir"])
-        root = case / ".foamagent/mesh-commands"
+        root = safe_case_path(case, ".foamagent", "mesh-commands")
         root.mkdir(parents=True, exist_ok=True)
         folder = Path(tempfile.mkdtemp(prefix="command-", dir=root))
         script = folder / "command.sh"
@@ -897,8 +986,13 @@ def _native_mesh_runners(state):
         # Slurm monitoring includes queue time; use the configured stage deadline,
         # not the backend's shorter local process timeout.
         result = run_stage_hpc(state, str(script), "mesh", state["config"].max_time_limit)
-        out = Path(result["output"]).read_text(errors="replace") if Path(result["output"]).exists() else ""
-        err = Path(result["error"]).read_text(errors="replace") if Path(result["error"]).exists() else str(result)
+        def diagnostic(path, missing):
+            if not path.exists():
+                return missing
+            scanned = scan_execution_log(path)
+            return '\n'.join([*scanned['errors'], scanned['tail']])
+        out = diagnostic(Path(result["output"]), "")
+        err = diagnostic(Path(result["error"]), str(result))
         if result.get("returncode"):
             raise subprocess.CalledProcessError(result["returncode"], args, output=out, stderr=err)
         return subprocess.CompletedProcess(args, 0, out, err)

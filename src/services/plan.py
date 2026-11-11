@@ -1,3 +1,4 @@
+from logger import print
 import os
 import re
 from typing import Dict, Any, List, Tuple, Optional, Literal
@@ -8,8 +9,8 @@ from config import Config
 from openfoam_target import generation_convention, configured_openfoam_target, generation_contract
 from models import ExistingCasePlan, StageOperation
 from .stage_plan import OPERATION_CONTRACT
-from . import global_llm_service
-from .case_paths import CasePathSafetyError, safe_case_relative_path
+from . import get_llm_service
+from .case_paths import CasePathSafetyError, safe_case_path, safe_case_relative_path
 
 
 class CaseSummaryModel(BaseModel):
@@ -89,7 +90,7 @@ def parse_requirement_to_case_info(
         "Infer a solver only when the user has not specified one. "
     )
     parse_user_prompt = f"User requirement: {user_requirement}."
-    llm_client = llm_service if llm_service is not None else global_llm_service
+    llm_client = get_llm_service(llm_service)
     res = llm_client.invoke(parse_user_prompt, parse_system_prompt, pydantic_obj=CaseSummaryModel)
     raw_case_name = res.case_name.replace(" ", "_")
     try:
@@ -171,10 +172,10 @@ class MeshReferenceSelection(BaseModel):
     reason: str
 
 
-def retrieve_mesh_reference(state):
+def retrieve_mesh_reference(state, input_context):
     """Retrieve mesh guidance without selecting the simulation solver."""
     config = state["config"]
-    query = state["user_requirement"] + "\nSupplied inputs:\n" + str(state.get("case_context") or {})
+    query = state["user_requirement"] + "\nSupplied inputs:\n" + str(input_context)
     candidates = retrieve_faiss(
         "openfoam_tutorials_structure", query, topk=config.searchdocs, config=config,
     )
@@ -187,8 +188,9 @@ def retrieve_mesh_reference(state):
     ]
     selection = state["llm_service"].invoke(
         f"<user_requirement>{state['user_requirement']}</user_requirement>\n"
-        f"<provided_inputs>{state.get('case_context') or {}}</provided_inputs>\n"
+        f"<provided_inputs>{input_context}</provided_inputs>\n"
         f"<case_contents>{state.get('foamfiles') or ''}</case_contents>\n"
+        f"<omitted_files>{state.get('input_omissions') or {}}</omitted_files>\n"
         f"<candidates>{summaries}</candidates>\n"
         f"<openfoam_target>{generation_convention(config)}</openfoam_target>",
         "Select one tutorial candidate useful for the requested geometry, dimensionality, "
@@ -263,6 +265,7 @@ def _build_advice(
     faiss_detailed: str,
     subtasks: List[Dict[str, str]],
     llm_service: Optional[Any] = None,
+    config: Optional[Config] = None,
 ) -> SimilarCaseAdviceModel:
     if not faiss_detailed or not subtasks:
         return SimilarCaseAdviceModel(per_file=[
@@ -283,7 +286,7 @@ def _build_advice(
         f"<tutorial_reference>{faiss_detailed}</tutorial_reference>\n"
         f"<subtasks>{subtasks}</subtasks>"
     )
-    client = llm_service if llm_service is not None else global_llm_service
+    client = get_llm_service(llm_service, config)
     return client.invoke(user_prompt, system_prompt, pydantic_obj=SimilarCaseAdviceModel)
 
 
@@ -333,7 +336,7 @@ def retrieve_references(case_name: str,
 
     if not candidates:
         print(f"No suitable similar case found for solver={case_solver}, domain={case_domain}.")
-        return "", "", "", "", _build_advice(user_requirement, case_info, "", subtasks or [], llm_service)
+        return "", "", "", "", _build_advice(user_requirement, case_info, "", subtasks or [], llm_service, config)
 
     # Domain breaks ties between solver matches; semantic distance breaks the rest.
     ranked = _rerank_candidates(candidates, case_domain)
@@ -341,7 +344,7 @@ def retrieve_references(case_name: str,
     dir_structure = _extract_directory_structure(selected)
     if not dir_structure:
         print("Warning: No directory_structure found in selected similar case.")
-        return "", "", "", "", _build_advice(user_requirement, case_info, "", subtasks or [], llm_service)
+        return "", "", "", "", _build_advice(user_requirement, case_info, "", subtasks or [], llm_service, config)
 
     # The structure index only contains the file tree.  Fetch the exact same
     # metadata identity from the details index before exposing file contents.
@@ -384,7 +387,7 @@ def retrieve_references(case_name: str,
     for idx, item in enumerate(faiss_allrun):
         allrun_reference += f"<similar_case_{idx + 1}>{item['full_content']}</similar_case_{idx + 1}>\n\n\n"
 
-    advice = _build_advice(user_requirement, case_info, faiss_detailed, subtasks or [], llm_service)
+    advice = _build_advice(user_requirement, case_info, faiss_detailed, subtasks or [], llm_service, config)
     return faiss_detailed, dir_structure, dir_counts_str, allrun_reference, advice
 
 
@@ -416,7 +419,7 @@ def decompose_to_subtasks(
         "Please generate the output as structured JSON."
     )
 
-    llm_client = llm_service if llm_service is not None else global_llm_service
+    llm_client = get_llm_service(llm_service)
     res = llm_client.invoke(decompose_user_prompt, decompose_system_prompt, pydantic_obj=OpenFOAMPlanModel)
     return res
 
@@ -461,6 +464,7 @@ def generate_simulation_plan(
         RuntimeError: If any step in the planning process fails
     """
     # Step 1: Parse user requirement to case info
+    llm_service = get_llm_service(llm_service, config)
     target_convention = generation_convention(config) if config is not None else ""
     case_info = parse_requirement_to_case_info(
         user_requirement,
@@ -476,12 +480,12 @@ def generate_simulation_plan(
     # Step 2: Resolve case directory
     resolved_case_dir = resolve_case_dir(
         case_name=case_name,
-        case_dir=case_dir,
+        case_dir=case_dir or (config.case_dir if config is not None else ""),
         run_times=run_times,
         run_directory=(
             str(run_directory)
             if run_directory is not None
-            else str(Path(__file__).resolve().parent.parent / "runs")
+            else config.run_directory if config is not None else None
         ),
     )
     
@@ -540,10 +544,12 @@ def generate_simulation_plan(
 def prepare_solver_context(state):
     """Choose solver metadata and retrieve solver references after mesh handoff."""
     config = state["config"]
+    reference_path = str(safe_case_path(state["case_dir"], "", "similar_case.txt"))
     requirement = (
         state["user_requirement"]
         + f"\n<actual_mesh>{state.get('mesh_info') or {}}</actual_mesh>"
         + f"\n<existing_case>{state.get('foamfiles') or ''}</existing_case>"
+        + f"\n<omitted_files>{state.get('input_omissions') or {}}</omitted_files>"
         + f"\n<mesh_boundary_plan>{state.get('mesh_boundary_plan') or []}</mesh_boundary_plan>"
         + f"\n<mesh_reference_source>{state['mesh_reference']['case']}</mesh_reference_source>"
         + "\nChoose the solver for this physical problem. Preserve existing physics "
@@ -559,7 +565,6 @@ def prepare_solver_context(state):
         user_requirement=state["user_requirement"], config=config,
         llm_service=state["llm_service"],
     )
-    reference_path = str(Path(state["case_dir"]) / "similar_case.txt")
     save_file(reference_path, f"{reference}\n\n{scripts}")
     return {
         **metadata, "case_name": state["case_name"],
@@ -603,6 +608,7 @@ def plan_imported_case(state: dict[str, Any]) -> dict[str, Any]:
         f"<user_requirement>{state.get('user_requirement', '')}</user_requirement>\n"
         f"<dir_structure>{state.get('dir_structure') or {}}</dir_structure>\n"
         f"<foamfiles>{state.get('foamfiles')}</foamfiles>\n"
+        f"<omitted_files>{state.get('input_omissions') or {}}</omitted_files>\n"
         f"<error_logs>{state.get('error_logs') or []}</error_logs>\n"
         f"<review_analysis>{state.get('review_analysis') or ''}</review_analysis>\n"
         f"<custom_mesh_path>{state.get('custom_mesh_path') or ''}</custom_mesh_path>\n"
@@ -671,7 +677,7 @@ def _normalise_metadata(value: Any) -> str:
 
 
 def _normalise_structure(value: Any) -> str:
-    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+    return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
 
@@ -690,7 +696,7 @@ def _score_value(item: Dict[str, Any]) -> float:
 
 def _metadata_identity(item: Dict[str, Any]) -> tuple[str, str, str, str]:
     return tuple(
-        _normalise_metadata(item.get(key))
+        str(item.get(key) or "").strip()
         for key in ("case_name", "case_domain", "case_category", "case_solver")
     )
 
@@ -698,7 +704,10 @@ def _metadata_identity(item: Dict[str, Any]) -> tuple[str, str, str, str]:
 def _extract_directory_structure(item: Dict[str, Any]) -> str:
     structure = item.get("dir_structure")
     if structure and _normalise_metadata(structure) != "unknown":
-        return str(structure).strip()
+        structure = str(structure).strip()
+        block = re.fullmatch(r"<directory_structure>(.*?)</directory_structure>",
+                             structure, re.DOTALL | re.IGNORECASE)
+        return block[1].strip() if block else structure
 
     full_content = str(item.get("full_content") or "")
     match = re.search(

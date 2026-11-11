@@ -1,4 +1,5 @@
 """Thin LangGraph adapter for OpenFOAM input generation and rewriting."""
+from logger import print
 
 from pathlib import Path
 from utils import scan_case_directory, load_case_files
@@ -6,27 +7,53 @@ from services.input_writer import initial_write, build_allrun, rewrite_files
 from services.case_paths import safe_case_relative_path
 from services.stage_plan import check_stage_operations, check_stage_inputs, check_stage_script, stage_outcome, pending_file_creates, unwritten_file_errors
 from services.review_history import ReviewHistory
-from services.case_inputs import read_case_inputs
+from services.case_inputs import read_case_inputs, canonical_input_protections, format_case_inputs
 from services.case_workspace import CaseWorkspace
 from services.static_review import finish_static_repair
 from translation.esi_translator import convert_case_to_esi_if_needed
 from openfoam_target import database_path_for_config, generation_convention, uses_legacy_esi_translation
+from services.execution_logs import declared_startup_inputs, check_execution_outputs, check_diagnostic_outputs, diagnostic_outputs
+from services.run_hpc import hpc_execution_outputs
 
 def input_writer_node(state):
     """Edit clean inputs, then expose those inputs to review and execution."""
     original = state
+    targets = [safe_case_relative_path(task['folder_name'], task['file_name']).as_posix()
+               for task in state.get('subtasks', [])] if state['input_writer_mode'] != 'rewrite' else []
+    targets.extend(task['file'] for task in (state.get('rewrite_plan') or {}).get('target_files', []))
+    protected = canonical_input_protections(state.get('case_input_source_dir'),
+                                            declared_startup_inputs(state['solver_operations']))
+    errors = check_diagnostic_outputs(state['case_dir'], [*targets, *protected])
+    if not errors:
+        outputs = hpc_execution_outputs('solver') if state.get('requires_hpc') else ['Allrun.out', 'Allrun.err']
+        errors = check_execution_outputs(outputs, protected)
+    if errors:
+        outcome = {'executed': False, 'error_logs': errors}
+        out = {'error_logs': errors, 'solver_execution': outcome,
+               **stage_outcome(state, 'solver', outcome)}
+        if (_preflight_repair_made_no_progress(state)
+                and not check_stage_script(state['case_dir'], state['solver_operations'], 'solver')):
+            out.update(error_logs=state['error_logs'], workflow_status='failed',
+                       termination_reason='repair_made_no_progress')
+        return out
     if state.get("case_input_source_dir"):
+        CaseWorkspace(state['case_dir'], state['case_input_source_dir']).retain_startup_inputs(
+            declared_startup_inputs(state['solver_operations']))
         state = {**state, "case_dir": state["case_input_source_dir"],
                  "case_import_report_dir": original.get("case_import_report_dir") or str(Path(original["case_dir"]) / ".foamagent")}
     out = _write_solver_inputs(state)
+    if out.get("error_logs"):
+        outcome = {"executed": False, "error_logs": out["error_logs"]}
+        out.update(solver_execution=outcome, **stage_outcome(original, "solver", outcome))
     history = ReviewHistory(original["case_dir"], original.get("case_import_report_dir"))
-    if state["input_writer_mode"] == "rewrite" and state.get("repair_source") != "static_review":
+    if (state["input_writer_mode"] == "rewrite" or state.get('error_logs')) and state.get("repair_source") != "static_review":
         history.append("file_repair", stage="solver", source=state.get("repair_source"),
                        runtime_loop=state.get("loop_count", 0),
                        updated_files=out.get("updated_files", []), file_diffs=out.get("file_diffs", []))
     if out.get("workflow_status") != "failed" and not out.get("error_logs"):
         if original.get("case_input_source_dir"):
-            CaseWorkspace(original["case_dir"], original["case_input_source_dir"]).restore_inputs()
+            CaseWorkspace(original["case_dir"], original["case_input_source_dir"]).restore_inputs(
+                protected_inputs=declared_startup_inputs(original['solver_operations']))
         out.update(load_case_files(original))
     out.update(finish_static_repair(original, "solver", out))
     return out
@@ -35,9 +62,7 @@ def input_writer_node(state):
 def _write_solver_inputs(state):
     errors = check_stage_operations(state["solver_operations"], "solver")
     if errors:
-        outcome = {"executed": False, "error_logs": errors}
-        return {"error_logs": errors, "solver_execution": outcome,
-                **stage_outcome(state, "solver", outcome)}
+        return {"error_logs": errors}
     state = dict(state)
     state['solver_script_dirty'] = state['solver_script_dirty'] or bool(
         check_stage_script(state['case_dir'], state['solver_operations'], 'solver'))
@@ -55,11 +80,10 @@ def _write_solver_inputs(state):
     
     if mode == "rewrite":
         out = _rewrite_mode(state) if (state.get("rewrite_plan") or {}).get("target_files") else {}
-        if (not (state.get('rewrite_plan') or {}).get('target_files') and state.get('error_logs')
-                and not state.get('repairing_mesh') and not state['solver_script_dirty']
-                and not _preflight_plan_repaired(state)):
+        if _preflight_repair_made_no_progress(state):
             out.update(error_logs=state['error_logs'], workflow_status='failed',
                        termination_reason='repair_made_no_progress')
+            return out
     else:
         out = _initial_write_mode(state)
         receipts = out['written_files']
@@ -71,7 +95,19 @@ def _write_solver_inputs(state):
             created_allrun = 'Allrun' in receipts
             out['input_writer_mode'] = 'rewrite' if not out['subtasks'] else 'initial'
             if (state.get("rewrite_plan") or {}).get("target_files"):
-                out.update(_rewrite_mode({**state, **out}))
+                rewritten = _rewrite_mode({**state, **out})
+                out = {**out, **rewritten,
+                    'written_files': list(dict.fromkeys([*out.get('written_files', []), *rewritten.get('written_files', [])])),
+                    'updated_files': list(dict.fromkeys([*out.get('updated_files', []), *rewritten.get('updated_files', [])])),
+                    'file_diffs': [*out.get('file_diffs', []), *rewritten.get('file_diffs', [])]}
+    out['last_repair'] = {'updated_files': out.get('updated_files', []),
+                          'file_diffs': out.get('file_diffs', [])}
+    if (state.get('repair_source') != 'static_review' and state.get('error_logs')
+            and not out.get('updated_files') and not state.get('repairing_mesh')
+            and not state['solver_script_dirty'] and not _preflight_plan_repaired(state)):
+        out.update(error_logs=state['error_logs'] + out.get('error_logs', []), workflow_status='failed',
+            termination_reason='repair_made_no_progress',
+            workflow_message='Repair made no file changes; execution was not started.')
     if out.get("error_logs"):
         return out
     script_written = created_allrun or 'Allrun' in out.get('written_files', [])
@@ -84,13 +120,23 @@ def _write_solver_inputs(state):
     return out
 
 
+def _preflight_repair_made_no_progress(state):
+    return (state['input_writer_mode'] == 'rewrite'
+            and not (state.get('rewrite_plan') or {}).get('target_files') and state.get('error_logs')
+            and not state.get('repairing_mesh') and not state['solver_script_dirty']
+            and not _preflight_plan_repaired(state))
+
+
 def _preflight_plan_repaired(state):
     """A proven operation/dependency correction can resolve preflight without file edits."""
     plan = state.get('rewrite_plan') or {}
     if plan.get('execution_plan_repaired') and not check_stage_operations(state['solver_operations'], 'solver'):
         return True
+    outputs = (hpc_execution_outputs('solver') if state.get('requires_hpc') else ['Allrun.out', 'Allrun.err']) + diagnostic_outputs(state['case_dir'])
     return bool(plan.get('dependencies_changed')) and not check_stage_inputs(
-        state['case_dir'], state['solver_operations'], 'solver')
+        state['case_dir'], state['solver_operations'], 'solver') and not check_execution_outputs(
+        outputs, canonical_input_protections(state.get('case_input_source_dir'),
+                                             declared_startup_inputs(state['solver_operations'])))
 
 
 def _build_solver_allrun(state):
@@ -115,7 +161,9 @@ def _rewrite_mode(state):
     static_repair = state.get("repair_source") == "static_review"
     write_dir = state.get("case_input_source_dir") or state["case_dir"]
     if state.get("case_input_source_dir"):
-        foamfiles, omitted = read_case_inputs(write_dir)
+        foamfiles, omitted = read_case_inputs(
+            write_dir, protected_inputs=canonical_input_protections(
+                state['case_input_source_dir'], declared_startup_inputs(state['solver_operations'])))
         directory = scan_case_directory(write_dir)
     else:
         foamfiles, omitted = state.get("foamfiles"), state.get("input_omissions")
@@ -134,6 +182,7 @@ def _rewrite_mode(state):
         allrun_reference=state.get("allrun_reference") or "",
         operations=state["solver_operations"],
         llm_service=state.get("llm_service"),
+        config=state['config'],
         review_context=history.context(events={"file_repair", "static_review_exit"}) if static_repair else "",
         tutorial_reference=state.get("tutorial_reference") or "",
         omitted_files=omitted,
@@ -146,22 +195,9 @@ def _rewrite_mode(state):
     
     # Rescan the directory and foam files to reflect any translations
     out["dir_structure"] = scan_case_directory(write_dir)
-    out["foamfiles"], out["input_omissions"] = read_case_inputs(write_dir)
-    out["last_repair"] = {
-        "updated_files": out.get("updated_files", []),
-        "file_diffs": out.get("file_diffs", []),
-    }
-
-    if (not static_repair and state.get("error_logs") and not out.get("updated_files") and not state.get("repairing_mesh")
-            and not state["solver_script_dirty"] and not _preflight_plan_repaired(state)):
-        print("Repair made no file changes. Stopping without rerunning the case.")
-        out.update({
-            "error_logs": state["error_logs"] + out.get('error_logs', []),
-            "workflow_status": "failed",
-            "termination_reason": "repair_made_no_progress",
-            "workflow_message": "Repair made no file changes; execution was not started.",
-        })
-
+    out["foamfiles"], out["input_omissions"] = read_case_inputs(
+        write_dir, protected_inputs=canonical_input_protections(
+            state.get('case_input_source_dir'), declared_startup_inputs(state['solver_operations'])))
     return out
 
 def _initial_write_mode(state):
@@ -171,10 +207,15 @@ def _initial_write_mode(state):
     print("<input_writer mode=\"initial\">")
     
     config = state["config"]
+    current_inputs, omitted = read_case_inputs(
+        state['case_dir'], protected_inputs=canonical_input_protections(
+            state.get('case_input_source_dir'), declared_startup_inputs(state['solver_operations'])))
     write_out = initial_write(
         case_dir=state["case_dir"],
         subtasks=state["subtasks"],
-        user_requirement=state["user_requirement"],
+        user_requirement=state["user_requirement"]
+        + f'\n<current_case_inputs>{format_case_inputs(current_inputs)}</current_case_inputs>'
+        + f'\n<omitted_files>{omitted}</omitted_files>',
         tutorial_reference=state["tutorial_reference"],
         case_solver=state["case_solver"],
         allrun_reference=state.get("allrun_reference") or "",
@@ -202,13 +243,16 @@ def _initial_write_mode(state):
     
     # Rescan the directory and foam files to reflect any translations
     dir_structure = scan_case_directory(state["case_dir"])
-    foamfiles, omitted = read_case_inputs(state["case_dir"])
+    foamfiles, omitted = read_case_inputs(
+        state["case_dir"], protected_inputs=canonical_input_protections(
+            state.get('case_input_source_dir'), declared_startup_inputs(state['solver_operations'])))
 
     return {
         "dir_structure": dir_structure,
         "commands": [],
         "foamfiles": foamfiles,
         "written_files": write_out['written_files'],
+        "updated_files": write_out['updated_files'],
         "input_omissions": omitted,
     }
 

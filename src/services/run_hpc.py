@@ -1,13 +1,18 @@
+from logger import print
 from typing import Any, Optional, Tuple, Dict
 import os
 import json
 import subprocess
 import re
 import time
+import shutil
 from models import RunOut
-from utils import save_file
+from utils import save_file, native_job_info_setup
 from .solver_execution import check_solver_execution
-from . import global_llm_service
+from .execution_logs import declared_startup_inputs, check_execution_outputs
+from .case_paths import safe_case_path
+from .case_inputs import read_case_inputs
+from . import get_llm_service
 
 
 class HpcWorkflowStop(RuntimeError):
@@ -45,6 +50,7 @@ def create_slurm_script(
     Returns:
         str: Path to the created SLURM script
     """
+    script_path = str(safe_case_path(case_dir, "", "submit_job.slurm"))
     system_prompt = (
         "You are an expert in HPC cluster job submission and SLURM scripting. "
         "Create a complete SLURM script for running OpenFOAM simulations. "
@@ -80,7 +86,7 @@ def create_slurm_script(
         f"Generate a complete SLURM script that will run the OpenFOAM simulation using the {execution_script} script."
     )
     
-    llm_client = llm_service if llm_service is not None else global_llm_service
+    llm_client = get_llm_service(llm_service)
     response = llm_client.invoke(user_prompt, system_prompt)
     
     # Clean up the response to extract just the script content
@@ -101,7 +107,6 @@ def create_slurm_script(
         script_content,
         openfoam_target,
     )
-    script_path = os.path.join(case_dir, "submit_job.slurm")
     save_file(script_path, script_content)
     return script_path
 
@@ -128,6 +133,7 @@ def create_slurm_script_with_error_context(
     Returns:
         str: Path to the created SLURM script
     """
+    script_path = str(safe_case_path(case_dir, "", "submit_job.slurm"))
     system_prompt = (
         "You are an expert in HPC cluster job submission and SLURM scripting. "
         "Create a complete SLURM script for running OpenFOAM simulations. "
@@ -181,7 +187,7 @@ def create_slurm_script_with_error_context(
     
     user_prompt += f"\nGenerate a complete SLURM script that will run the OpenFOAM simulation using the {execution_script} script. Return ONLY the complete SLURM script content. Do not include any explanations or markdown formatting."
     
-    llm_client = llm_service if llm_service is not None else global_llm_service
+    llm_client = get_llm_service(llm_service)
     response = llm_client.invoke(user_prompt, system_prompt)
     
     # Clean up the response to extract just the script content
@@ -202,12 +208,13 @@ def create_slurm_script_with_error_context(
         script_content,
         openfoam_target,
     )
-    script_path = os.path.join(case_dir, "submit_job.slurm")
     save_file(script_path, script_content)
     return script_path
 
 
-def submit_slurm_job(script_path: str) -> Tuple[Optional[str], bool, str]:
+def submit_slurm_job(script_path: str, *, timeout: float = 60) -> Tuple[Optional[str], bool, str]:
+    environment = dict(os.environ)
+    environment.pop("SBATCH_WAIT", None)
     try:
         # The script's runtime guard checks $WM_PROJECT_VERSION before any module-load
         # step (the generated script is told not to source OpenFOAM itself), so it
@@ -220,25 +227,35 @@ def submit_slurm_job(script_path: str) -> Tuple[Optional[str], bool, str]:
             ["sbatch", "--export=ALL", script_path],
             capture_output=True,
             text=True,
-            check=True,
+            check=False,
+            env=environment,
+            timeout=min(timeout, 60),
         )
-        output = result.stdout.strip()
-        job_id_match = re.search(r'Submitted batch job (\d+)', output)
-        if job_id_match:
-            return job_id_match.group(1), True, ""
-        raise HpcWorkflowStop("hpc_submission_unconfirmed",
-                              f"Could not extract job ID from sbatch output: {output}")
-    except subprocess.CalledProcessError as e:
-        return None, False, f"Failed to submit job: {e.stderr}"
-    except HpcWorkflowStop:
-        raise
-    except Exception as e:
-        raise HpcWorkflowStop("hpc_submission_unconfirmed", f"Submission could not be confirmed: {e}") from e
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as error:
+        result = error
+    def decoded(value):
+        return value.decode(errors="replace") if isinstance(value, bytes) else value or ""
+    output = "\n".join(decoded(getattr(result, name, "")) for name in ("stdout", "stderr"))
+    ids = set(re.findall(r'^Submitted batch job ([0-9]+)(?: on cluster ([^\s;]+))?[ \t]*$', output, re.M))
+    parsable = re.fullmatch(r'\s*([0-9]+)(?:;([^\s;]+))?\s*', decoded(getattr(result, "stdout", "")))
+    if parsable:
+        ids.add((parsable[1], parsable[2] or ""))
+    if len(ids) == 1:
+        number, cluster = ids.pop()
+        return number + (";" + cluster if cluster else ""), True, ""
+    rejected = re.search(
+        r'\b(?:invalid partition(?: specified| name)|invalid account|unrecognized option|'
+        r'unrecognized argument|invalid (?:option|argument)|invalid --[\w-]+ specification)\b', output, re.I)
+    if not isinstance(result, (subprocess.TimeoutExpired, OSError)) and getattr(result, 'returncode', 0) and rejected:
+        return None, False, f"Failed to submit job: {output.strip()}"
+    raise HpcWorkflowStop("hpc_submission_unconfirmed",
+                          f"Submission could not be confirmed: {output.strip() or str(result)}")
 
 
 def check_job_status(job_id: str, *, timeout: Optional[float] = None) -> Tuple[Optional[str], bool, str]:
     try:
-        result = subprocess.run(["squeue", "-j", job_id, "--noheader", "-o", "%T"], capture_output=True, text=True, check=True, timeout=timeout)
+        number, cluster_args = _slurm_job_identity(job_id)
+        result = subprocess.run(["squeue", *cluster_args, "-j", number, "--noheader", "-o", "%T"], capture_output=True, text=True, check=True, timeout=timeout)
         status = result.stdout.strip()
         if status:
             return status, True, ""
@@ -249,8 +266,14 @@ def check_job_status(job_id: str, *, timeout: Optional[float] = None) -> Tuple[O
         return None, False, f"Unexpected error: {str(e)}"
 
 
-def run_simulation_hpc(script_path: str) -> RunOut:
-    job_id, ok, err = submit_slurm_job(script_path)
+def _slurm_job_identity(job_id):
+    """Retain sbatch's cluster identity through monitoring and cancellation."""
+    number, _, cluster = job_id.partition(";")
+    return number, ["--clusters", cluster] if cluster else []
+
+
+def run_simulation_hpc(script_path: str, *, timeout: float = 60) -> RunOut:
+    job_id, ok, err = submit_slurm_job(script_path, timeout=timeout)
     status = "submitted" if ok else f"failed: {err}"
     return RunOut(job_id=job_id, status=status)
 
@@ -271,15 +294,8 @@ def extract_cluster_info_from_requirement(
     Returns:
         dict: Dictionary containing cluster_name, account_number, and other cluster details
     """
-    # Check if decomposeParDict exists and read its content
-    decompose_par_dict_content = ""
-    decompose_par_dict_path = os.path.join(case_dir, "system", "decomposeParDict")
-    if os.path.exists(decompose_par_dict_path):
-        try:
-            with open(decompose_par_dict_path, 'r') as f:
-                decompose_par_dict_content = f.read()
-        except Exception as e:
-            print(f"Warning: Could not read decomposeParDict: {e}")
+    inputs, omitted = read_case_inputs(case_dir, selected_paths=['system/decomposeParDict'])
+    decompose_par_dict_content = next((file.content for file in inputs.list_foamfile), "")
     
     system_prompt = (
         "You are an expert in HPC cluster analysis. "
@@ -317,73 +333,40 @@ def extract_cluster_info_from_requirement(
             "Analyze the decomposeParDict to determine the appropriate number of tasks per node "
             "based on the decomposition settings. "
         )
+
+    if omitted:
+        user_prompt += f"\n<omitted_files>{json.dumps(omitted)}</omitted_files>\n"
     
     user_prompt += "Extract cluster information and return as JSON object."
     
-    llm_client = llm_service if llm_service is not None else global_llm_service
+    llm_client = get_llm_service(llm_service)
     response = llm_client.invoke(user_prompt, system_prompt)
     
-    # Try to parse the JSON response
-    try:
-        # Clean up the response to extract JSON
-        response = response.strip()
-        if response.startswith('```json'):
-            response = response[7:]
-        if response.endswith('```'):
-            response = response[:-3]
-        response = response.strip()
-        
-        cluster_info = json.loads(response)
-        
-        # Set defaults for missing values
-        defaults = {
-            'cluster_name': 'default_cluster',
-            'account_number': 'default_account',
-            'partition': 'normal',
-            'nodes': 1,
-            'ntasks_per_node': 1,
-            'time_limit': 24,
-            'memory': 64
-        }
-        
-        for key, default_value in defaults.items():
-            if key not in cluster_info or cluster_info[key] is None:
-                cluster_info[key] = default_value
-                
-        return cluster_info
-        
-    except (json.JSONDecodeError, KeyError) as e:
-        print(f"Error parsing cluster info from LLM response: {e}")
-        print(f"LLM response: {response}")
-        # Return default values if parsing fails
-        return {
-            'cluster_name': 'default_cluster',
-            'account_number': 'default_account',
-            'partition': 'normal',
-            'nodes': 1,
-            'ntasks_per_node': 1,
-            'time_limit': 24,
-            'memory': 64
-        }
-    except Exception as e:
-        print(f"Unexpected error in extract_cluster_info_from_requirement: {e}")
-        # Return default values for unexpected errors
-        return {
-            'cluster_name': 'default_cluster',
-            'account_number': 'default_account',
-            'partition': 'normal',
-            'nodes': 1,
-            'ntasks_per_node': 1,
-            'time_limit': 24,
-            'memory': 64
-        }
+    response = response.strip()
+    if response.startswith('```json'):
+        response = response[7:]
+    if response.endswith('```'):
+        response = response[:-3]
+    cluster_info = json.loads(response.strip())
+    if not isinstance(cluster_info, dict):
+        raise ValueError("Cluster configuration must be a JSON object")
+
+    required = ('cluster_name', 'account_number', 'partition', 'nodes',
+                'ntasks_per_node', 'time_limit', 'memory')
+    missing = [key for key in required if key not in cluster_info or cluster_info[key] is None]
+    if missing:
+        raise ValueError("Cluster configuration is missing required fields: " + ", ".join(missing))
+    return cluster_info
 
 
 def check_logs_for_errors(case_dir: str, *, fields_before: dict[str, tuple[int, ...]],
-                          openfoam_target: str = "", timeout: int = 3600):
+                          logs_before: dict[str, tuple[int, ...]], protected_inputs=(),
+                          openfoam_target: str = "", timeout: int = 3600, job_info_dir=None):
     """Return parsed OpenFOAM error logs for a case directory."""
     return check_solver_execution(
-        case_dir, fields_before=fields_before, openfoam_target=openfoam_target, timeout=timeout)
+        case_dir, fields_before=fields_before, logs_before=logs_before,
+        protected_inputs=protected_inputs, openfoam_target=openfoam_target, timeout=timeout,
+        job_info_dir=job_info_dir)
 
 
 def wait_for_job(job_id: str, max_wait_time: int = 3600, wait_interval: int = 30) -> Tuple[str, bool, str]:
@@ -405,11 +388,108 @@ def wait_for_job(job_id: str, max_wait_time: int = 3600, wait_interval: int = 30
     return "TIMEOUT", False, f"Monitoring exceeded {max_wait_time}s; last state: {last_status}"
 
 
+# Native sbatch option arity is needed only to distinguish --wait/-W from an
+# option's value. Scheduler option/resource validation remains sbatch's job.
+# https://github.com/SchedMD/slurm/blob/master/src/common/slurm_opt.c
+_SBATCH_REQUIRED_ARGUMENTS = set("""
+    account acctg-freq array batch bbf autocomplete begin bb cluster-constraint
+    chdir clusters cluster comment constraint container-id runtime context
+    core-spec cores-per-socket cpu-freq cpus-per-gpu cpus-per-task deadline
+    delay-boot dependency distribution error exclude export export-file extra
+    extra-node-info gid gpu-bind tres-bind gpu-freq gpus gpus-per-node
+    gpus-per-socket gpus-per-task tres-per-task gres gres-flags hint input job-name
+    kill-on-invalid-dep kv layout licenses mail-type mail-user max-pids mcs-label
+    mem mem-bind mem-per-cpu mem-per-gpu mem-update mincpus network nodefile
+    nodelist nodes ntasks ntasks-per-core ntasks-per-node ntasks-per-socket
+    ntasks-per-tres ntasks-per-gpu open-mode output partition prefer priority
+    profile qos relay-io reservation resources segment signal sockets-per-node
+    switches tasks-per-node thread-spec threads-per-core time time-min tmp uid
+    user wait-all-nodes wckey wrap
+""".split())
+_SBATCH_FLAG_OPTIONS = set("""
+    consolidate-segments contiguous external get-user-env help hold ignore-pbs
+    no-requeue overcommit oversubscribe parsable quiet reboot spread-job
+    spread-segments stepmgr test-only use-min-nodes usage verbose version wait
+    exclusive oom-kill-step nice no-kill propagate requeue resv-ports
+""".split())
+
+
+def _slurm_directive_arguments(text):
+    """Follow sbatch get_argument quoting, escapes and comments, not shell syntax."""
+    argument, quote, escaped = None, None, False
+    for character in text:
+        if argument is None:
+            if character.isspace():
+                continue
+            argument = []
+        if escaped:
+            argument.append(character)
+            escaped = False
+        elif character == '\\':
+            escaped = True
+        elif quote:
+            if character == quote:
+                quote = None
+            else:
+                argument.append(character)
+        elif character in "\"'":
+            quote = character
+        elif character == '#':
+            break
+        elif character.isspace():
+            if not argument:
+                return
+            yield ''.join(argument)
+            argument = None
+        else:
+            argument.append(character)
+    if quote:
+        raise ValueError('Unmatched quote in Slurm directive')
+    if argument:
+        yield ''.join(argument)
+
+
+def _reject_submission_wait(script_content: str) -> None:
+    """Inspect native leading directives without interpreting the job program."""
+    arguments = []
+    for line in script_content.splitlines():
+        directive = re.match(r'^#(?:SBATCH|SLURM)(.*)$', line)
+        if directive:
+            arguments.extend(_slurm_directive_arguments(directive[1]))
+        elif line.strip() and not line.lstrip().startswith('#'):
+            break
+    tokens = iter(arguments)
+    for token in tokens:
+        if token == '--':
+            break
+        if token.startswith('--'):
+            name, equals, _ = token[2:].partition('=')
+            if name == 'wait':
+                raise ValueError('Slurm --wait/-W directives are not allowed; submission must return a job ID promptly')
+            if not equals:
+                # getopt_long accepts an unambiguous abbreviation too.
+                names = _SBATCH_REQUIRED_ARGUMENTS | _SBATCH_FLAG_OPTIONS
+                matches = {name} if name in names else {option for option in names if option.startswith(name)}
+                if len(matches) == 1 and matches <= _SBATCH_REQUIRED_ARGUMENTS:
+                    next(tokens, None)
+        elif token.startswith('-'):
+            for index, option in enumerate(token[1:], start=1):
+                if option == 'W':
+                    raise ValueError('Slurm --wait/-W directives are not allowed; submission must return a job ID promptly')
+                if option in 'ABCDFGJLMNSabcdeimnopqtwx':
+                    if index == len(token) - 1:
+                        next(tokens, None)
+                    break
+                if option == 'k':  # Optional short argument consumes only attached text.
+                    break
+
+
 def _add_openfoam_runtime_guard(
     script_content: str,
     openfoam_target: str,
 ) -> str:
     """Make an explicit native-target job fail on a mismatched runtime."""
+    _reject_submission_wait(script_content)
     if openfoam_target not in {"foundation-v10", "esi-v2006"}:
         return script_content
     expected = "v2006|2006" if openfoam_target == "esi-v2006" else "10"
@@ -434,34 +514,60 @@ def _add_openfoam_runtime_guard(
     return "\n".join([*lines[:insert_at], guard.rstrip("\n"), *lines[insert_at:]]) + "\n"
 
 
+def hpc_execution_outputs(stage):
+    script = "Allmesh" if stage == "mesh" else "Allrun"
+    return [f"{script}.out", f"{script}.err", "submit_job.slurm"]
+
+
 def run_stage_hpc(state, script, stage, timeout):
     """Submit one stage attempt; queue disappearance alone is not completion."""
     from pathlib import Path
     import tempfile
     import shlex
-    case = Path(state["case_dir"]).resolve()
-    root = case / ".foamagent" / (stage + "-jobs")
+    operations = state.get(stage + "_operations") or []
+    if stage == "mesh":
+        operations = [*operations, *(state.get("solver_operations") or []),
+                      *(state.get("pending_solver_operations") or [])]
+    output_paths = hpc_execution_outputs(stage)
+    from .case_inputs import canonical_input_protections
+    conflicts = check_execution_outputs(output_paths, canonical_input_protections(
+        state.get('case_input_source_dir'), declared_startup_inputs(operations)))
+    if conflicts:
+        raise ValueError(str(conflicts))
+    deadline = time.monotonic() + timeout
+    # Validate lexical destinations before resolution or metadata creation.
+    destinations = [safe_case_path(state["case_dir"], "", name) for name in output_paths]
+    case = destinations[0].parent
+    root = safe_case_path(case, ".foamagent", stage + "-jobs")
     root.mkdir(parents=True, exist_ok=True)
     attempt = Path(tempfile.mkdtemp(prefix="attempt-", dir=root))
     marker, out, err = (attempt / name for name in ("exit-code", "stdout", "stderr"))
+    job_info_dir = attempt / 'native-jobs' if stage == 'solver' else None
+    if job_info_dir is not None:
+        job_info_dir.mkdir()
     wrapper = attempt / "run-stage.sh"
     q = lambda p: shlex.quote(str(p))
     wrapper.write_text("#!/bin/bash\n" +
         f"cd {q(case)} || exit 1\n" +
+        (native_job_info_setup(job_info_dir) if job_info_dir is not None else '') +
         f"bash -e -o pipefail {q(Path(script).resolve())} > {q(out)} 2> {q(err)}\n" +
         "rc=$?\n" + f"printf '%s\\n' \"$rc\" > {q(marker)}.tmp\n" +
         f"mv {q(marker)}.tmp {q(marker)}\nexit \"$rc\"\n")
     wrapper.chmod(0o700)
-    cluster = extract_cluster_info_from_requirement(state["user_requirement"], str(case), llm_service=state.get("llm_service"))
+    client = get_llm_service(state.get('llm_service'), state['config'])
+    try:
+        cluster = extract_cluster_info_from_requirement(state["user_requirement"], str(case), llm_service=client)
+    except ValueError as error:
+        raise HpcWorkflowStop("hpc_configuration_failed", f"Cannot determine cluster configuration: {error}") from error
     state["cluster_info"] = cluster
     from openfoam_target import runtime_openfoam_target
     previous_script, submission_error = "", ""
     record = {"job_id": None, "output": str(out), "error": str(err)}
     submission_number = 0
     while True:
-        if state.get("loop_count", 0) >= state["config"].max_loop:
+        if submission_error and state.get("loop_count", 0) >= state["config"].max_loop:
             raise HpcWorkflowStop("max_review_loop_reached", "Slurm submission exhausted the shared repair budget", record)
-        kwargs = dict(llm_service=state.get("llm_service"),
+        kwargs = dict(llm_service=client,
                       openfoam_target=runtime_openfoam_target(state["config"]), execution_script=str(wrapper))
         if submission_error:
             batch = create_slurm_script_with_error_context(str(case), cluster, submission_error, previous_script, **kwargs)
@@ -472,11 +578,17 @@ def run_stage_hpc(state, script, stage, timeout):
         batch_copy = attempt / f"submit-{submission_number}.slurm"
         batch_copy.write_text(previous_script)
         record = {"job_id": None, "script": str(batch_copy), "output": str(out), "error": str(err)}
+        if job_info_dir is not None:
+            record['job_info_dir'] = str(job_info_dir)
         state.setdefault(stage + "_jobs", []).append(record)
         try:
-            submitted = run_simulation_hpc(str(batch_copy))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise HpcWorkflowStop('hpc_stage_timeout', 'Stage budget expired before Slurm submission', record)
+            submitted = run_simulation_hpc(str(batch_copy), timeout=min(remaining, 60))
         except HpcWorkflowStop as stop:
-            record.update(status="submission_unknown", returncode=1, diagnostic=str(stop))
+            record.update(status="submission_unknown" if stop.reason == 'hpc_submission_unconfirmed' else 'not_submitted',
+                          returncode=1, diagnostic=str(stop))
             stop.record = record
             raise
         record.update(job_id=submitted.job_id, status=submitted.status)
@@ -488,11 +600,12 @@ def run_stage_hpc(state, script, stage, timeout):
         submission_error = submitted.status
         state["loop_count"] = state.get("loop_count", 0) + 1
 
-    status, ok, error = wait_for_job(submitted.job_id, max_wait_time=timeout)
+    status, ok, error = wait_for_job(submitted.job_id, max_wait_time=max(0, deadline - time.monotonic()))
     record["status"] = status
     if not ok:
         try:
-            cancelled = subprocess.run(["scancel", str(submitted.job_id)], check=False, capture_output=True, text=True, timeout=60)
+            number, cluster_args = _slurm_job_identity(submitted.job_id)
+            cancelled = subprocess.run(["scancel", *cluster_args, number], check=False, capture_output=True, text=True, timeout=60)
             record["cancellation"] = {"returncode": cancelled.returncode, "stderr": cancelled.stderr}
         except Exception as exc:
             record["cancellation"] = {"error": str(exc)}
@@ -503,14 +616,20 @@ def run_stage_hpc(state, script, stage, timeout):
             raise HpcWorkflowStop("hpc_job_state_unconfirmed", "Could not confirm that the Slurm job stopped; no further work will run", record)
     try:
         code = int(marker.read_text().strip())
+        executed = ok
     except (OSError, ValueError):
         code = 1
+        executed = False
         error = error or "No exit result for this stage attempt"
     record.update(returncode=code if ok and status == "COMPLETED" else 1,
-                  timed_out=status == "TIMEOUT", diagnostic=error)
+                  timed_out=status == "TIMEOUT", diagnostic=error, executed=executed)
     # Keep conventional stage outputs for the existing error collector.
-    for src, name in ((out, stage == "mesh" and "Allmesh.out" or "Allrun.out"),
-                      (err, stage == "mesh" and "Allmesh.err" or "Allrun.err")):
-        (case / name).write_text(src.read_text(errors="replace") if src.exists()
-                                 else error or "No output was produced for this stage attempt")
+    # Native operations may have replaced a destination since preflight. Check
+    # both streams before copying either, retaining existing evidence on failure.
+    streams = [safe_case_path(case, "", name) for name in output_paths[:2]]
+    for src, destination in zip((out, err), streams):
+        if src.exists():
+            shutil.copyfile(src, destination)
+        else:
+            destination.write_text(error or "No output was produced for this stage attempt")
     return record

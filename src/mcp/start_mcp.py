@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 from .cli import run_server
 from .fastmcp_server import mcp
+from logger import print
 
 if __name__ == "__main__":  # pragma: no cover
     transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()

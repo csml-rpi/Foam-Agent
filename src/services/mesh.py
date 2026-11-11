@@ -10,12 +10,22 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from pydantic import BaseModel, Field
-from utils import run_openfoam_utility, save_file
-from . import global_llm_service
+from utils import run_openfoam_utility, run_owned_process, save_file, reject_symbolic_links
+from . import get_llm_service
 from .run_hpc import HpcWorkflowStop
+from .visualization import ensure_foam_file
+from .execution_logs import check_execution_outputs
+from .case_paths import safe_case_path
+from .case_inputs import read_case_inputs
 
 
 _FAILED_MESH_CHECKS_RE = re.compile(r'Failed [1-9][0-9]* mesh checks')
+_MESH_FILES = ("points", "faces", "owner", "neighbour", "boundary")
+
+
+def _missing_mesh_files(directory):
+    return [name for name in _MESH_FILES
+            if not ((directory / name).is_file() or (directory / (name + ".gz")).is_file())]
 
 
 def _mesh_failure(message, execution):
@@ -51,31 +61,46 @@ def _convert_mesh(case_dir, timeout, openfoam_target, utility_runner, execution)
         raise RuntimeError('checkMesh reported failed mesh checks.\n' + checked.stdout)
 
 
-def prepare_custom_mesh(custom_mesh_path, case_dir, *, retry=False, source_written=False):
-    mesh_in_case_dir = Path(case_dir) / 'geometry.msh'
-    origin_file = Path(case_dir) / '.foamagent/mesh-source.json'
+def prepare_custom_mesh(custom_mesh_path, case_dir, *, retry=False, source_written=False,
+                        protected_inputs=()):
+    conflicts = check_execution_outputs(['constant/polyMesh'], protected_inputs)
+    if conflicts:
+        return conflicts
+    mesh_in_case_dir = safe_case_path(case_dir, '', 'geometry.msh')
+    origin_file = safe_case_path(case_dir, '.foamagent', 'mesh-source.json')
     origin = dict(source=str(Path(custom_mesh_path).expanduser().resolve()), backend='custom_mesh')
     previous = json.loads(origin_file.read_text()) if origin_file.is_file() else None
     if source_written or not retry or previous != origin or not mesh_in_case_dir.is_file():
         if not (mesh_in_case_dir.exists() and os.path.samefile(custom_mesh_path, mesh_in_case_dir)):
+            conflicts = check_execution_outputs(['geometry.msh'], protected_inputs)
+            if conflicts:
+                return conflicts
+            mesh_in_case_dir.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(custom_mesh_path, mesh_in_case_dir)
     origin_file.parent.mkdir(parents=True, exist_ok=True)
     origin_file.write_text(json.dumps(origin))
+    return []
 
 
 def copy_custom_mesh(custom_mesh_path: str, case_dir: str, *, timeout: int,
                      openfoam_target: str = '', utility_runner=None, retry: bool = False,
-                     source_written: bool = False) -> Dict[str, Any]:
+                     source_written: bool = False, protected_inputs=()) -> Dict[str, Any]:
     """Stage the selected .msh, convert and check it once; preserve repaired working copies."""
     execution = []
     if not custom_mesh_path:
         return _mesh_failure('No custom mesh path provided', execution)
     if not os.path.exists(custom_mesh_path):
         return _mesh_failure(f'Custom mesh not found: {custom_mesh_path}', execution)
-    os.makedirs(case_dir, exist_ok=True)
     mesh_in_case_dir = Path(case_dir)/'geometry.msh'
     try:
-        prepare_custom_mesh(custom_mesh_path, case_dir, retry=retry, source_written=source_written)
+        reject_symbolic_links(Path(case_dir) / 'constant')
+        reject_symbolic_links(Path(case_dir) / 'system')
+        conflicts = prepare_custom_mesh(custom_mesh_path, case_dir, retry=retry,
+                                        source_written=source_written, protected_inputs=protected_inputs)
+        if conflicts:
+            result = _mesh_failure('Custom mesh outputs conflict with declared startup inputs', execution)
+            result['error_logs'] = conflicts
+            return result
         (Path(case_dir)/'constant').mkdir(exist_ok=True)
         (Path(case_dir)/'system').mkdir(exist_ok=True)
         _convert_mesh(case_dir, timeout, openfoam_target, utility_runner, execution)
@@ -91,7 +116,7 @@ def copy_custom_mesh(custom_mesh_path: str, case_dir: str, *, timeout: int,
         return _mesh_failure(f'Custom mesh conversion/check failed: {error}', execution)
     if not (Path(case_dir)/'constant/polyMesh').is_dir():
         return _mesh_failure('polyMesh directory not created', execution)
-    (Path(case_dir)/(Path(case_dir).name+'.foam')).touch()
+    ensure_foam_file(case_dir)
     return dict(mesh_info=dict(mesh_file_path=str(mesh_in_case_dir), mesh_file_type='gmsh',
                               mesh_description='Selected mesh converted and checked',
                               requires_blockmesh_removal=True, check_mesh_passed=True),
@@ -119,15 +144,19 @@ class GMSHPythonCode(BaseModel):
 
 def prepare_gmsh_script(user_requirement, case_dir, *, script_prepared, llm_service=None,
                         openfoam_target='', repair_feedback=''):
-    python_file = Path(case_dir) / 'generate_mesh.py'
+    python_file = safe_case_path(case_dir, '', 'generate_mesh.py')
     changes = {'updated_files': [], 'file_diffs': []}
     if not script_prepared:
         existing = python_file.read_text() if python_file.is_file() else ''
-        client = llm_service if llm_service is not None else global_llm_service
+        inputs, omitted = read_case_inputs(case_dir, selected_paths=['generate_mesh.py'])
+        existing_context = next((file.content for file in inputs.list_foamfile
+                                 if file.file_name == python_file.name), '')
+        client = get_llm_service(llm_service)
         response = client.invoke(
             f'<user_requirements>{user_requirement}</user_requirements>\n'
             f'<openfoam_target>{openfoam_target}</openfoam_target>\n'
-            f'<existing_python_code>{existing}</existing_python_code>\n'
+            f'<existing_python_code>{existing_context}</existing_python_code>\n'
+            f'<omitted_files>{json.dumps(omitted)}</omitted_files>\n'
             f'<repair_feedback>{repair_feedback}</repair_feedback>',
             GMSH_PYTHON_SYSTEM_PROMPT, pydantic_obj=GMSHPythonCode)
         if not response.python_code.strip():
@@ -147,21 +176,27 @@ def prepare_gmsh_script(user_requirement, case_dir, *, script_prepared, llm_serv
 
 def handle_gmsh_mesh(user_requirement: str, case_dir: str, *, timeout: int, script_prepared: bool,
                      llm_service: Optional[Any] = None, openfoam_target: str = '', utility_runner=None,
-                     repair_feedback: str = '', python_runner=None) -> Dict[str, Any]:
+                     repair_feedback: str = '', python_runner=None, protected_inputs=()) -> Dict[str, Any]:
     """Generate or execute the explicitly written script, then convert/check once."""
     case_dir = os.path.abspath(case_dir)
-    os.makedirs(case_dir, exist_ok=True)
     python_file = Path(case_dir)/'generate_mesh.py'
     msh_file = Path(case_dir)/'geometry.msh'
     execution = []
+    conflicts = check_execution_outputs(['geometry.msh', 'constant/polyMesh'], protected_inputs)
+    if conflicts:
+        result = _mesh_failure('Gmsh outputs conflict with declared startup inputs', execution)
+        result['error_logs'] = conflicts
+        return result
     try:
+        reject_symbolic_links(Path(case_dir) / 'constant')
+        reject_symbolic_links(Path(case_dir) / 'system')
+        os.makedirs(case_dir, exist_ok=True)
         prepare_gmsh_script(user_requirement, case_dir, script_prepared=script_prepared,
                             llm_service=llm_service, openfoam_target=openfoam_target,
                             repair_feedback=repair_feedback)
         _clear_gmsh_attempt_outputs(case_dir)
-        _run_mesh_command(execution, python_runner or subprocess.run, [sys.executable, str(python_file)],
-                          cwd=case_dir, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True, timeout=timeout)
+        _run_mesh_command(execution, python_runner or run_owned_process, [sys.executable, str(python_file)],
+                          cwd=case_dir, check=True, text=True, timeout=timeout)
         if not msh_file.is_file():
             return _mesh_failure('Gmsh script completed without creating geometry.msh.', execution)
         (Path(case_dir)/'constant').mkdir(exist_ok=True)
@@ -173,11 +208,11 @@ def handle_gmsh_mesh(user_requirement: str, case_dir: str, *, timeout: int, scri
         return _mesh_failure(f'Mesh command failed: {error.stderr or error.stdout or error}', execution)
     except subprocess.TimeoutExpired:
         return _mesh_failure(f'Mesh command timed out after {timeout}s.', execution)
-    except (OSError, RuntimeError) as error:
+    except (OSError, RuntimeError, ValueError) as error:
         return _mesh_failure(f'Mesh setup failed: {error}', execution)
     if not (Path(case_dir)/'constant/polyMesh').is_dir():
         return _mesh_failure('polyMesh directory not created', execution)
-    (Path(case_dir)/(Path(case_dir).name+'.foam')).touch()
+    ensure_foam_file(case_dir)
     return dict(mesh_info=dict(mesh_file_path=str(msh_file), mesh_file_type='gmsh',
                               mesh_description='Gmsh program executed, converted and checked',
                               requires_blockmesh_removal=True, check_mesh_passed=True),

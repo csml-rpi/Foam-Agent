@@ -1,4 +1,5 @@
 """Materialise non-CAD inputs without deciding mesh or solver policy."""
+from logger import print
 
 import shutil
 from pathlib import Path
@@ -9,18 +10,27 @@ from openfoam_target import ESI_V2006, FOUNDATION_V10, configured_openfoam_targe
 from utils import load_agent_resources, load_case_files
 from .case_import import CaseImportError, import_case, build_case_context
 from .output_safety import prepare_output_directory, validate_output_path
+from .case_workspace import prepare_case_workspace
 
 
 def prepare_inputs(state):
     config = state["config"]
     try:
-        if config.case_dir and state.get("custom_mesh_path"):
+        source = None
+        if state.get("custom_mesh_path"):
+            source = Path(state["custom_mesh_path"]).expanduser().resolve()
+            if not source.is_file():
+                raise ValueError(f"Custom mesh input is not a file: {source}")
+            # Check source access before replacing an existing owned output.
+            with source.open("rb"):
+                pass
+        if config.case_dir and source is not None:
             # Import also clears the selected output. Protect every supplied
             # source before that happens, including an additional mesh input.
-            validate_output_path(config.case_dir, source_path=state["custom_mesh_path"])
+            validate_output_path(config.case_dir, source_path=source)
         if state.get("workflow_mode") == "imported_case":
             # Keep the existing adapter's target detection and failure semantics.
-            update = prepare_imported_case(state)
+            update = prepare_imported_case(state, extra_mesh_source=source)
             if update.get("workflow_status") == "failed":
                 return update
         else:
@@ -46,15 +56,19 @@ def prepare_inputs(state):
         update["requires_hpc"] = current.get("requires_hpc")
         if update["requires_hpc"] is None:
             update["requires_hpc"] = llm_requires_hpc(current)
-        if state.get("custom_mesh_path"):
-            source = Path(state["custom_mesh_path"]).expanduser().resolve()
+        if source is not None:
             destination = case / "input" / source.name
             destination.parent.mkdir(parents=True, exist_ok=True)
-            if source != destination.resolve():
+            # Existing imported destinations were checked against the original
+            # source identity before import could replace any previous output.
+            if source != destination.resolve() and (
+                    state.get("workflow_mode") != "imported_case" or not destination.exists()):
                 shutil.copy2(source, destination)
             update["custom_mesh_path"] = str(destination)
         update["case_context"] = current.get("case_context") or build_case_context(case)
         update.update(load_case_files(update))
+        workspace = prepare_case_workspace(str(case), current.get("case_import_report_dir"))
+        update["case_input_source_dir"] = str(workspace.source_dir)
         return update
     except (OSError, ValueError) as exc:
         return {
@@ -86,7 +100,7 @@ def _prepare_generated_case_dir(config, source_path):
         return prepare_output_directory(case, overwrite=False, source_path=source_path)
 
 
-def prepare_imported_case(state: dict[str, Any]) -> dict[str, Any]:
+def prepare_imported_case(state: dict[str, Any], *, extra_mesh_source=None) -> dict[str, Any]:
     """Copy and inspect a case, then hand its context to Meshing."""
     print("<case_import>")
     config = state["config"]
@@ -97,6 +111,7 @@ def prepare_imported_case(state: dict[str, Any]) -> dict[str, Any]:
             case_subdir=state.get("case_import_subdir"),
             overwrite=config.overwrite_case_dir,
             openfoam_target=getattr(config, "openfoam_target", ""),
+            extra_mesh_source=extra_mesh_source,
         )
     except (CaseImportError, OSError) as exc:
         print(f"<case_import_error>{exc}</case_import_error>")

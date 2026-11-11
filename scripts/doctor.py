@@ -16,7 +16,7 @@ import sys
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 from config import Config
-from openfoam_target import configured_openfoam_target
+from openfoam_target import configured_openfoam_target, runtime_openfoam_target
 
 # This sibling verifier uses only the Python standard library.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -113,9 +113,12 @@ def main(argv=None) -> int:
         for package in provider_packages[extra]:
             check_package(package, extra)
 
-    expected = {"foundation-v10": {"10"}, "esi-v2006": {"2006", "v2006"}}[target]
-    report(bool(os.getenv("WM_PROJECT_DIR")) and bool(shutil.which("blockMesh")) and os.getenv("WM_PROJECT_VERSION") in expected,
-           f"OpenFOAM {target}: WM_PROJECT_VERSION={os.getenv('WM_PROJECT_VERSION', 'unset')}; source the matching etc/bashrc")
+    runtime_target = runtime_openfoam_target(cfg)
+    expected = {"foundation-v10": {"10"}, "esi-v2006": {"2006", "v2006"}}.get(runtime_target)
+    version = os.getenv("WM_PROJECT_VERSION")
+    available = bool(os.getenv("WM_PROJECT_DIR")) and bool(shutil.which("blockMesh")) and bool(version)
+    report(available and (expected is None or version in expected),
+           f"OpenFOAM {runtime_target or 'legacy ESI'}: WM_PROJECT_VERSION={version or 'unset'}; source the matching etc/bashrc")
     corpus = Path(cfg.database_path) / target
     corpus_errors = validate(target, corpus, (cfg.embedding_model,))
     report(not corpus_errors, "tutorial corpus and FAISS files" + ("; run git lfs pull and select matching model/target" if corpus_errors else ""))
