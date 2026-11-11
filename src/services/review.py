@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Any, Literal
 from pydantic import BaseModel, Field, ValidationError, model_validator
 from models import PlannedFileChange, StageOperation
-from .stage_plan import OPERATION_CONTRACT, MESH_STAGE_CONTRACT, mesh_operation_updates, replace_pending_tasks, resolve_file_tasks, script_commands, check_stage_operations
+from .stage_plan import OPERATION_CONTRACT, MESH_STAGE_CONTRACT, mesh_operation_updates, replace_pending_tasks, resolve_file_tasks, script_commands, check_stage_operations, operation_script_errors
 from .case_paths import safe_case_relative_from_text, safe_case_path
 from .case_inputs import case_input_fingerprint, format_case_inputs, canonical_input_protections
 from openfoam_target import generation_contract
@@ -50,6 +50,10 @@ class StageReviewDecision(RewritePlan):
         if isinstance(self, SolverReviewDecision) and self.operations is not None:
             if any(op.stage != "solver" for op in self.operations):
                 raise ValueError("Solver operations must belong to solver; use operation_request for mesh work")
+        if self.operations is not None:
+            errors = operation_script_errors([op.model_dump() for op in self.operations])
+            if errors:
+                raise ValueError("\n".join(errors))
         return self
 
 
@@ -76,7 +80,10 @@ REVIEWER_SYSTEM_PROMPT = (
     "unspecified numerical controls; explain the uncertainty and expected effect. "
     "Missing keywords must retain the exact spelling from "
     "the error, including punctuation. Preserve all physical conditions and parameters "
-    "specified by the user. References demonstrate compatible syntax, not replacement physics. "
+    "specified by the user. A native error saying an entry is undefined remains applicable "
+    "while that entry is absent from the effective input. Its absence does not prove the "
+    "error is stale or resolved. Check the actual input and producing source before stopping. "
+    "References demonstrate compatible syntax, not replacement physics. "
     "Separate necessary repairs from questions requiring another run and optional diagnostics. "
     "Do not assert an uncertain diagnosis as fact, add monitoring configuration "
     "as a substitute for a repair, or change a resolved setting merely to try a different approach. "

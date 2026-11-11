@@ -1,4 +1,8 @@
 """Declared stage dependencies; no inferred commands or generated defaults."""
+import json
+
+from pydantic import ValidationError
+
 from models import StageOperation
 from utils import case_file_key, resolve_case_file
 from .case_paths import safe_case_relative_from_text, safe_case_relative_path, safe_case_path
@@ -27,8 +31,12 @@ OPERATION_CONTRACT = (
     "During workflow execution the stage runner already activates the selected native "
     "OpenFOAM runtime and runs Bash from the case directory with errexit and pipefail. "
     "Use these actual execution facts when planning required shell setup. "
-    "To retain an existing execution script, copy its complete approved shell body into "
-    "the script operations, preserving unrelated content. Allrun edits require the updated "
+    "Choose one script representation per stage: either one operation containing the complete "
+    "approved script, or ordered shell fragments without shebangs. Never copy the complete "
+    "script into each individual operation. Preserve retained setup and helpers exactly once. "
+    "RunFunctions manages its own logs: do not redirect a helper to the same log it creates, "
+    "and declare distinct log suffixes for deliberately repeated helper invocations. "
+    "Allrun edits require the updated "
     "solver operation plan, including all retained shell content. "
     "Do not invent default physical conditions."
 )
@@ -43,9 +51,71 @@ MESH_STAGE_CONTRACT = (
     "physical fields in the mesh stage. Defer physical operations with stage solver and "
     "physical file tasks with stage solver for Solver Planner to reconcile after handoff. "
     "Keep mesh startup dictionaries distinct from the eventual physical configuration. "
+    "A dictionary required to start a mesh utility must have a mesh-stage bootstrap task "
+    "before execution, even when the same path also has pending solver-stage changes. "
+    "Retain those later physical instructions separately. A required startup setting is "
+    "not forbidden merely because the solver later uses it too. Never wait for Solver "
+    "Planner to supply an input that is needed to complete the earlier mesh stage. "
     "When an existing Allmesh contains deferred operations, explicitly edit it or select "
     "build_and_run for the mesh-only operations; run_existing must not retain those operations. "
 )
+
+
+def operation_script_errors(operations):
+    """A complete program has one owner; fragments may still repeat commands."""
+    errors = []
+    programs = {"mesh": [], "solver": []}
+    for raw in operations:
+        operation = StageOperation.model_validate(raw)
+        if operation.executor == "script":
+            programs[operation.stage].append(operation.command)
+    for stage in ("mesh", "solver"):
+        commands = programs[stage]
+        if len(commands) > 1 and any(command.lstrip().startswith("#!") for command in commands):
+            errors.append(f"{stage} mixes complete scripts with multiple operations. "
+                          "Declare the complete retained program once as one operation, or split "
+                          "it into ordered fragments without shebangs. Do not repeat the whole "
+                          "program under different operation purposes.")
+    return errors
+
+
+def invoke_stage_model(client, user, system, schema, *, validate=None, record=None):
+    """Keep structured output strict and allow one evidence-preserving correction."""
+    original = user
+    for attempt in range(2):
+        raw = None
+        try:
+            raw = client.invoke(user, system, pydantic_obj=schema)
+            response = schema.model_validate(raw)
+            errors = validate(response) if validate is not None else []
+            if errors:
+                raise ValueError("\n".join(errors))
+        except (ValidationError, ValueError) as error:
+            details = (error.errors(include_input=True, include_url=False)
+                       if isinstance(error, ValidationError) else str(error))
+            rejected = {
+                "schema": schema.__name__, "attempt": attempt + 1,
+                "response": raw.model_dump() if hasattr(raw, "model_dump") else raw,
+                "validation_errors": details,
+            }
+            # Validation contexts may contain exception objects, not just JSON values.
+            rejected = json.loads(json.dumps(rejected, ensure_ascii=False, default=str))
+            if record is not None:
+                record("stage_response_rejected", **rejected)
+            if attempt:
+                raise
+            user = (original + "\n<rejected_stage_response>"
+                    + json.dumps(rejected, ensure_ascii=False)
+                    + "</rejected_stage_response>\nCorrect the supplied plan or decision to satisfy "
+                      "the schema and execution dependencies. Preserve all original requirements "
+                      "and still-pending work; do not invent replacement physics or new issues. "
+                      "For a stop decision, use no file tasks, operations=null and "
+                      "operation_request=null. Return one complete corrected response.")
+            continue
+        if record is not None:
+            record("stage_response_accepted", schema=schema.__name__, attempt=attempt + 1,
+                   response=response.model_dump())
+        return response
 
 
 def mesh_operation_updates(state, operations):
@@ -61,6 +131,8 @@ def mesh_operation_updates(state, operations):
 def check_stage_operations(operations, stage, *, allow_backend=False):
     """Validate execution ownership without guessing from commands or filenames."""
     errors = []
+    errors.extend({"file": "stage_plan", "error_content": message}
+                  for message in operation_script_errors(operations))
     if stage == "solver" and not operations:
         errors.append({"file": "stage_plan", "error_content": "solver requires an ordered script operation plan."})
     for raw in operations:
@@ -121,6 +193,9 @@ def script_commands(operations):
 
 def render_stage_script(operations):
     """Render the approved shell fragments without interpreting their meaning."""
+    errors = operation_script_errors(operations)
+    if errors:
+        raise ValueError("\n".join(errors))
     commands = script_commands(operations)
     if not commands or any(not command.strip() for command in commands):
         raise ValueError('An execution script requires nonempty literal script operations.')

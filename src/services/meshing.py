@@ -10,7 +10,7 @@ import re
 import os
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from openfoam_target import database_path_for_config, generation_convention, runtime_openfoam_target
 from utils import load_case_files, run_command, run_openfoam_utility, reject_symbolic_links, case_file_key, resolve_case_file, is_processor_dir, _is_numeric_name, is_initial_time_dir
@@ -22,7 +22,7 @@ from .case_workspace import CaseWorkspace
 from .review_history import ReviewHistory
 from .plan import SubtaskModel, retrieve_mesh_reference
 from models import StageOperation
-from .stage_plan import OPERATION_CONTRACT, MESH_STAGE_CONTRACT, mesh_operation_updates, check_mesh_plan, check_stage_inputs, check_stage_script, script_commands, replace_pending_tasks, resolve_file_tasks, pending_file_creates, unwritten_file_errors, stage_outcome
+from .stage_plan import OPERATION_CONTRACT, MESH_STAGE_CONTRACT, mesh_operation_updates, check_mesh_plan, check_stage_inputs, check_stage_script, script_commands, replace_pending_tasks, resolve_file_tasks, pending_file_creates, unwritten_file_errors, stage_outcome, operation_script_errors, invoke_stage_model
 from .run_hpc import HpcWorkflowStop, hpc_execution_outputs
 from .execution_logs import archive_native_logs, declared_startup_inputs, snapshot_execution_logs, current_execution_logs, scan_execution_log, check_execution_outputs, check_diagnostic_outputs
 from .case_inputs import read_case_inputs, canonical_input_protections, _input_paths
@@ -51,10 +51,56 @@ class MeshingPlan(BaseModel):
     operations: list[StageOperation]
     final_reconstruction: FinalReconstruction | None = None
 
+    @model_validator(mode="after")
+    def validate_scripts(self):
+        errors = operation_script_errors([op.model_dump() for op in self.operations])
+        if errors:
+            raise ValueError("\n".join(errors))
+        return self
+
 
 def _unique_pending_repairs(tasks):
     """Remove stored copies of a repair, retaining distinct instructions per file."""
     return replace_pending_tasks([], tasks)
+
+
+def _resolved_mesh_tasks(state, plan):
+    previous = replace_pending_tasks(
+        (state.get('mesh_resume_state') or {}).get('pending', []),
+        (state.get('rewrite_plan') or {}).get('target_files', []))
+    return resolve_file_tasks(
+        [*(state.get('mesh_subtasks') or []), *(state.get('pending_solver_subtasks') or [])],
+        previous, [task.model_dump() for task in plan.mesh_subtasks])
+
+
+def _mesh_dependency_errors(state, plan):
+    """Reject a mesh prerequisite whose only declared producer runs after handoff."""
+    creates, changes = _resolved_mesh_tasks(state, plan)
+    planned = [(safe_case_relative_path(task['folder_name'], task['file_name']), task['stage'])
+               for task in creates]
+    planned.extend((safe_case_relative_from_text(task['file']), task['stage']) for task in changes)
+    mesh_tasks = {case_file_key(path) for path, stage in planned if stage == 'mesh'}
+    later_tasks = {case_file_key(path) for path, stage in planned if stage == 'solver'}
+    errors = []
+    for operation in plan.operations:
+        if operation.stage != 'mesh':
+            continue
+        for required in operation.required_inputs:
+            path = safe_case_relative_from_text(required.path)
+            key = case_file_key(path)
+            current = safe_case_path(state['case_dir'], str(path.parent), path.name)
+            available = resolve_case_file(current).is_file()
+            if not available and state.get('case_input_source_dir'):
+                canonical = safe_case_path(state['case_input_source_dir'], str(path.parent), path.name)
+                available = resolve_case_file(canonical).is_file()
+            if key in later_tasks and key not in mesh_tasks and not available:
+                errors.append(
+                    f'Mesh requires {path} before {operation.command}, but its only file task '
+                    'is deferred to solver after mesh handoff. This dependency cannot execute. '
+                    'Provide a separate mesh-stage startup task if the utility needs this input; '
+                    'preserve the later solver task for its final physical configuration. '
+                    'If the operation itself is physical preparation, defer that operation instead.')
+    return errors
 
 
 def plan_meshing(state):
@@ -96,7 +142,9 @@ def plan_meshing(state):
         f"<repair_plan>{state.get('rewrite_plan') or {}}</repair_plan>\n"
         f"<openfoam_target>{generation_convention(state['config'])}</openfoam_target>"
     )
-    plan = state["llm_service"].invoke(
+    history = ReviewHistory(state['case_dir'], state.get('case_import_report_dir'))
+    plan = invoke_stage_model(
+        state["llm_service"],
         prompt,
         OPERATION_CONTRACT + MESH_STAGE_CONTRACT + " Prepare the final mesh in constant/polyMesh for a single-region case, or constant/<region>/polyMesh for every active region declared by native constant/regionProperties. "
         "An unused assembly mesh at constant/polyMesh does not replace active regional meshes. "
@@ -156,18 +204,15 @@ def plan_meshing(state):
         "complete actual Allmesh shell program as a script operation, including its retained "
         "setup and helpers. For build_and_run, declare literal ordered shell fragments, "
         "including any setup, helper definitions and unrelated content that must be retained.",
-        pydantic_obj=MeshingPlan,
+        MeshingPlan,
+        validate=lambda response: _mesh_dependency_errors(state, response),
+        record=lambda event, **details: history.append(event, stage='mesh', source='meshing_planner', **details),
     )
     operation_update = mesh_operation_updates(state, [op.model_dump() for op in plan.operations])
     source = Path(plan.mesh_source).expanduser() if plan.mesh_source else None
     if source is not None and not source.is_absolute():
         source = case / source
-    old_changes = replace_pending_tasks(
-        (state.get('mesh_resume_state') or {}).get('pending', []),
-        (state.get("rewrite_plan") or {}).get("target_files", []))
-    creates, changes = resolve_file_tasks(
-        [*(state.get("mesh_subtasks") or []), *(state.get("pending_solver_subtasks") or [])],
-        old_changes, [task.model_dump() for task in plan.mesh_subtasks])
+    creates, changes = _resolved_mesh_tasks(state, plan)
     return {
         "rewrite_plan": {"target_files": changes} if changes else None,
         "pending_solver_subtasks": [t for t in creates if t['stage'] == 'solver'],

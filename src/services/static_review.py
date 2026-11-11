@@ -320,8 +320,9 @@ def review_stage_inputs(state, stage):
                       "error_logs": []}
         else:
             from .review import SolverReviewDecision, apply_stage_decision
-            from .stage_plan import OPERATION_CONTRACT
-            decision = SolverReviewDecision.model_validate(state["llm_service"].invoke(
+            from .stage_plan import OPERATION_CONTRACT, invoke_stage_model
+            decision = invoke_stage_model(
+                state["llm_service"],
                 json.dumps({"verified_findings": [f.model_dump() for f in report.errors],
                             "current_files": foamfiles.model_dump(), "operations": state["solver_operations"],
                             "actual_mesh": state.get("mesh_info"), "user_requirement": state["user_requirement"]}),
@@ -331,8 +332,9 @@ def review_stage_inputs(state, stage):
                 "explicit request when actual mesh work is necessary. Declare file stages by purpose. "
                 "Allrun changes require its complete updated operations. Use stop with no tasks when "
                 "no justified correction remains. " + OPERATION_CONTRACT,
-                pydantic_obj=SolverReviewDecision,
-            ))
+                SolverReviewDecision,
+                record=partial(history.append, stage=stage, source="static_review"),
+            )
             if decision.action == "stop":
                 return {**result, **_end_initial_review(state, stage, "no_changes")}
             repair = apply_stage_decision({**state, "error_logs": [], "repair_source": "static_review"}, stage, decision)
