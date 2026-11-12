@@ -257,6 +257,8 @@ def initial_write(
             "a reference default is never an additional user requirement. "
         )
         advice_text = ""
+        # Reference-use advice can be wrong; retain the actual evidence so the
+        # writer can reconcile it with the task, user constraints and target.
         file_reference = tutorial_reference
         if isinstance(advice, dict) and "per_file" in advice:
             file_advice = next((item for item in advice["per_file"]
@@ -264,8 +266,6 @@ def initial_write(
                                 and case_file_key(item.get("file_name", "")) == logical_name), None)
             if file_advice:
                 advice_text = f"<file_advice>{file_advice}</file_advice>\n"
-                if file_advice.get("classification") in {"present_but_unused", "write_fresh"}:
-                    file_reference = ""
         elif advice:
             advice_text = f"<similar_case_advice>{advice}</similar_case_advice>\n"
         similar_ref_block = (
