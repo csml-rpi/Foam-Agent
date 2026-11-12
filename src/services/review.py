@@ -47,9 +47,6 @@ class StageReviewDecision(RewritePlan):
         if (action != "stop" and any(path == "Allrun" for path, _ in keys)
                 and self.operations is None and isinstance(self, SolverReviewDecision)):
             raise ValueError("Editing Allrun requires its updated operation plan")
-        if isinstance(self, SolverReviewDecision) and self.operations is not None:
-            if any(op.stage != "solver" for op in self.operations):
-                raise ValueError("Solver operations must belong to solver; use operation_request for mesh work")
         if self.operations is not None:
             errors = operation_script_errors([op.model_dump() for op in self.operations])
             if errors:
@@ -61,7 +58,17 @@ class MeshReviewDecision(StageReviewDecision):
     action: Literal["continue", "stop"]
 
 
+class _SolverOperation(StageOperation):
+    stage: Literal["solver"]
+    executor: Literal["script"]
+
+
 class SolverReviewDecision(StageReviewDecision):
+    operations: Optional[List[_SolverOperation]] = Field(
+        min_length=1,
+        description="A complete replacement solver script plan, or null to retain it. "
+                    "Request mesh work through operation_request, never through these operations.",
+    )
     action: Literal["repair_solver", "repair_mesh", "stop"]
 
 
