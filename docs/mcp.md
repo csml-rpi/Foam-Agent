@@ -1,6 +1,6 @@
 # MCP Guide
 
-Foam-Agent exposes planning, file generation, execution, repair, and visualization as MCP tools. Install project dependencies, configure model credentials, and select a matching OpenFOAM runtime and corpus.
+Foam-Agent exposes planning, file generation, execution, repair, and visualization as MCP tools. Complete [local installation](usage.md#local-installation) and [authentication](usage.md#authentication) before starting the server. Select an [OpenFOAM target](usage.md#openfoam-targets-and-corpora) with its matching runtime and corpus.
 
 ## Client Setup
 
@@ -26,7 +26,7 @@ The console command defaults to stdio. To serve HTTP:
 foamagent-mcp --transport http --host 0.0.0.0 --port 7860
 ```
 
-For Docker, build the runtime image and start the server:
+For Docker, first [build the runtime image](usage.md#docker-builds):
 
 ```bash
 docker build --platform linux/amd64 -f docker/Dockerfile -t foamagent:local .
@@ -93,7 +93,8 @@ For an existing case, call `run_case` with:
 (default `careful`), `input_writer_generation_mode`, and `max_static_review_retries`
 (default `10`). These overrides apply to that invocation; individual tools use
 the server's target configuration. Standalone `input_writer` accepts the mode and
-generation override.
+generation override. See [execution modes](usage.md#execution-modes-and-static-review)
+and [existing cases](usage.md#existing-cases).
 
 All paths refer to the server's filesystem. Generated `input_writer` cases default to `runs/<case_name>/` in the repository; the Docker mount above exposes those results on the host. For `run_case`, mount its inputs and use an `output_dir` inside a mounted writable directory to retain the results.
 
@@ -112,12 +113,13 @@ To apply corrections, format error findings as `review_analysis` text and pass
 `error_logs=[]` to `apply_fixes`. Clients control review/repair rounds; standalone review is
 read-only and leaves history persistence to the client.
 
-Full `run_case` reviews mesh and solver inputs in careful mode, sharing one static
+Full `run_case` uses the [static review policy and reports](usage.md#execution-modes-and-static-review)
+for mesh and solver inputs in careful mode, sharing one static
 repair budget. It retains canonical inputs under `report/inputs/workflow-*/`.
 Writer edits and successful mesh handoffs update these sources; execution restores
 them into `work/`. Standalone `run` executes the supplied case directly.
 
-Individual tools do not execute the complete graph. `run` is local-only and executes directly, without automatic static review; there is no standalone meshing or HPC tool. Use the CLI graph for generated-case Gmsh/custom-mesh and HPC routing; use `run_case` for the imported-case graph, including automatic static review in careful mode and its configured repair limits.
+Individual tools do not execute the complete graph. `run` is local-only and executes directly, without automatic static review; there is no standalone meshing or HPC tool. Use the CLI graph for generated-case Gmsh/custom-mesh and HPC routing; use `run_case` for the imported-case graph, including automatic static review in careful mode and its configured repair limits. [HPC monitoring limits](usage.md#hpc-execution-and-monitoring) apply to that graph.
 
 Standalone `run` executes Allrun directly. Success requires zero exit, normal native
 solver completion and a result field created or rewritten during this attempt,
@@ -137,7 +139,7 @@ string-based error list and includes this context in each corresponding string.
 
 ## Claude Code Skill
 
-Cloned repositories include the `/foam` skill:
+Cloned repositories include the [`/foam` skill](../.claude/skills/foam.md):
 
 ```text
 /foam Simulate lid-driven cavity flow at Re=1000
