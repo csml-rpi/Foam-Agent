@@ -1,10 +1,15 @@
+from logger import print
 import os
-import re
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Any, List
 
-from utils import check_foam_errors, remove_numeric_folders, run_command
+from utils import is_initial_time_dir, _is_numeric_name, run_command, is_processor_dir
+from .solver_execution import check_solver_execution, snapshot_result_fields
+from .execution_logs import archive_native_logs, snapshot_execution_logs, current_execution_logs, check_execution_outputs
+from .case_inputs import is_declared_input
+from .case_paths import safe_case_path
 
 
 def run_allrun_and_collect_errors(
@@ -13,6 +18,7 @@ def run_allrun_and_collect_errors(
     max_retries: int = 1,
     *,
     openfoam_target: str = "",
+    protected_inputs=(),
 ) -> List[Any]:
     """
     Execute the Allrun script and collect any error logs from the simulation.
@@ -38,14 +44,14 @@ def run_allrun_and_collect_errors(
         >>> errors = run_allrun_and_collect_errors(
         ...     case_dir="/path/to/case",
         ...     timeout=1800,
-        ...     max_retries=2
+        ...     max_retries=2,
         ... )
         >>> if not errors:
         ...     print("Simulation completed successfully")
         >>> else:
         ...     print(f"Found {len(errors)} errors")
     """
-    allrun_file_path = os.path.join(case_dir, "Allrun")
+    allrun_file_path = str(Path(case_dir).resolve() / "Allrun")
     if not os.path.isfile(allrun_file_path):
         return [
             {
@@ -56,7 +62,10 @@ def run_allrun_and_collect_errors(
     
     out_file = os.path.join(case_dir, "Allrun.out")
     err_file = os.path.join(case_dir, "Allrun.err")
-    _cleanup_run_artifacts(case_dir)
+    conflicts = check_execution_outputs(["Allrun.out", "Allrun.err"], protected_inputs)
+    if conflicts:
+        return conflicts
+    _cleanup_run_artifacts(case_dir, protected_inputs=protected_inputs)
 
     last_error_logs: List[Any] = []
     for attempt in range(1, max_retries + 1):
@@ -66,20 +75,27 @@ def run_allrun_and_collect_errors(
             if openfoam_target
             else {}
         )
+        fields_before = snapshot_result_fields(case_dir)
+        logs_before = snapshot_execution_logs(case_dir)
+        jobs = safe_case_path(case_dir, '.foamagent', 'solver-native-jobs')
+        jobs.mkdir(parents=True, exist_ok=True)
+        job_info_dir = tempfile.mkdtemp(prefix='attempt-', dir=jobs)
         command_result = run_command(
             allrun_file_path,
             out_file,
             err_file,
             case_dir,
             timeout,
+            fail_fast=True,
+            job_info_dir=job_info_dir,
             **command_kwargs,
         )
 
         error_logs: List[Any] = []
-        timed_out = bool(_result_field(command_result, "timed_out", False))
-        returncode = _result_field(command_result, "returncode", 0)
+        timed_out = command_result["timed_out"]
+        returncode = command_result["returncode"]
         if timed_out:
-            output = _execution_output(case_dir)
+            output = _execution_output(case_dir, logs_before)
             error_logs.append(
                 {
                     "file": "Allrun",
@@ -87,8 +103,8 @@ def run_allrun_and_collect_errors(
                     "diagnostic_context": output,
                 }
             )
-        elif returncode not in (None, 0):
-            output = _execution_output(case_dir)
+        elif returncode != 0:
+            output = _execution_output(case_dir, logs_before)
             error_logs.append(
                 {
                     "file": "Allrun",
@@ -97,7 +113,10 @@ def run_allrun_and_collect_errors(
                 }
             )
 
-        error_logs.extend(check_foam_errors(case_dir))
+        error_logs.extend(check_solver_execution(
+            case_dir, fields_before=fields_before, logs_before=logs_before,
+            protected_inputs=protected_inputs, openfoam_target=openfoam_target, timeout=timeout,
+            job_info_dir=job_info_dir))
         error_logs = _deduplicate_errors(error_logs)
         if not error_logs:
             return []
@@ -105,16 +124,9 @@ def run_allrun_and_collect_errors(
         last_error_logs = error_logs
         if attempt < max_retries:
             print("Allrun reported errors; retrying after cleanup...")
-            _cleanup_run_artifacts(case_dir)
+            _cleanup_run_artifacts(case_dir, protected_inputs=protected_inputs)
 
     return last_error_logs
-
-
-def _result_field(result: Any, name: str, default: Any = None) -> Any:
-    """Read a run result while remaining compatible with older monkeypatches."""
-    if isinstance(result, dict):
-        return result.get(name, default)
-    return getattr(result, name, default)
 
 
 def _deduplicate_errors(errors: List[Any]) -> List[Any]:
@@ -131,43 +143,45 @@ def _deduplicate_errors(errors: List[Any]) -> List[Any]:
     return deduplicated
 
 
-def _cleanup_run_artifacts(case_dir: str) -> None:
-    """Remove disposable outputs before retrying a newly generated case."""
+def _cleanup_run_artifacts(case_dir: str, *, protected_inputs=()) -> None:
+    """Remove disposable solver outputs before a fresh execution attempt."""
     root = Path(case_dir)
+    archive_native_logs(root, protected_inputs=protected_inputs)
     try:
         entries = list(root.iterdir())
     except OSError:
         return
     for entry in entries:
+        if is_declared_input(entry.name, protected_inputs):
+            continue
         try:
             if entry.is_symlink():
-                if entry.name.startswith("log") or entry.name in {"Allrun.out", "Allrun.err"}:
+                if entry.name in {"Allrun.out", "Allrun.err"} or _is_numeric_name(entry.name) and not is_initial_time_dir(entry.name):
                     entry.unlink()
                 continue
             if entry.is_file() and (
-                entry.name.startswith("log")
-                or entry.name in {"Allrun.out", "Allrun.err"}
+                entry.name in {"Allrun.out", "Allrun.err"}
             ):
                 entry.unlink()
             elif entry.is_dir() and (
-                re.fullmatch(r"processor\d+", entry.name)
+                is_processor_dir(entry.name)
                 or entry.name in {"postProcessing", "VTK"}
+                or _is_numeric_name(entry.name) and not is_initial_time_dir(entry.name)
             ):
                 shutil.rmtree(entry)
         except OSError as exc:
             raise RuntimeError(f"Unable to clean prior run artifact {entry}: {exc}") from exc
-    remove_numeric_folders(case_dir)
 
 
-def _execution_output(case_dir: str) -> str:
+def _execution_output(case_dir: str, logs_before: dict) -> str:
     """Return recent process output as diagnostic context for the Reviewer."""
     root = Path(case_dir)
     command_logs = sorted(
-        (path for path in root.glob("log*") if path.is_file() and not path.is_symlink()),
+        current_execution_logs(root, logs_before, include_unverified=True),
         key=lambda path: path.stat().st_mtime_ns,
         reverse=True,
     )[:3]
-    paths = [root / "Allrun.err", root / "Allrun.out", *command_logs]
+    paths = command_logs
     excerpts: List[str] = []
     remaining = 32_000
     for path in paths:

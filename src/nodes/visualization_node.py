@@ -1,7 +1,9 @@
 # visualization_node.py
 """Thin LangGraph adapter for visualization."""
+from logger import print
 
 from services.visualization import visualize_case
+from services.execution_logs import declared_startup_inputs
 
 def visualization_node(state):
     """Delegate visualization work and merge its result into graph state."""
@@ -11,7 +13,13 @@ def visualization_node(state):
             state.get("case_dir"),
             state.get("user_requirement", ""),
             llm_service=state.get("llm_service"),
+            config=state.get('config'),
             max_loop=getattr(state.get("config"), "max_loop", 2),
+            protected_inputs=declared_startup_inputs([
+                *state.get('mesh_operations', []), *state.get('solver_operations', []),
+                *state.get('pending_solver_operations', []),
+            ]),
+            source_input_dir=state.get('case_input_source_dir'),
         )
     except Exception as exc:
         result = {"pyvista_visualization": {"success": False, "error": str(exc)}}

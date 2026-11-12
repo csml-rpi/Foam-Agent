@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import hashlib
 import json
-import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
@@ -10,34 +8,28 @@ import stat
 import tempfile
 from typing import Any, Optional
 import zipfile
+import zlib
 
 from models import CaseImportError, CaseManifest
 from openfoam_target import ESI_V2006, FOUNDATION_V10, normalise_openfoam_target
+from utils import _is_numeric_name
 from .output_safety import (
     OutputDirectorySafetyError,
     prepare_output_directory,
+    validate_output_preparation,
 )
+from .solver_execution import application_entry, application_executable, application_requires_native
 
 
-_APPLICATION_RE = re.compile(r"\bapplication\s+([^\s;]+)\s*;")
 _VERSION_RE = re.compile(r"\bVersion\s*:\s*([vV]?\d+(?:\.\d+)?)")
-_TIME_DIRECTORY_RE = re.compile(
-    r"^[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?$"
-)
 
 
 def _read_text(path: Path, *, limit: Optional[int] = None) -> str:
+    from utils import read_case_text
     try:
-        with path.open("rb") as handle:
-            data = handle.read(limit) if limit is not None else handle.read()
-        return data.decode("utf-8", errors="replace")
-    except OSError:
+        return read_case_text(path, errors="replace", limit=limit)
+    except (OSError, EOFError, zlib.error):
         return ""
-
-
-def _strip_comments(content: str) -> str:
-    without_blocks = re.sub(r"/\*.*?\*/", "", content, flags=re.DOTALL)
-    return re.sub(r"//.*$", "", without_blocks, flags=re.MULTILINE)
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -53,7 +45,7 @@ def _safe_zip_member(entry: zipfile.ZipInfo) -> Optional[PurePosixPath]:
     name = entry.filename.replace("\\", "/")
     if stat.S_ISLNK(entry.external_attr >> 16):
         raise CaseImportError(f"ZIP symbolic links are not supported: {entry.filename!r}")
-    if not name or name.endswith("/"):
+    if not name:
         return None
     relative = PurePosixPath(name)
     if relative.is_absolute() or ".." in relative.parts:
@@ -91,6 +83,9 @@ def _extract_zip(archive: Path, destination: Path) -> None:
                 if relative is None:
                     continue
                 target = destination.joinpath(*relative.parts)
+                if entry.filename.replace("\\", "/").endswith("/"):
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with zip_file.open(entry) as source, target.open("wb") as output:
                     while True:
@@ -107,6 +102,11 @@ def _extract_zip(archive: Path, destination: Path) -> None:
                                 "during extraction."
                             )
                         output.write(chunk)
+                mode = entry.external_attr >> 16
+                if entry.create_system == 3 and (
+                    stat.S_ISREG(mode) or (stat.S_IFMT(mode) == 0 and mode & 0o777)
+                ):
+                    target.chmod(mode & 0o777)
     except zipfile.BadZipFile as exc:
         raise CaseImportError(f"Invalid ZIP archive: {archive}") from exc
 
@@ -135,8 +135,9 @@ def _reject_source_symlinks(source: Path) -> None:
 
 def _candidate_cases(root: Path) -> list[str]:
     candidates: list[str] = []
-    for control_dict in root.rglob("controlDict"):
-        if control_dict.parent.name != "system" or not control_dict.is_file():
+    for control_dict in [*root.rglob("controlDict"), *root.rglob("controlDict.gz")]:
+        if (".foamagent" in control_dict.relative_to(root).parts
+                or control_dict.parent.name != "system" or not control_dict.is_file()):
             continue
         case_root = control_dict.parent.parent
         candidates.append(case_root.relative_to(root).as_posix())
@@ -165,37 +166,46 @@ def _select_case_root(
             + ", ".join(candidates)
         )
 
-    children = [path for path in root.iterdir() if path.is_dir()]
-    selected = children[0] if len(children) == 1 else root
-    return selected, candidates, issues
+    return root, candidates, issues
 
 
-def _case_evidence(case_root: Path) -> str:
+def _case_headers(case_root: Path) -> list[str]:
+    from utils import resolve_case_file
     paths = [case_root / "system" / "controlDict"]
     for name in ("blockMeshDict", "fvSchemes", "fvSolution"):
         paths.append(case_root / "system" / name)
-    return "\n".join(_read_text(path, limit=256_000) for path in paths if path.is_file())
+    headers = []
+    for path in paths:
+        if not resolve_case_file(path).is_file():
+            continue
+        leading = re.match(r"\s*/\*(.*?)\*/", _read_text(path, limit=256_000), re.DOTALL)
+        if leading and "OpenFOAM:" in leading[1]:
+            headers.append(leading[1])
+    return headers
 
 
 def _detect_platform(case_root: Path) -> tuple[str, Optional[str]]:
-    text = _case_evidence(case_root)
-    match = _VERSION_RE.search(text)
-    version = match.group(1) if match else None
-    lowered = text.lower()
-    if "openfoam.com" in lowered:
+    facts = []
+    for header in _case_headers(case_root):
+        match = _VERSION_RE.search(header)
+        version = match.group(1) if match else None
+        lowered = header.lower()
+        for domain, family in (('openfoam.com', 'esi'), ('openfoam.org', 'foundation')):
+            if domain in lowered:
+                facts.append((family, version))
+    families = {family for family, _ in facts}
+    versions = {version.lstrip('vV') for _, version in facts if version}
+    if len(families) > 1 or len(versions) > 1:
+        return "conflicting-platforms", None
+    if facts:
+        family = next(iter(families))
+        version = next((version for _, version in facts if version), None)
         if not version:
-            return "esi-unknown-version", None
-        if version and version.lstrip("vV") == "2006":
-            return ESI_V2006, version
-        return "esi-other", version
-    if "openfoam.org" in lowered:
-        if not version:
-            return "foundation-unknown-version", None
-        if version and version.lstrip("vV") == "10":
-            return FOUNDATION_V10, version
-        return "foundation-other", version
+            return f'{family}-unknown-version', None
+        supported, target = ('2006', ESI_V2006) if family == 'esi' else ('10', FOUNDATION_V10)
+        return (target if version.lstrip('vV') == supported else f'{family}-other'), version
     # Dictionary names alone do not identify a distribution or release.
-    return "unknown", version
+    return "unknown", None
 
 
 def _resolve_platform(
@@ -225,21 +235,19 @@ def _resolve_platform(
 
 
 def _application(case_root: Path) -> Optional[str]:
-    content = _strip_comments(_read_text(case_root / "system" / "controlDict"))
-    match = _APPLICATION_RE.search(content)
-    return match.group(1) if match else None
-
-
-def _mesh_state(case_root: Path) -> str:
-    if (case_root / "constant" / "polyMesh").is_dir():
-        return "existing-polyMesh"
-    if (case_root / "system" / "blockMeshDict").is_file():
-        return "blockMesh"
-    return "missing"
+    try:
+        content = _read_text(case_root / "system" / "controlDict")
+        if application_requires_native(content):
+            return None
+        entry = application_entry(content)
+        return application_executable(entry[1]) if entry is not None else None
+    except ValueError:
+        return None  # Discovery records only established literal facts.
 
 
 def _discovery_issues(case_root: Path) -> list[str]:
     """Describe incomplete or unreadable case inputs for Planner/Reviewer."""
+    from utils import resolve_case_file
     issues: list[str] = []
     required = [
         case_root / "system" / "controlDict",
@@ -247,6 +255,7 @@ def _discovery_issues(case_root: Path) -> list[str]:
         case_root / "system" / "fvSolution",
     ]
     for path in required:
+        path = resolve_case_file(path)
         if not path.is_file():
             issues.append(f"Missing {path.relative_to(case_root).as_posix()}.")
             continue
@@ -256,43 +265,16 @@ def _discovery_issues(case_root: Path) -> list[str]:
             issues.append(
                 f"Cannot read {path.relative_to(case_root).as_posix()}: {exc}"
             )
-    if (case_root / "system" / "controlDict").is_file() and not _application(case_root):
-        issues.append("system/controlDict does not declare an application solver.")
+    if resolve_case_file(case_root / "system" / "controlDict").is_file() and not _application(case_root):
+        issues.append("system/controlDict application could not be established during import.")
     if not (case_root / "Allrun").is_file():
         issues.append("Missing Allrun.")
-    if _mesh_state(case_root) == "missing":
-        issues.append("No existing polyMesh or system/blockMeshDict was found.")
     if case_root.is_dir() and not any(
-        path.is_dir() and _TIME_DIRECTORY_RE.fullmatch(path.name)
+        path.is_dir() and _is_numeric_name(path.name)
         for path in case_root.iterdir()
     ):
         issues.append("No initial or restart time directory was found.")
     return issues
-
-
-def snapshot_files(root: str | Path, *, exclude_runtime: bool = False) -> dict[str, str]:
-    root = Path(root)
-    snapshot: dict[str, str] = {}
-    if not root.is_dir():
-        return snapshot
-    if exclude_runtime:
-        from utils import is_solver_output_dir
-        paths = []
-        for directory, names, files in os.walk(root, followlinks=False):
-            if Path(directory) == root:
-                names[:] = [name for name in names if not is_solver_output_dir(name)]
-            paths.extend(Path(directory) / name for name in files)
-    else:
-        paths = root.rglob("*")
-    for path in sorted(paths):
-        if path.is_file() and not path.is_symlink():
-            try:
-                snapshot[path.relative_to(root).as_posix()] = hashlib.sha256(
-                    path.read_bytes()
-                ).hexdigest()
-            except OSError:
-                continue
-    return snapshot
 
 
 def _make_read_only(root: Path) -> None:
@@ -320,6 +302,7 @@ def build_case_context(
     *,
     manifest: Optional[CaseManifest] = None,
 ) -> dict[str, Any]:
+    from utils import is_initial_time_dir, resolve_case_file
     root = Path(case_dir)
     files = sorted(
         path.relative_to(root).as_posix()
@@ -329,7 +312,7 @@ def build_case_context(
     time_directories = sorted(
         path.name
         for path in root.iterdir()
-        if path.is_dir() and _TIME_DIRECTORY_RE.fullmatch(path.name)
+        if path.is_dir() and _is_numeric_name(path.name)
     ) if root.is_dir() else []
     platform, version = _detect_platform(root)
     application = _application(root)
@@ -340,11 +323,10 @@ def build_case_context(
         "version": version or (manifest.version if manifest else None),
         "application": application or (manifest.application if manifest else None),
         "files": files,
-        "has_control_dict": (root / "system" / "controlDict").is_file(),
+        "has_control_dict": resolve_case_file(root / "system" / "controlDict").is_file(),
         "has_allrun": (root / "Allrun").is_file(),
-        "mesh_state": _mesh_state(root),
         "time_directories": time_directories,
-        "has_existing_results": any(name not in {"0", "0.0"} for name in time_directories)
+        "has_existing_results": any(not is_initial_time_dir(name) for name in time_directories)
         or (root / "postProcessing").exists(),
         "candidate_cases": list(manifest.candidate_cases) if manifest else [],
         "issues": [
@@ -361,6 +343,7 @@ def import_case(
     case_subdir: Optional[str] = None,
     overwrite: bool = False,
     openfoam_target: str = "",
+    extra_mesh_source: str | Path | None = None,
 ) -> CaseManifest:
     """Copy an existing case into immutable ``original`` and mutable ``work`` trees."""
     source_input = Path(case_path).expanduser()
@@ -374,7 +357,7 @@ def import_case(
         raise CaseImportError("--case_path must reference a directory or ZIP archive.")
     _reject_source_symlinks(source)
     try:
-        output_root = prepare_output_directory(
+        output_root = validate_output_preparation(
             output_dir,
             overwrite=overwrite,
             source_path=source,
@@ -386,6 +369,20 @@ def import_case(
         staging = Path(temporary) / "source"
         _copy_source(source, staging)
         selected, candidates, selection_issues = _select_case_root(staging, case_subdir)
+        if extra_mesh_source is not None:
+            extra = Path(extra_mesh_source).expanduser().resolve()
+            destination = selected / "input" / extra.name
+            original_destination = source / selected.relative_to(staging) / "input" / extra.name
+            parent_conflict = destination.parent.exists() and not destination.parent.is_dir()
+            if (parent_conflict
+                    or destination.exists() and not (
+                        source.is_dir() and original_destination.is_file()
+                        and extra.samefile(original_destination))):
+                conflict = destination.parent if parent_conflict else destination
+                raise CaseImportError(
+                    f"Additional mesh input {extra} conflicts with imported case input "
+                    f"{conflict.relative_to(selected)} from {source}. Use distinct source paths."
+                )
         detected, version = _detect_platform(selected)
         if selected == staging and candidates:
             detected_candidates = [
@@ -399,6 +396,15 @@ def import_case(
                 version = versions.pop() if len(versions) == 1 else None
         platform, platform_issues = _resolve_platform(detected, openfoam_target)
 
+        # ZIP metadata can remove read access after extracting readable archive bytes.
+        for path in selected.rglob("*"):
+            if path.is_file():
+                with path.open("rb"):
+                    pass
+
+        output_root = prepare_output_directory(
+            output_root, overwrite=overwrite, source_path=source,
+        )
         original = output_root / "original"
         work = output_root / "work"
         report = output_root / "report"
@@ -414,7 +420,6 @@ def import_case(
         version=version,
         application=_application(original),
         allrun_provided=(original / "Allrun").is_file(),
-        mesh_state=_mesh_state(original),
         candidate_cases=[] if case_subdir else candidates,
         issues=[*selection_issues, *platform_issues],
         target_mismatch=any(

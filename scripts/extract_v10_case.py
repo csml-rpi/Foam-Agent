@@ -9,13 +9,17 @@ without invoking an LLM.
 from __future__ import annotations
 
 import argparse
+import gzip
 import os
 import re
-import shutil
 import sys
-from pathlib import Path
+import tempfile
+from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "src"))
+from services.output_safety import validate_output_path
+
 _ENV_DB = os.environ.get("FOAMAGENT_DB_PATH")
 DEFAULT_DB = Path(_ENV_DB) if _ENV_DB else (ROOT / "database" / "foundation-v10" / "raw" / "openfoam_tutorials_details.txt")
 
@@ -40,37 +44,49 @@ def extract_case(
 
   Returns the parsed <index> metadata for the matched case.
   """
-  output_dir = Path(output_dir).resolve()
-  db_path = Path(db_path)
+  db_path = Path(db_path).expanduser().resolve()
 
   if not db_path.is_file():
     raise FileNotFoundError(f"Database not found: {db_path}")
 
+  output_dir = validate_output_path(output_dir, source_path=db_path)
   if output_dir.exists():
-    if overwrite:
-      shutil.rmtree(output_dir)
-    else:
+    if not output_dir.is_dir():
+      raise NotADirectoryError(f"Output is not a directory: {output_dir}")
+    if not overwrite:
       raise FileExistsError(
         f"Output directory already exists: {output_dir} (use --overwrite)"
       )
 
-  metadata = _stream_extract(
-    db_path=db_path,
-    output_dir=output_dir,
-    case_name=case_name,
-    solver=solver,
-    domain=domain,
-    category=category,
-  )
-  if metadata is None:
-    filters = [f"name={case_name!r}"]
-    if solver:
-      filters.append(f"solver={solver!r}")
-    if domain:
-      filters.append(f"domain={domain!r}")
-    if category:
-      filters.append(f"category={category!r}")
-    raise LookupError("No matching case found in database (" + ", ".join(filters) + ")")
+  output_dir.parent.mkdir(parents=True, exist_ok=True)
+  with tempfile.TemporaryDirectory(prefix=".foamagent-extract-", dir=output_dir.parent) as temporary:
+    staging = Path(temporary) / "case"
+    metadata = _stream_extract(
+      db_path=db_path,
+      output_dir=staging,
+      case_name=case_name,
+      solver=solver,
+      domain=domain,
+      category=category,
+    )
+    if metadata is None:
+      filters = [f"name={case_name!r}"]
+      if solver:
+        filters.append(f"solver={solver!r}")
+      if domain:
+        filters.append(f"domain={domain!r}")
+      if category:
+        filters.append(f"category={category!r}")
+      raise LookupError("No matching complete case found in database (" + ", ".join(filters) + ")")
+    backup = Path(temporary) / "previous"
+    if output_dir.exists():
+      output_dir.rename(backup)
+    try:
+      staging.rename(output_dir)
+    except OSError:
+      if backup.exists():
+        backup.rename(output_dir)
+      raise
 
   return metadata
 
@@ -131,11 +147,20 @@ def _stream_extract(
       current_file = None
       current_lines = []
       return
-    dest = output_dir / current_folder
+    folder = PurePosixPath(current_folder.replace("\\", "/"))
+    filename = PurePosixPath(current_file.replace("\\", "/"))
+    if (folder.is_absolute() or ".." in folder.parts
+        or folder.parts and folder.parts[0].endswith(":")
+        or filename.is_absolute() or len(filename.parts) != 1
+        or filename.name == ".." or filename.name.endswith(":")):
+      raise ValueError(f"Unsafe tutorial file path: {current_folder!r}/{current_file!r}")
+    dest = output_dir.joinpath(*folder.parts)
     dest.mkdir(parents=True, exist_ok=True)
-    path = dest / current_file
+    path = dest / filename.name
     body = "".join(current_lines).strip()
-    path.write_text(body + ("\n" if body else ""), encoding="utf-8")
+    opener = gzip.open if path.suffix == '.gz' else open
+    with opener(path, 'wt', encoding='utf-8') as stream:
+      stream.write(body + ("\n" if body else ""))
     print(f"  [+] {current_folder}/{current_file}")
     files_written += 1
     current_file = None
@@ -146,6 +171,8 @@ def _stream_extract(
       stripped = line.strip()
 
       if stripped == "<case_begin>":
+        if target:
+          raise ValueError("Matched case is missing its closing case marker")
         in_case = True
         in_index = False
         in_directory_structure = False
@@ -164,7 +191,8 @@ def _stream_extract(
 
       if stripped == "</case_end>":
         if target:
-          _flush_file()
+          if current_file is not None:
+            raise ValueError("Matched case contains an unterminated file content block")
           if files_written == 0:
             raise RuntimeError("Matched case block contained no files")
           return index
@@ -223,22 +251,25 @@ def _stream_extract(
 
       # Target case: extract files under <tutorials>
       if stripped.startswith("<directory_begin>directory name:"):
-        _flush_file()
+        if current_file is not None:
+          raise ValueError("Matched case contains an unterminated file content block")
         current_folder = stripped.split("directory name:", 1)[1].strip()
         continue
 
       if stripped.startswith("<file_begin>file name:"):
-        _flush_file()
+        if current_file is not None:
+          raise ValueError("Matched case contains an unterminated file content block")
         current_file = stripped.split("file name:", 1)[1].strip()
         current_lines = []
         continue
 
-      if stripped == "</file_content>":
-        _flush_file()
-        continue
-
-      if current_file is not None and stripped != "<file_content>":
-        current_lines.append(line)
+      if current_file is not None:
+        if stripped.startswith("<file_content>"):
+          line = line.partition("<file_content>")[2]
+        content, closing, _ = line.partition("</file_content>")
+        current_lines.append(content)
+        if closing:
+          _flush_file()
 
   return None
 
@@ -312,7 +343,7 @@ def main() -> int:
       category=category,
       overwrite=args.overwrite,
     )
-  except (FileNotFoundError, LookupError, FileExistsError) as exc:
+  except (FileNotFoundError, LookupError, FileExistsError, ValueError) as exc:
     print(f"[X] {exc}", file=sys.stderr)
     return 1
 

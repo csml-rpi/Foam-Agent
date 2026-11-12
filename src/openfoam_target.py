@@ -200,4 +200,10 @@ def generation_contract(openfoam_fork: str) -> str:
             "Keep all generated files internally consistent with that configured fork and do not mix conventions from another fork.",
         ]
 
+    constraints.append(
+        "When a supplied tutorial matches this target and selected solver, preserve its "
+        "applicable dictionary structure and value notation while adapting requested physical "
+        "values. Do not replace native tutorial syntax based only on memory; use the actual "
+        "runtime parser errors to establish needed corrections."
+    )
     return "\n".join(f"- {constraint}" for constraint in constraints)

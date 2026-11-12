@@ -1,3 +1,4 @@
+from logger import print
 import os
 import json
 import sys
@@ -5,8 +6,10 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from pydantic import BaseModel, Field
-from utils import save_file
-from . import global_llm_service
+from utils import save_file, reject_symbolic_links, run_owned_process, resolve_case_file
+from . import get_llm_service
+from .case_paths import safe_case_path
+from .execution_logs import check_execution_outputs
 
 
 def ensure_foam_file(case_dir: str) -> str:
@@ -33,6 +36,7 @@ def ensure_foam_file(case_dir: str) -> str:
     case_dir = os.path.abspath(case_dir)
     foam = f"{os.path.basename(case_dir)}.foam"
     foam_path = os.path.join(case_dir, foam)
+    reject_symbolic_links(foam_path)
     
     # Create or update the .foam file
     if not os.path.exists(foam_path):
@@ -49,9 +53,11 @@ def run_pyvista_script(
     case_dir: str,
     script: str,
     *,
-    filename: str = "visualization.py",
+    filename: str = ".foamagent/visualization.py",
     expected_pngs: List[str],
     timeout_s: int = 180,
+    protected_inputs=(),
+    source_input_dir: str | None = None,
 ) -> Tuple[bool, str, List[str]]:
     """Run a generated visualization script deterministically.
 
@@ -61,56 +67,64 @@ def run_pyvista_script(
       - Apply a timeout so headless/VTK hangs don't block forever.
     """
     case_dir = os.path.abspath(case_dir)
-    script_path = os.path.join(case_dir, filename)
-    save_file(script_path, script)
+    case_root = Path(case_dir)
 
-    expected_paths = []
-    if not expected_pngs or len(set(expected_pngs)) != len(expected_pngs):
-        return False, "", ["Specify a nonempty list of unique PNG output paths."]
-    for expected_png in expected_pngs:
-        if not expected_png or Path(expected_png).suffix.lower() != ".png":
-            return False, "", [f"Expected a PNG output path: {expected_png}"]
-        case_root = Path(case_dir).resolve()
-        requested_path = case_root / expected_png
-        expected_path = requested_path.resolve()
+    def output_path(name):
+        requested_path = case_root / name
+        reject_symbolic_links(requested_path)
+        path = requested_path.resolve()
         try:
-            expected_path.relative_to(case_root)
-        except ValueError:
-            return False, "", [
-                "Expected visualization artifact must remain inside the case directory",
-                f"expected_png={expected_png}",
-            ]
-        if requested_path.is_symlink():
-            return False, "", [
-                "Expected visualization artifact must not be a symbolic link",
-                f"expected_png={requested_path}",
-            ]
-        if expected_path.exists():
-            if expected_path.is_dir():
-                return False, "", [
-                    "Expected visualization artifact is an existing directory",
-                    f"expected_png={expected_path}",
-                ]
-            if not expected_path.is_file():
-                return False, "", [
-                    "Expected visualization artifact is not a regular file",
-                    f"expected_png={expected_path}",
-                ]
-            expected_path.unlink()
-        expected_paths.append(str(expected_path))
+            path.relative_to(case_root.resolve())
+        except ValueError as exc:
+            raise ValueError(f"Visualization output must remain inside the case directory: {name}") from exc
+        if path.exists() and not path.is_file():
+            raise ValueError(f"Visualization output is not a regular file: {name}")
+        relative = path.relative_to(case_root.resolve())
+        conflicts = check_execution_outputs([relative.as_posix()], protected_inputs)
+        if conflicts:
+            raise ValueError(conflicts[0]['error_content'])
+        if source_input_dir:
+            source = safe_case_path(source_input_dir, str(relative.parent), relative.name)
+            if resolve_case_file(source).exists():
+                raise ValueError(f"Visualization output conflicts with canonical input: {relative}")
+        return str(path)
 
     try:
-        subprocess.run(
-            [sys.executable, script_path],
+        if not expected_pngs:
+            raise ValueError("Specify a nonempty list of unique PNG output paths.")
+        script_path = output_path(filename)
+        expected_paths = []
+        for name in expected_pngs:
+            if not name or Path(name).suffix.lower() != ".png":
+                raise ValueError(f"Expected a PNG output path: {name}")
+            expected_paths.append(output_path(name))
+        all_outputs = [script_path, *expected_paths]
+        if len(set(all_outputs)) != len(all_outputs):
+            raise ValueError("Visualization output paths must identify unique targets.")
+    except (OSError, ValueError) as exc:
+        return False, "", [str(exc)]
+
+    save_file(script_path, script)
+    for path in expected_paths:
+        if Path(path).exists():
+            Path(path).unlink()
+
+    try:
+        run_owned_process(
+            [sys.executable, '-c',
+             'import os, runpy, sys; sys.path.insert(0, os.path.dirname(sys.argv[1])); '
+             'runpy.run_path(sys.argv[1], run_name="__main__")', script_path],
             cwd=case_dir,
             check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
             timeout=timeout_s,
         )
 
         for expected_png_abs in expected_paths:
-            if not os.path.isfile(expected_png_abs) or os.path.islink(expected_png_abs):
+            try:
+                output_path(expected_png_abs)
+            except (OSError, ValueError) as exc:
+                return False, "", [str(exc)]
+            if not os.path.isfile(expected_png_abs):
                 return False, "", [f"Visualization did not create the expected PNG: {expected_png_abs}"]
             from PIL import Image
             try:
@@ -172,6 +186,9 @@ def visualize_case(
     max_loop: int = 2,
     llm_service: Optional[Any] = None,
     timeout_s: int = 180,
+    config: Optional[Any] = None,
+    protected_inputs=(),
+    source_input_dir: str | None = None,
 ) -> Dict[str, Any]:
     """Generate requested plots and retry execution or requirement-review failures."""
     if not case_dir:
@@ -181,11 +198,10 @@ def visualize_case(
         return _visualization_failure(case_dir=case_dir, error_message=f"Case directory does not exist: {case_dir}")
 
     foam_file = ensure_foam_file(case_dir)
-    llm_client = llm_service if llm_service is not None else global_llm_service
+    llm_client = get_llm_service(llm_service, config)
     error_logs: List[str] = []
     previous_script = ""
     previous_plots = []
-    case_files = [str(path.relative_to(case_dir)) for path in sorted(Path(case_dir).rglob("*")) if path.is_file()]
     system_prompt = (
         "Generate a complete off-screen PyVista script and an output plot manifest for the user's "
         "OpenFOAM visualization requirements. Inspect actual fields and time values at runtime. "
@@ -205,7 +221,6 @@ def visualize_case(
             "case_directory": case_dir,
             "foam_file": foam_file,
             "user_requirement": user_requirement,
-            "case_files": case_files,
             "previous_script": previous_script,
             "previous_plots": previous_plots,
             "feedback": error_logs,
@@ -216,8 +231,9 @@ def visualize_case(
         previous_plots = [plot.model_dump() for plot in proposal.plots]
         output_names = [plot.output_png for plot in proposal.plots]
         success, _, errors = run_pyvista_script(
-            case_dir, proposal.script, filename="visualization.py",
+            case_dir, proposal.script,
             expected_pngs=output_names, timeout_s=timeout_s,
+            protected_inputs=protected_inputs, source_input_dir=source_input_dir,
         )
         if not success:
             error_logs.extend(errors)

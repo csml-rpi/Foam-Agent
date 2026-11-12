@@ -16,7 +16,6 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -26,18 +25,12 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from translation.esi_translator import ESITranslator  # noqa: E402
+from services.solver_execution import read_case_application  # noqa: E402
 from extract_v10_case import _PRESETS, extract_case  # noqa: E402
 
 
-def _read_application(case_dir: Path) -> str:
-  control = case_dir / "system" / "controlDict"
-  if not control.is_file():
-    raise FileNotFoundError(f"Missing {control}")
-  text = control.read_text(encoding="utf-8", errors="ignore")
-  match = re.search(r"application\s+(\w+)\s*;", text)
-  if not match:
-    raise ValueError(f"Could not parse application from {control}")
-  return match.group(1)
+def _read_application(case_dir: Path, *, timeout: int = 600) -> str:
+  return read_case_application(str(case_dir), timeout=timeout)
 
 
 def _run_openfoam(case_dir: Path, application: str, timeout: int) -> None:
@@ -154,15 +147,16 @@ def main() -> int:
 
   if args.run:
     try:
-      application = _read_application(case_dir)
+      application = _read_application(case_dir, timeout=args.timeout)
       _run_openfoam(case_dir, application, timeout=args.timeout)
     except subprocess.CalledProcessError as exc:
-      print(f"[X] OpenFOAM command failed (exit {exc.returncode})", file=sys.stderr)
+      details = "\n".join(str(part) for part in (exc, exc.stdout, exc.stderr) if part)
+      print(f"[X] OpenFOAM command failed (exit {exc.returncode}): {details}", file=sys.stderr)
       return 1
-    except subprocess.TimeoutExpired:
-      print("[X] OpenFOAM command timed out", file=sys.stderr)
+    except subprocess.TimeoutExpired as exc:
+      print(f"[X] OpenFOAM command timed out: {exc}", file=sys.stderr)
       return 1
-    except (FileNotFoundError, ValueError) as exc:
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
       print(f"[X] {exc}", file=sys.stderr)
       return 1
     print(f"\n[✓] OpenFOAM run finished for {application}")

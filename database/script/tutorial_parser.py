@@ -5,6 +5,7 @@ import concurrent.futures
 from pathlib import Path
 import re
 import json
+import gzip
 
 def read_files_into_dict(base_path, stats=None):
     """Read OpenFOAM tutorial case files.
@@ -59,15 +60,17 @@ def read_files_into_dict(base_path, stats=None):
             file_path = os.path.join(root, file)
             rel_folder = os.path.relpath(root, base_path)
 
-            # Avoid sucking in huge decomposed meshes or processor dirs if present
-            # (tutorials shouldn't have them, but generated artifacts might).
-            if rel_folder.startswith("processor") or rel_folder.startswith("postProcessing"):
+            # Exclude native output roots while retaining ordinary supplied inputs.
+            root_folder = rel_folder.split(os.sep, 1)[0]
+            if (root_folder in {"processors", "postProcessing"}
+                    or re.fullmatch(r"processor(?:[0-9]+|s[0-9]+(?:_[0-9]+-[0-9]+)?)", root_folder)):
                 continue
 
             stats["files_total_scanned"] += 1
 
             try:
-                with open(file_path, "r") as file_handle:
+                opener = gzip.open if file_path.endswith('.gz') else open
+                with opener(file_path, "rt") as file_handle:
                     content = file_handle.read()
                 entries.append({
                     "folder_name": rel_folder,
@@ -178,10 +181,7 @@ def find_cases(root_dir):
                 elif len(path_components) == 4:
                     domain, solver, category = path_components[0], path_components[1], path_components[2]
 
-            # --- NEW LOGIC: Check for missing blockMeshDict and copy if referenced in Allrun ---
-            # (entries can include nested folders; entry_names is for quick checks)
-            entry_names = [e.get("file_name") for e in entries]
-
+            # Include referenced mesh input in the corpus without changing tutorials.
             system_dir = os.path.join(root, "system")
             blockmeshdict_path = os.path.join(system_dir, "blockMeshDict")
             if not os.path.isfile(blockmeshdict_path):
@@ -194,31 +194,23 @@ def find_cases(root_dir):
                         referenced_file = match.group(1)
                         src_blockmeshdict = os.path.join(blockmesh_resource_dir, referenced_file)
                         if os.path.isfile(src_blockmeshdict):
-                            # Copy to system/blockMeshDict
                             try:
                                 with open(src_blockmeshdict, "r") as src_f:
                                     blockmesh_content = src_f.read()
-                                # Save to the case's system dir
-                                os.makedirs(system_dir, exist_ok=True)
-                                with open(blockmeshdict_path, "w") as dst_f:
-                                    dst_f.write(blockmesh_content)
-                                # Add to in-memory structures for output
                                 entries.append({
                                     "folder_name": "system",
                                     "file_name": "blockMeshDict",
                                     "content": blockmesh_content
                                 })
-                                entry_names.append("blockMeshDict")
-                                print(f"[INFO] Copied {src_blockmeshdict} to {blockmeshdict_path} for case {case_name}")
+                                print(f"[INFO] Included {src_blockmeshdict} for case {case_name}")
                             except Exception as e:
-                                print(f"[WARNING] Failed to copy {src_blockmeshdict} to {blockmeshdict_path}: {e}")
+                                print(f"[WARNING] Failed to read {src_blockmeshdict}: {e}")
                         else:
                             print(f"[WARNING] Referenced blockMeshDict {src_blockmeshdict} not found for case {case_name}")
                     else:
                         print(f"[INFO] No blockMesh -dict reference found in Allrun for case {case_name}")
                 else:
                     print(f"[INFO] No Allrun file to check for blockMeshDict reference in case {case_name}")
-            # --- END NEW LOGIC ---
 
             # Append the extracted metadata to the 'cases' list
             cases.append({
@@ -324,11 +316,7 @@ def save_cases_to_file(cases, output_dir):
                         content = ent.get("content", "")
                         break
 
-                # Delete comments, such as license information, from the file contents
-                cleaned_text = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
-                cleaned_text = re.sub(r'//.*', '', cleaned_text)
-
-                tutorials_text += f"<file_content>{cleaned_text}</file_content>\n"
+                tutorials_text += f"<file_content>{content}</file_content>\n"
                 tutorials_text += f"</file_end>\n\n"
             
             tutorials_text += f"</directory_end>\n\n"            
@@ -363,7 +351,7 @@ def get_command_help(command, directory_path):
     """Retrieves the help message for a given command."""
     try:
         result = subprocess.run(
-            f"{os.path.join(directory_path, command)} -help", shell=True, capture_output=True, text=True
+            [os.path.join(directory_path, command), "-help"], capture_output=True, text=True
         )
         return result.stdout if result.returncode == 0 else result.stderr
     except Exception as e:
@@ -389,9 +377,18 @@ if __name__ == "__main__":
     
     print(args)
 
+    active_root = os.environ.get("WM_PROJECT_DIR")
+    if not active_root or Path(active_root).expanduser().resolve() != Path(args.wm_project_dir).expanduser().resolve():
+        raise ValueError("Source the requested --wm_project_dir installation's etc/bashrc before extracting its corpus.")
+    app_bin = os.environ.get("FOAM_APPBIN")
+    if not app_bin:
+        raise ValueError("The selected OpenFOAM runtime must declare FOAM_APPBIN for command extraction.")
+    commands_path = Path(app_bin).expanduser()
+
     tutorial_path = args.tutorials_dir or os.path.join(args.wm_project_dir, "tutorials")
     if not os.path.isdir(tutorial_path):
         raise FileNotFoundError(f"OpenFOAM tutorials directory does not exist: {tutorial_path}")
+    os.environ["FOAM_TUTORIALS"] = tutorial_path
     cases_info, case_stats = find_cases(tutorial_path)
     print(f"Statistics: {case_stats}")
     print(f"Found {len(cases_info)} cases in {tutorial_path}")
@@ -402,7 +399,6 @@ if __name__ == "__main__":
 
     save_cases_to_file(cases_info, output_dir)
 
-    commands_path = Path(args.wm_project_dir) / "platforms/linux64GccDPInt32Opt/bin"
     commands = get_commands_from_directory(commands_path)
     command_help_data = fetch_command_helps(commands, commands_path)
 

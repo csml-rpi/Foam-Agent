@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path, PurePosixPath
+from utils import reject_symbolic_links
 
 
 class CasePathSafetyError(ValueError):
@@ -12,9 +13,9 @@ def _normalise_component(value: str, *, label: str, allow_empty: bool = False) -
         raise CasePathSafetyError(f"{label} must be a string")
     if "\x00" in value:
         raise CasePathSafetyError(f"{label} contains a NUL byte")
-    value = value.replace("\\", "/").strip()
-    if not value:
-        if allow_empty:
+    value = value.replace("\\", "/")
+    if not value.strip():
+        if allow_empty and not value:
             return PurePosixPath(".")
         raise CasePathSafetyError(f"{label} cannot be empty")
     path = PurePosixPath(value)
@@ -39,9 +40,11 @@ def safe_case_relative_path(folder_name: str, file_name: str) -> PurePosixPath:
 
 def safe_case_path(case_dir: str | Path, folder_name: str, file_name: str) -> Path:
     """Return a validated path guaranteed to remain under ``case_dir``."""
-    case_root = Path(case_dir).expanduser().resolve()
+    case_root = Path(case_dir).expanduser().absolute()
     relative = safe_case_relative_path(folder_name, file_name)
-    target = (case_root / Path(*relative.parts)).resolve()
+    target = case_root / Path(*relative.parts)
+    reject_symbolic_links(target)
+    case_root, target = case_root.resolve(), target.resolve()
     try:
         target.relative_to(case_root)
     except ValueError as exc:

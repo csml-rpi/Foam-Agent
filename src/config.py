@@ -1,3 +1,4 @@
+from logger import print
 # config.py
 import os
 from dataclasses import dataclass
@@ -16,10 +17,10 @@ class Config:
     case_dir: str = ""
     overwrite_case_dir: bool = False
     max_time_limit: int = 3600  # Max time limit after which the openfoam run will be terminated, in seconds
-    recursion_limit: int = 100  # Base graph budget; static review gets an additional bounded allowance
-    execution_mode: str = "careful"  # careful: review before first execution; fast: run directly
-    max_static_review_retries: int = 10  # Initial review/repair rounds, separate from max_loop
-    # Explicit override; None follows the execution mode preset.
+    # None budgets the graph for max_loop; an explicit limit remains unchanged.
+    recursion_limit: int | None = None
+    execution_mode: str = "careful"
+    max_static_review_retries: int = 10  # Shared by both initial stage reviews
     # Input writer generation mode:
     # - "sequential_dependency": generate files sequentially; use already-generated files as context to enforce consistency.
     # - "parallel_no_context": generate files in parallel without cross-file context (faster, may need more reviewer iterations).
@@ -67,9 +68,10 @@ class Config:
 
     @property
     def workflow_recursion_limit(self) -> int:
-        # The initial phase has at most N review/Writer pairs (one review for N=0).
-        # Leave the configured base budget available for the existing runtime graph.
-        static_steps = max(1, 2 * self.max_static_review_retries) if self.static_review_enabled else 0
+        # Mesh review uses the existing backend node. Initial solver review adds
+        # one node; its longest repair route visits meshing planner, backend,
+        # solver planner, writer and static review (five nodes per shared retry).
+        static_steps = 5 * self.max_static_review_retries + 1 if self.static_review_enabled else 0
         return self.recursion_limit + static_steps
 
     def __post_init__(self) -> None:
@@ -78,6 +80,12 @@ class Config:
         Priority: env var (if set & non-empty) > default value.
         Always prints what value is used to make runs reproducible.
         """
+
+        if self.recursion_limit is None:
+            # A repair can traverse meshing_planner, meshing, solver_planner,
+            # input_writer, runner and reviewer. Allow the initial pipeline,
+            # optional visualization and the graph's final stop as well.
+            self.recursion_limit = 6 * max(1, self.max_loop) + 8
 
         if self.execution_mode not in {"careful", "fast"}:
             raise ValueError("execution_mode must be careful or fast.")

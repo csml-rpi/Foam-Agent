@@ -14,6 +14,8 @@ python3 "${ROOT}/scripts/verify_esi_translation.py" \
   -o "${CASE_DIR}" \
   --overwrite
 
+CASE_DIR="$(cd -- "${CASE_DIR}" && pwd -P)"
+
 echo "[2/4] Docker image: ${IMAGE}"
 echo "[3/4] blockMesh + solver in container"
 
@@ -23,15 +25,18 @@ docker run --rm \
   "${IMAGE}" \
   bash -lc "
     set -e
-    cd '${CASE_DIR}'
+    cd \"\$1\"
     source /openfoam/bashrc 2>/dev/null || source /opt/openfoam*/etc/bashrc 2>/dev/null || true
-    APP=\$(grep -E '^[[:space:]]*application[[:space:]]+' system/controlDict | awk '{print \$2}' | tr -d ';')
+    APP=\$(foamDictionary system/controlDict -entry application -value)
+    if [[ \"\$APP\" == \\\"*\\\" ]]; then
+        APP=\"\${APP:1:-1}\"
+    fi
     echo \"Solver: \$APP\"
     blockMesh
-    timeout ${TIMEOUT} \"\$APP\"
+    timeout \"\$2\" \"\$APP\"
     echo '---'
     tail -5 \"log.\$APP\" 2>/dev/null || true
     grep -E 'End|FOAM exiting' \"log.\$APP\" 2>/dev/null || echo '(check log.\$APP for convergence)'
-"
+" foamagent-verify "${CASE_DIR}" "${TIMEOUT}"
 
 echo "[✓] Docker verification finished: ${CASE_DIR}"

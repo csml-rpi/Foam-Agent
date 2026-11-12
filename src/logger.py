@@ -1,117 +1,111 @@
-# logger.py
-"""Centralized logging for Foam-Agent workflow.
+"""XML diagnostics on stderr, with log handles owned by the current run."""
 
-Provides:
-- XML-tagged output to stdout for structured parsing
-- workflow.log: captures ALL print output (via stdout tee)
-- review.log: captures only reviewer-related output (errors, review analysis, rewrite plans)
-
-Usage:
-    from logger import setup_logging, close_logging, log_review
-
-    setup_logging("/path/to/case_dir")   # call once case_dir is known
-    # ... all subsequent print() calls are captured in workflow.log ...
-    log_review(error_text, "error_logs")  # also writes to review.log
-    close_logging()                       # restore stdout, close files
-"""
-
+import builtins
+from contextlib import contextmanager
+from contextvars import ContextVar
 import os
+from pathlib import Path
 import sys
+from threading import RLock
 from typing import Optional, TextIO
 
 
-class _TeeWriter:
-    """Write to both the original stream and a log file."""
+_current_logger: ContextVar[Optional['FoamAgentLogger']] = ContextVar('foamagent_logger', default=None)
+LOG_FILENAMES = ('workflow.log', 'review.log')
 
-    def __init__(self, original: TextIO, log_file: TextIO):
-        self._original = original
-        self._log_file = log_file
 
-    def write(self, text: str):
-        self._original.write(text)
-        if self._log_file and not self._log_file.closed:
-            self._log_file.write(text)
-            self._log_file.flush()
-
-    def flush(self):
-        self._original.flush()
-        if self._log_file and not self._log_file.closed:
-            self._log_file.flush()
-
-    def __getattr__(self, name):
-        return getattr(self._original, name)
+def active_log_paths() -> tuple[Path, ...]:
+    """Paths currently owned by diagnostics in this run's logging context."""
+    logger = _current_logger.get()
+    return tuple(Path(handle.name) for handle in (logger._workflow_file, logger._review_file)
+                 if handle is not None) if logger is not None else ()
 
 
 class FoamAgentLogger:
-    """Singleton logger that tees stdout to workflow.log and provides review.log."""
-
-    _instance: Optional["FoamAgentLogger"] = None
-
     def __init__(self):
         self._workflow_file: Optional[TextIO] = None
         self._review_file: Optional[TextIO] = None
-        self._original_stdout: Optional[TextIO] = None
-        self._initialized = False
+        self._lock = RLock()
 
     @classmethod
-    def get_instance(cls) -> "FoamAgentLogger":
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
+    def get_instance(cls) -> 'FoamAgentLogger':
+        logger = _current_logger.get()
+        if logger is None:
+            logger = cls()
+            _current_logger.set(logger)
+        return logger
 
     @property
     def initialized(self) -> bool:
-        return self._initialized
+        return self._workflow_file is not None
 
-    def setup(self, output_dir: str) -> None:
-        """Initialize log files and redirect stdout to tee."""
-        if self._initialized:
+    def setup(self, output_dir: str, *, append: bool = False) -> None:
+        if self.initialized:
             return
+        paths = [Path(output_dir).absolute() / name for name in LOG_FILENAMES]
+        for path in paths:
+            for component in (*path.parents, path):
+                if component.is_symlink():
+                    raise ValueError(f"Log paths must not contain symbolic links: {component}")
+            if path.exists() and not path.is_file():
+                raise IsADirectoryError(f"Log target is not a regular file: {path}")
         os.makedirs(output_dir, exist_ok=True)
-
-        self._workflow_file = open(os.path.join(output_dir, "workflow.log"), "w")
-        self._review_file = open(os.path.join(output_dir, "review.log"), "w")
-
-        self._original_stdout = sys.stdout
-        sys.stdout = _TeeWriter(self._original_stdout, self._workflow_file)
-        self._initialized = True
+        mode = 'a' if append else 'w'
+        self._workflow_file = open(paths[0], mode)
+        self._review_file = open(paths[1], mode)
 
     def close(self) -> None:
-        """Close log files and restore stdout."""
-        if self._original_stdout is not None:
-            sys.stdout = self._original_stdout
-            self._original_stdout = None
-        if self._workflow_file and not self._workflow_file.closed:
-            self._workflow_file.close()
-            self._workflow_file = None
-        if self._review_file and not self._review_file.closed:
-            self._review_file.close()
-            self._review_file = None
-        self._initialized = False
+        with self._lock:
+            for handle in (self._workflow_file, self._review_file):
+                if handle is not None:
+                    handle.close()
+            self._workflow_file = self._review_file = None
+
+    def write(self, text: str, *, review: bool = False) -> None:
+        with self._lock:
+            sys.stderr.write(text)
+            sys.stderr.flush()
+            for handle in (self._workflow_file, self._review_file if review else None):
+                if handle is not None:
+                    handle.write(text)
+                    handle.flush()
 
     def log_review(self, message: str, tag: str) -> None:
-        """Log a message with XML tag to stdout (→ workflow.log via tee) AND review.log."""
-        output = f"<{tag}>\n{message}\n</{tag}>"
-        print(output)
-        if self._review_file and not self._review_file.closed:
-            self._review_file.write(output + "\n")
-            self._review_file.flush()
+        self.write(f'<{tag}>\n{message}\n</{tag}>\n', review=True)
 
 
-# ---------------------------------------------------------------------------
-# Module-level convenience functions
-# ---------------------------------------------------------------------------
+def print(*values, sep=' ', end='\n', file=None, flush=False) -> None:
+    """Keep diagnostic call sites and text while leaving protocol stdout alone."""
+    if file is not None and file is not sys.stderr:
+        builtins.print(*values, sep=sep, end=end, file=file, flush=flush)
+        return
+    from io import StringIO
+    text = StringIO()
+    builtins.print(*values, sep=sep, end=end, file=text)
+    FoamAgentLogger.get_instance().write(text.getvalue())
 
-def setup_logging(output_dir: str) -> None:
-    """Initialize logging to output_dir. Call once after case_dir is created."""
-    FoamAgentLogger.get_instance().setup(output_dir)
+
+@contextmanager
+def logging_context():
+    """Create a shared handle before child graph/thread contexts are copied."""
+    logger = FoamAgentLogger()
+    token = _current_logger.set(logger)
+    try:
+        yield logger
+    finally:
+        logger.close()
+        _current_logger.reset(token)
+
+
+def setup_logging(output_dir: str, *, append: bool = False) -> None:
+    FoamAgentLogger.get_instance().setup(output_dir, append=append)
 
 
 def close_logging() -> None:
-    """Close log files and restore stdout."""
-    FoamAgentLogger.get_instance().close()
+    logger = _current_logger.get()
+    if logger is not None:
+        logger.close()
 
 
 def log_review(message: str, tag: str) -> None:
-    """Log to stdout + workflow.log + review.log, wrapped in <tag>...</tag>."""
     FoamAgentLogger.get_instance().log_review(message, tag)

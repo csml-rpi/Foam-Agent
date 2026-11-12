@@ -84,15 +84,16 @@ The default LLM uses a Codex OAuth cache. An API key requires selecting its prov
 
 Choose an execution mode with `--execution_mode` (or `Config.execution_mode`):
 
-| Mode | File generation | Before the first execution |
+| Mode | File generation | Before each stage's first execution |
 |---|---|---|
-| `careful` (default) | Sequential, sharing generated files as context | LLM static review |
+| `careful` (default) | Sequential in planned dependency order | Mesh/solver LLM static review |
 | `fast` | Independent parallel generation | Run directly |
 
 Both modes repair runtime errors. Static review requests only definite, necessary
-corrections, with up to `--max_static_review_retries 10` rounds, separate from
-runtime `max_loop`. Reaching the limit or making no edits proceeds to Run;
-review service failures stop the workflow. Later runs use runtime review only.
+corrections, with `--max_static_review_retries 10` repair rounds shared by both
+initial stages, separate from runtime `max_loop`. A later stage still reviews when
+no repairs remain. Reaching the limit or making no edits proceeds to native
+execution checks; review service failures stop. Later attempts use runtime review only.
 `--input_writer_generation_mode sequential_dependency|parallel_no_context`
 overrides generation independently. See [configuration and reports](docs/usage.md#execution-modes-and-static-review).
 
