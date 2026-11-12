@@ -1,6 +1,6 @@
 # Working on Foam-Agent
 
-Foam-Agent automates CFD simulation through LangGraph, OpenFOAM tutorial retrieval, and model-backed services.
+Foam-Agent automates CFD simulation through LangGraph, OpenFOAM tutorial retrieval, and model-backed services. See [README](README.md) for setup, [usage](docs/usage.md) for configuration, and [MCP](docs/mcp.md) for tool contracts.
 
 ## Development Commands
 
@@ -47,7 +47,7 @@ Generated-file models live in `utils.py`; planning/rewrite models are defined in
 
 Foundation OpenFOAM v10 is the default. `FOAMAGENT_OPENFOAM_TARGET=esi-v2006` selects native ESI/OpenCFD v2006 with isolated tutorials, native conventions, runtime checks, and a matching Docker image. `FOAMAGENT_OPENFOAM_FORK=esi` is the separate legacy translation path; native v2006 must bypass it.
 
-Hydrate Git LFS assets and select indices matching the embedding model. Do not regenerate FAISS indices without a specific need. Foundation includes Qwen 0.6B/8B and OpenAI small indices; ESI includes Qwen 0.6B and OpenAI small. When rebuilding, always pass both embedding provider and model. The initializer's `--database_path` is a target directory, while `Config.database_path` is its parent.
+Hydrate Git LFS assets and select indices matching the embedding model. Do not regenerate FAISS indices without a specific need. Foundation includes Qwen 0.6B/8B and OpenAI small indices; ESI includes Qwen 0.6B and OpenAI small. When rebuilding, always pass both embedding provider and model; see [corpus instructions](docs/usage.md#openfoam-targets-and-corpora). The initializer's `--database_path` is a target directory, while `Config.database_path` is its parent.
 
 ## Workflow Contracts
 

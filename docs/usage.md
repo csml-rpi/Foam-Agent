@@ -36,7 +36,7 @@ and `conda activate FoamAgent`, then run the same pip commands. The Conda file
 only creates Python and pip; `pyproject.toml` is the application dependency source.
 `constraints.txt` pins compatible versions, rather than exporting an entire workstation.
 
-Install and source Foundation OpenFOAM v10 for
+Install and source [Foundation OpenFOAM v10](https://openfoam.org/version/10/) for
 the default target, or ESI/OpenCFD v2006 with its matching corpus. Adapt the path:
 
 ```bash
@@ -116,7 +116,7 @@ imports. `mesh_static_review.json` and `solver_static_review.json` retain each
 stage's last initial review; `static_review.json` aggregates them;
 `review_history.jsonl` stores findings, verification decisions, edit diffs and
 runtime feedback; `static_review_references.json` stores the references used.
-Standalone MCP tools require an explicit `static_review` call;
+Standalone MCP tools require an explicit [`static_review`](mcp.md#workflows) call;
 `run_case` follows the complete workflow.
 
 ### Authentication
@@ -129,7 +129,7 @@ Set credentials before model-backed operations; services initialize model client
 | `anthropic` | `ANTHROPIC_API_KEY` |
 | `deepseek` | `DEEPSEEK_API_KEY` |
 | `bedrock` | AWS credentials and a supported model/inference profile |
-| `ollama` | Optional Python packages, a local Ollama service and model |
+| `ollama` | [Optional Python packages, a local Ollama service and model](#ollama) |
 | `openai-codex` | Codex subscription OAuth cache |
 
 For API-key usage, select both provider and model:
@@ -152,7 +152,8 @@ docker run -it \
 
 ### Ollama
 
-Install the Ollama extra in the same Python environment and select your installed model:
+Follow the [local installation](#local-installation), then install the Ollama
+extra in the same Python environment and select your installed model:
 
 ```bash
 python -m pip install -c constraints.txt -e '.[ollama]'
@@ -192,7 +193,8 @@ are retained. Standalone `run` executes the supplied case directly.
 After mesh handoff, local execution clears previous run artifacts and nonzero time directories;
 it does not resume prior results. Use `original/` to recover imported inputs.
 `Allrun` executes from `work/` for imports or the generated case directory.
-HPC executes the same case through Slurm. Gzip inputs and multi-region cases are supported.
+HPC follows its Slurm script and the [monitoring limits](#hpc-execution-and-monitoring).
+Gzip inputs and multi-region cases are supported.
 
 Local/HPC success requires zero exit, normal native solver completion and a valid
 result field created or rewritten during this attempt, including time zero.
@@ -320,7 +322,7 @@ docker build --platform linux/amd64 -f docker/Dockerfile.esi-v2006 -t foamagent:
 ```
 
 Both images work in `/home/openfoam/Foam-Agent`. Mount input directories read-only
-and outputs separately.
+and outputs separately, as in the [Quick Start](../README.md#quick-start-recommended-docker).
 The default command opens a shell; append any CLI/MCP command to run it directly.
 Container entrypoint messages use stderr.
 
@@ -338,4 +340,4 @@ no longer changes code inside the container. A full offline transfer can use
 | Structured-output HTTP 400 | Select a supported `FOAMAGENT_STRUCTURED_OUTPUT_METHOD`, then use `doctor.py --check-llm` |
 | Missing runtime dependencies | Install with constraints and run `python scripts/doctor.py`; add the extra for an optional provider |
 | Authentication failure | Check the selected provider/model and its credentials before startup |
-| MCP connection failure | Check server transport, host, port, and client settings; the HTTP endpoint is `/mcp` |
+| MCP connection failure | Check server transport, host, port, and client settings in the [MCP guide](mcp.md); the HTTP endpoint is `/mcp` |

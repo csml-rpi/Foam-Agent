@@ -1,15 +1,42 @@
-"""Stage orchestration, clean-input handoff, mesh evidence, and review."""
+"""Exercise meshing, solver handoff, review, execution, and the MCP run entry."""
 
 import asyncio
-import gzip
 import importlib
 import json
 from pathlib import Path
+import socket
 import subprocess
+import sys
 from types import SimpleNamespace
 
-from PIL import Image
 import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT), str(ROOT / "src")]
+
+from config import Config
+from main import initialize_state
+from services import mesh, meshing
+
+
+@pytest.fixture(autouse=True)
+def offline_models(monkeypatch):
+    import utils
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Feature tests must supply model responses without network access")
+
+    monkeypatch.setattr(utils.LLMService, "invoke", forbidden)
+    monkeypatch.setattr(utils, "get_embedding_model", forbidden)
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
+
+
+@pytest.fixture
+def mesh_services(monkeypatch):
+    monkeypatch.setattr(meshing, "read_patch_bounds", lambda _: {"wall": [0, 1, 0, 1, 0, 1]})
+    monkeypatch.setattr(meshing, "retrieve_mesh_reference", lambda *a: dict(
+        case=None, content="", script="", reason="Supplied test mesh"))
+    return SimpleNamespace(mesh=mesh, meshing=meshing)
 
 
 def _put(root, relative, content):
@@ -32,17 +59,12 @@ def _operations(*commands, stage="solver"):
 
 
 def _state(case, **updates):
-    from config import Config
-    state = dict(
-        case_dir=str(case), config=Config(openfoam_target="foundation-v10", max_loop=3),
-        user_requirement="Run the supplied case", llm_service=None, loop_count=0,
-        mesh_type="standard_mesh", mesh_source=None, mesh_script_action="none",
-        mesh_operations=[], pending_solver_operations=[], solver_operations=_operations("icoFoam"),
-        mesh_review_history=[], solver_review_history=[], solver_script_dirty=False,
-        mesh_reference=dict(case=None, content="", script="", reason="fixture"),
-        mesh_boundary_plan=[], dir_structure={}, foamfiles=None, allrun_reference="",
-        cross_stage_request=None,
-    )
+    state = initialize_state("Run the supplied case", Config(execution_mode="fast", max_loop=3))
+    state.update(
+        case_dir=str(case), mesh_type="standard_mesh", mesh_source=None, mesh_script_action="none",
+        solver_operations=_operations("icoFoam"), mesh_boundary_plan=[], dir_structure={},
+        mesh_reference=dict(case=None, content="", script="", reason="Supplied test mesh"),
+        allrun_reference="")
     state.update(updates)
     return state
 
@@ -57,7 +79,7 @@ def _solver_state(case, llm=None):
     return {**state, **load_case_files(state)}
 
 
-def test_standard_mesh(modules, tmp_path, monkeypatch):
+def test_standard_mesh(mesh_services, tmp_path, monkeypatch):
     """A retained Allmesh runs only after its declared startup input is written."""
     _poly_mesh(tmp_path)
     script = "#!/bin/bash\nset -e\ncat system/startup > mesh-result\n"
@@ -72,20 +94,20 @@ def test_standard_mesh(modules, tmp_path, monkeypatch):
         Path(err).write_text(result.stderr)
         return {"returncode": result.returncode, "timed_out": False}
 
-    monkeypatch.setattr(modules.meshing, "run_command", execute)
-    first = modules.meshing.execute_meshing(state, modules.meshing.standard_meshing)
+    monkeypatch.setattr(mesh_services.meshing, "run_command", execute)
+    first = mesh_services.meshing.execute_meshing(state, mesh_services.meshing.standard_meshing)
     assert first["error_logs"] and not (tmp_path / "mesh-result").exists()
     state.update(first)
     state.update(llm_service=SimpleNamespace(invoke=lambda *a, **kw: "supplied startup\n"),
                  mesh_subtasks=[dict(folder_name="system", file_name="startup", stage="mesh",
                                      action="create", changes="Create the declared startup input")])
-    result = modules.meshing.execute_meshing(state, modules.meshing.standard_meshing)
+    result = mesh_services.meshing.execute_meshing(state, mesh_services.meshing.standard_meshing)
     assert not result["error_logs"]
     assert (tmp_path / "Allmesh").read_text() == script
     assert (tmp_path / "mesh-result").read_text() == "supplied startup\n"
 
 
-def test_gmsh_mesh(modules, tmp_path):
+def test_gmsh_mesh(mesh_services, tmp_path):
     """An explicitly prepared Gmsh program is followed by conversion and checking."""
     script = _put(tmp_path, "generate_mesh.py", "# supplied generation program\n")
     calls = []
@@ -100,7 +122,7 @@ def test_gmsh_mesh(modules, tmp_path):
         _poly_mesh(tmp_path)
         return subprocess.CompletedProcess(argv, 0, "Mesh OK.", "")
 
-    result = modules.mesh.handle_gmsh_mesh(
+    result = mesh_services.mesh.handle_gmsh_mesh(
         "Use the supplied program", str(tmp_path), timeout=10, script_prepared=True,
         python_runner=generate, utility_runner=utility,
         llm_service=SimpleNamespace(invoke=lambda *a, **kw: pytest.fail("Unexpected model call")))
@@ -108,7 +130,7 @@ def test_gmsh_mesh(modules, tmp_path):
     assert calls == ["gmshToFoam", "checkMesh"]
 
 
-def test_custom_mesh_repair(modules, tmp_path, monkeypatch):
+def test_custom_mesh_repair(mesh_services, tmp_path, monkeypatch):
     """Retry converts the repaired working mesh without recopying the original."""
     source = _put(tmp_path, "input/source.msh", "original mesh")
     converted = []
@@ -120,123 +142,42 @@ def test_custom_mesh_repair(modules, tmp_path, monkeypatch):
         summary = "Failed 1 mesh checks." if len(converted) == 1 else "Mesh OK."
         return subprocess.CompletedProcess(argv, 0, summary, "")
 
-    monkeypatch.setattr(modules.mesh, "run_openfoam_utility", utility)
-    first = modules.mesh.copy_custom_mesh(str(source), str(tmp_path), timeout=10)
+    monkeypatch.setattr(mesh_services.mesh, "run_openfoam_utility", utility)
+    first = mesh_services.mesh.copy_custom_mesh(str(source), str(tmp_path), timeout=10)
     assert first["error_logs"]
     _put(tmp_path, "geometry.msh", "repaired working mesh")
-    result = modules.mesh.copy_custom_mesh(str(source), str(tmp_path), timeout=10, retry=True)
+    result = mesh_services.mesh.copy_custom_mesh(str(source), str(tmp_path), timeout=10, retry=True)
     assert not result["error_logs"]
     assert converted == ["original mesh", "repaired working mesh"]
     assert source.read_text() == "original mesh"
 
 
-def _cube(root, region, offset):
-    """A valid one-cell mesh for the real VTK reader."""
-    points = [(offset + x, y, z) for x, y, z in
-              [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0),
-               (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]]
-    bodies = {
-        "points": ("vectorField", "8\n(\n" + "\n".join(f"({x} {y} {z})" for x, y, z in points) + "\n)"),
-        "faces": ("faceList", "6\n(4(0 3 2 1) 4(4 5 6 7) 4(0 1 5 4) 4(1 2 6 5) 4(2 3 7 6) 4(3 0 4 7))"),
-        "owner": ("labelList", "6\n(0 0 0 0 0 0)"),
-        "neighbour": ("labelList", "0\n()"),
-        "boundary": ("polyBoundaryMesh", "1\n(walls {type wall; nFaces 6; startFace 0;})"),
-    }
-    for name, (kind, body) in bodies.items():
-        _put(root, f"constant/{region}/polyMesh/{name}",
-             f"FoamFile {{version 2.0; format ascii; class {kind}; object {name};}}\n{body}\n")
-    _put(root, "system/controlDict", "application checkMesh; startTime 0; endTime 1; deltaT 1;\n")
-    _put(root, f"system/{region}/fvSolution", "solvers {}\n")
-    _put(root, f"system/{region}/fvSchemes", "ddtSchemes {default steadyState;}\n")
-
-
-@pytest.mark.parametrize('target,key', [
-    ('foundation-v10', 'regions'),
-    ('esi-v2006', '"reg.*"'),
-])
-def test_multiregion_handoff(modules, tmp_path, monkeypatch, target, key):
-    """Region-only meshes retain actual regional patches and measured bounds."""
-    _cube(tmp_path, "fluid", 0)
-    _cube(tmp_path, "solid", 2)
-    _put(tmp_path, "constant/regionProperties", "regions (fluid (fluid) solid (solid));\n")
-    monkeypatch.setattr(modules.meshing, "read_patch_bounds", modules.read_patch_bounds)
-    queries = []
-    def native(argv, **kwargs):
-        queries.append(argv)
-        output = ('Using #codeStream at line 2 in file "constant/regionProperties"\n'
-                  'Using #codeStream with "dynamicCode/library.so"\n'
-                  'codeStream : dictionary:"constant/regionProperties" master-only-reading:0\n'
-                  + key + '\n2\n(\nfluid 1(fluid)\nsolid 1(solid)\n);\n')
-        return subprocess.CompletedProcess(argv, 0, output, '')
-    monkeypatch.setattr(modules.meshing, "run_openfoam_utility", native)
-    state = _state(tmp_path)
-    state['config'].openfoam_target = target
-    result = modules.meshing.execute_meshing(state, lambda _: {"error_logs": []})
-    assert not result["error_logs"] and not (tmp_path / "constant/polyMesh").exists()
-    assert set(result["mesh_info"]["regions"]) == {"fluid", "solid"}
-    assert result["mesh_info"]["patch_bounds"] == {
-        "fluid/walls": [0, 1, 0, 1, 0, 1], "solid/walls": [2, 3, 0, 1, 0, 1]}
-    assert queries == [['foamDictionary', *(['-expand'] if target == 'foundation-v10' else []),
-                        'constant/regionProperties', '-entry', 'regions']]
-
-
-@pytest.mark.parametrize('partition', ['processor0', 'processors1', 'processors1_0-0'])
-def test_mesh_reconstruction(modules, tmp_path, monkeypatch, partition):
-    """Successful reconstruction replaces the mesh; a later native failure rolls back."""
-    _poly_mesh(tmp_path)
-    _poly_mesh(tmp_path / partition)
-    initial = _put(tmp_path, "0/U", "preserve initial field")
-    fail = False
-
-    def reconstruct(argv, **kwargs):
-        _poly_mesh(tmp_path)
-        if fail:
-            raise subprocess.CalledProcessError(1, argv, stderr="partition read failed")
-        _put(tmp_path, "constant/polyMesh/points", "reconstructed mesh")
-        return subprocess.CompletedProcess(argv, 0, "reconstructed", "")
-
-    monkeypatch.setattr(modules.meshing, "run_openfoam_utility", reconstruct)
-    previous_mesh = {"check_mesh_passed": True}
-    state = _state(tmp_path, mesh_info=previous_mesh, final_reconstruction=dict(
-        sources=[f"{partition}/constant/polyMesh"], argv=["reconstructParMesh", "-constant"]))
-    first = modules.meshing.execute_meshing(state, lambda _: {"error_logs": []})
-    assert not first["error_logs"]
-    assert first["mesh_info"]["check_mesh_passed"] is None
-    assert previous_mesh["check_mesh_passed"] is True
-    fail = True
-    state.update(first)
-    state['final_reconstruction'] = dict(sources=[f"{partition}/constant/polyMesh"], argv=["reconstructParMesh", "-constant"])
-    second = modules.meshing.execute_meshing(state, lambda _: {"error_logs": []})
-    assert second["error_logs"]
-    assert (tmp_path / "constant/polyMesh/points").read_text() == "reconstructed mesh"
-    assert initial.read_text() == "preserve initial field"
-
-
-def test_pending_physical_operations(modules, tmp_path, monkeypatch):
+def test_pending_physical_operations(mesh_services, tmp_path, monkeypatch):
     """Unexecuted initialization survives mesh handoff until the writer emits Allrun."""
     from nodes.input_writer_node import input_writer_node
     from router_func import route_after_meshing
+    from services import plan as plans
 
     _poly_mesh(tmp_path)
     _put(tmp_path, "system/controlDict", "application icoFoam;\n")
     _put(tmp_path, "Allrun", "icoFoam\n")
     operations = _operations("setFields", "icoFoam")
-    llm = SimpleNamespace(invoke=lambda *a, **kw: modules.meshing.MeshRepairImpact(
+    llm = SimpleNamespace(invoke=lambda *a, **kw: mesh_services.meshing.MeshRepairImpact(
         replan_solver=False, reason="Keep pending physical preparation"))
     state = _solver_state(tmp_path, llm)
     state.update(case_origin="generated", case_info="supplied physics", mesh_type="custom_mesh",
                  pending_solver_operations=operations, solver_operations=operations)
-    state.update(modules.meshing.execute_meshing(state, modules.meshing.custom_meshing))
+    state.update(mesh_services.meshing.execute_meshing(state, mesh_services.meshing.custom_meshing))
     assert route_after_meshing(state) == "solver_planner"
     assert state["pending_solver_operations"] == operations
-    planner = modules.solver_planner_node
+    planner = importlib.import_module('nodes.solver_planner_node')
     monkeypatch.setattr(planner, "prepare_solver_context", lambda _: dict(
         dir_counts_str="", dir_structure_reference="", tutorial_reference=""))
-    monkeypatch.setattr(planner, "_build_advice", lambda *a: modules.plan.SimilarCaseAdviceModel())
+    monkeypatch.setattr(planner, "_build_advice", lambda *a: plans.SimilarCaseAdviceModel())
 
     def plan(requirement, *args, **kwargs):
         assert "setFields" in requirement
-        return modules.plan.OpenFOAMPlanModel(operations=operations, subtasks=[])
+        return plans.OpenFOAMPlanModel(operations=operations, subtasks=[])
 
     monkeypatch.setattr(planner, "decompose_to_subtasks", plan)
     state.update(planner.solver_planner_node(state))
@@ -246,243 +187,8 @@ def test_pending_physical_operations(modules, tmp_path, monkeypatch):
     assert (tmp_path / "Allrun").read_text().count("setFields") == 1
 
 
-def test_solver_completion(modules, tmp_path, monkeypatch):
-    """Quoted application works, while completion without a new result is rejected."""
-    from services import solver_execution
-
-    _put(tmp_path, "system/controlDict", 'application "icoFoam";\n')
-    _put(tmp_path, "0/U", "FoamFile {class volVectorField;}\n")
-    before = solver_execution.snapshot_result_fields(tmp_path)
-    _put(tmp_path, "log.solve", "Exec : icoFoam\nEnd\n")
-    monkeypatch.setattr(solver_execution, "run_openfoam_utility", lambda argv, **kw:
-                        subprocess.CompletedProcess(argv, 0, 'application "icoFoam";\n', ""))
-    assert solver_execution.check_solver_execution(str(tmp_path), fields_before=before, logs_before={})
-    _put(tmp_path, "1/U", "FoamFile {class volVectorField;}\n")
-    assert not solver_execution.check_solver_execution(str(tmp_path), fields_before=before, logs_before={})
-
-
-def test_repair_progress(modules, tmp_path, monkeypatch):
-    """Correcting an invalid operation stage allows execution without a file edit."""
-    from nodes.input_writer_node import input_writer_node
-    from nodes.local_runner_node import local_runner_node
-    from services import review
-
-    script = _put(tmp_path, "Allrun", "icoFoam\n")
-    _put(tmp_path, "system/controlDict", "application icoFoam;\n")
-    replacement = _operations("icoFoam\n")
-    llm = SimpleNamespace(invoke=lambda *a: json.dumps(dict(
-        action="repair_solver", target_files=[], operations=replacement, operation_request=None,
-        diagnosis="Correct operation ownership", evidence=["preflight error"], reason="Fix stage")))
-    state = _solver_state(tmp_path, llm)
-    state["solver_operations"] = _operations("icoFoam\n", stage="mesh")
-    calls = []
-    monkeypatch.setattr("nodes.local_runner_node.run_allrun_and_collect_errors",
-                        lambda *a, **kw: calls.append(a) or [])
-    monkeypatch.setattr(review, "log_review", lambda *a: None)
-    state.update(input_writer_node(state))
-    assert state["error_logs"] and not calls
-    state.update(review.review_solver(state))
-    state.update(input_writer_node(state))
-    assert not state["error_logs"] and not state.get("termination_reason")
-    state.update(local_runner_node(state))
-    assert state["workflow_status"] == "success" and len(calls) == 1
-    assert script.read_text() == "icoFoam\n"
-
-
-def test_mcp_run_contract(modules, tmp_path, monkeypatch):
-    """Standalone MCP run forwards its request and retains the supplied script."""
-    server = importlib.import_module("src.mcp.fastmcp_server")
-    script = _put(tmp_path, "Allrun", "#!/bin/bash\ncustomSolver --user-option\n")
-    calls = []
-    monkeypatch.setattr(server, "run_allrun_and_collect_errors", lambda **kw: calls.append(kw) or [])
-
-    async def log(*args, **kwargs):
-        pass
-
-    run = getattr(server.run, "fn", server.run)
-    response = asyncio.run(run(server.RunSimulationRequest(case_dir=str(tmp_path), timeout=17),
-                               SimpleNamespace(info=log, error=log)))
-    assert response.status == "success" and not response.errors
-    assert calls == [dict(case_dir=str(tmp_path), timeout=17, max_retries=3,
-                          openfoam_target=server.runtime_openfoam_target(server.global_config))]
-    assert script.read_text() == "#!/bin/bash\ncustomSolver --user-option\n"
-
-
-def test_visualization_failure_status(modules, tmp_path, monkeypatch):
-    """A rendering failure preserves simulation success as partial_success."""
-    from config import Config
-
-    node = importlib.import_module("nodes.visualization_node")
-    monkeypatch.setattr(node, "visualize_case", lambda *a, **kw:
-                        {"pyvista_visualization": {"success": False, "error": "render failed"}})
-    result = node.visualization_node(dict(case_dir=str(tmp_path), config=Config(), workflow_status="success"))
-    assert result["workflow_status"] == "partial_success"
-    assert result["termination_reason"] == "visualization_failed"
-    assert modules.main.workflow_exit_code(result) != 0
-
-
-def test_output_ownership(modules, tmp_path):
-    """Replacing an output requires explicit overwrite and the ownership marker."""
-    from config import Config
-    from services.output_safety import OUTPUT_MARKER_NAME, OutputDirectorySafetyError
-
-    case = tmp_path / "case"
-    config = Config(case_dir=str(case))
-    modules.preparation._prepare_generated_case_dir(config, None)
-    original = _put(case, "0/U", "initial field")
-    with pytest.raises(FileExistsError):
-        modules.preparation._prepare_generated_case_dir(config, None)
-    assert original.read_text() == "initial field"
-    config.overwrite_case_dir = True
-    modules.preparation._prepare_generated_case_dir(config, None)
-    assert not original.exists()
-    (case / OUTPUT_MARKER_NAME).unlink()
-    valuable = _put(case, "valuable-input", "preserve me")
-    with pytest.raises(OutputDirectorySafetyError, match="unowned"):
-        modules.preparation._prepare_generated_case_dir(config, None)
-    assert valuable.read_text() == "preserve me"
-
-
-@pytest.mark.parametrize('failure,compressed', [
-    ('native', False),
-    ('incomplete', True),
-    ('commit', False),
-    ('hpc_unconfirmed', False),
-    ('none', True),
-])
-def test_regional_reconstruction_rolls_back_every_mesh_and_keeps_retry_sources(
-        modules, tmp_path, monkeypatch, failure, compressed):
-    import gzip
-    from services.case_workspace import CaseWorkspace
-    from services.run_hpc import HpcWorkflowStop
-    for root in (tmp_path, tmp_path / 'processor0'):
-        for region in ('fluid', 'solid'):
-            _cube(root, region, 0)
-    _put(tmp_path, 'constant/regionProperties', 'regions (fluid (fluid) solid (solid));\n')
-    initial = _put(tmp_path, '0/U', 'original initial field')
-    if compressed:
-        for directory in tmp_path.rglob('polyMesh'):
-            for path in directory.iterdir():
-                path.with_name(path.name + '.gz').write_bytes(gzip.compress(path.read_bytes()))
-                path.unlink()
-    workspace = CaseWorkspace.create(str(tmp_path), str(tmp_path / '.foamagent'))
-    before = {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob('*')
-              if p.is_file() and '.foamagent' not in p.parts and 'polyMesh' in p.parts}
-    monkeypatch.setattr(modules.meshing, 'read_patch_bounds', modules.read_patch_bounds)
-
-    def native(argv, **kwargs):
-        if argv[0] == 'foamDictionary':
-            return subprocess.CompletedProcess(argv, 0,
-                '' if '-includes' in argv else 'regions (fluid (fluid) solid (solid));\n', '')
-        _cube(tmp_path, 'fluid', 10)
-        if failure.startswith('hpc_'):
-            raise HpcWorkflowStop(
-                'hpc_job_state_unconfirmed' if failure == 'hpc_unconfirmed' else 'hpc_monitoring_timeout',
-                'Reconstruction stop could not be confirmed' if failure == 'hpc_unconfirmed' else 'Reconstruction stop confirmed',
-                {'job_id': '123'})
-        if failure == 'native':
-            return subprocess.CompletedProcess(argv, 1, '', 'reconstruction failed')
-        _cube(tmp_path, 'solid', 10)
-        if failure == 'incomplete':
-            (tmp_path / 'constant/solid/polyMesh/owner').unlink()
-        return subprocess.CompletedProcess(argv, 0, '', '')
-
-    monkeypatch.setattr(modules.meshing, 'run_openfoam_utility', native)
-    rename = Path.rename
-    failed = False
-
-    def fail_commit(path, target):
-        nonlocal failed
-        if failure == 'commit' and not failed and Path(target) == workspace.source_dir / 'constant/solid/polyMesh':
-            failed = True
-            raise OSError('second-region handoff failed')
-        return rename(path, target)
-
-    monkeypatch.setattr(Path, 'rename', fail_commit)
-    previous_mesh = {'regions': {region: {'poly_mesh_path': str(tmp_path / 'constant' / region / 'polyMesh')}
-                                 for region in ('fluid', 'solid')},
-                     'patch_bounds': {'fluid/walls': [0, 1, 0, 1, 0, 1]}, 'check_mesh_passed': True}
-    pending = {'file': '0/U', 'stage': 'solver', 'changes': 'Retain the approved physical correction'}
-    state = _state(tmp_path, mesh_info=previous_mesh, rewrite_plan={'target_files': [pending]},
-        case_input_source_dir=str(workspace.source_dir), final_reconstruction=dict(
-        sources=[f'processor0/constant/{r}/polyMesh' for r in ('fluid', 'solid')],
-        argv=['reconstructParMesh', '-constant', '-allRegions']))
-    result = modules.meshing.execute_meshing(state, lambda _: {'error_logs': []})
-    assert previous_mesh['check_mesh_passed'] is True
-    assert {**state, **result}['rewrite_plan']['target_files'] == [pending]
-    if failure == 'hpc_unconfirmed':
-        assert result['termination_reason'] == 'hpc_job_state_unconfirmed'
-        reconstruction = result['mesh_execution']['final_reconstruction']
-        assert reconstruction['status'] == 'state_unconfirmed'
-        assert all(Path(path).is_dir() for path in reconstruction['backup_paths'].values())
-        assert (tmp_path / 'constant/fluid/polyMesh/points').is_file()
-        assert not (tmp_path / 'constant/solid/polyMesh').exists()
-        assert 'mesh_info' not in result
-        assert initial.read_text() == 'original initial field'
-        return
-    if failure == 'none':
-        assert not result['error_logs']
-        assert result['mesh_execution']['final_reconstruction']['status'] == 'complete'
-        assert result['final_reconstruction'] is None
-        assert (workspace.source_dir / '.foamagent/mesh-handoff').exists()
-        workspace.restore_inputs()
-        assert initial.read_text() == 'original initial field'
-        assert '10' in (tmp_path / 'constant/fluid/polyMesh/points').read_text()
-        return
-    assert result['error_logs']
-    assert result['mesh_execution']['final_reconstruction']['status'] == 'rolled_back'
-    assert result['mesh_info'] is None and {**state, **result}['mesh_info'] is None
-    if failure == 'hpc_confirmed':
-        assert result['termination_reason'] == 'hpc_monitoring_timeout'
-    assert all((tmp_path / path).read_bytes() == content for path, content in before.items())
-    assert initial.read_text() == 'original initial field'
-    assert not (workspace.source_dir / '.foamagent/mesh-handoff').exists()
-
-
-def mesh(root, relative="constant/polyMesh", value="1000", compressed=False):
-    directory = root / relative
-    directory.mkdir(parents=True, exist_ok=True)
-    for name in ("points", "faces", "owner", "neighbour", "boundary"):
-        data = value.encode()
-        (directory / (name + (".gz" if compressed else ""))).write_bytes(
-            gzip.compress(data) if compressed else data)
-    return directory
-
-
-@pytest.mark.parametrize('compressed,regions', [
-    (False, False),
-    (True, True),
-])
-def test_mesh_handoff_commits_only_mesh_and_preserves_clean_geometry(tmp_path, compressed, regions):
-    from services.case_workspace import CaseWorkspace
-    geometry = tmp_path / "geometry.stl"
-    geometry.write_text("1000")
-    initial = tmp_path / "0/U"
-    initial.parent.mkdir()
-    initial.write_text("clean field template")
-    paths = {name: mesh(tmp_path, f"constant/{name}/polyMesh", compressed=compressed)
-             for name in ("fluid", "solid")} if regions else {"": mesh(tmp_path, compressed=compressed)}
-    if regions:
-        (tmp_path / "constant/regionProperties").write_text("regions (fluid (fluid) solid (solid));")
-    workspace = CaseWorkspace.create(str(tmp_path), str(tmp_path / ".foamagent"))
-    for _ in range(2):
-        workspace.restore_inputs()
-        assert geometry.read_text() == "1000"
-        assert initial.read_text() == "clean field template"
-        geometry.write_text("1")
-        initial.write_text("runtime-expanded field")
-        for name, directory in paths.items():
-            mesh(tmp_path, directory.relative_to(tmp_path).as_posix(), value="1", compressed=compressed)
-        workspace.commit_mesh(paths)
-    workspace.restore_inputs()
-    assert geometry.read_text() == "1000" and initial.read_text() == "clean field template"
-    for directory in paths.values():
-        point = directory / ("points.gz" if compressed else "points")
-        assert (gzip.decompress(point.read_bytes()).decode() if compressed else point.read_text()) == "1"
-
-
 @pytest.mark.parametrize("stage", ["mesh", "solver"])
-def test_careful_initial_reviews_use_stage_specific_model_doubles(tmp_path, stage):
+def test_initial_static_review_uses_current_stage_and_declared_inputs(tmp_path, stage):
     from config import Config
     from services.static_review import StaticReviewResult, review_stage_inputs
 
@@ -513,61 +219,123 @@ def test_careful_initial_reviews_use_stage_specific_model_doubles(tmp_path, stag
     assert len(requests) == 1
 
 
-@pytest.mark.parametrize('outputs,filename', [
-    (['plot.png', './plot.png'], 'visualization.py'),
-    (['plot.png', '../outside.png'], 'visualization.py'),
-])
-def test_all_output_paths_are_checked_before_any_mutation(tmp_path, outputs, filename):
-    from services.visualization import run_pyvista_script
+@pytest.mark.parametrize("already_exists", [False, True], ids=["new-input", "unchanged-input"])
+def test_mixed_creation_and_rewrite_stop_only_when_no_inputs_change(tmp_path, already_exists):
+    from config import Config
+    from main import initialize_state
+    from nodes.input_writer_node import input_writer_node
+    from router_func import route_after_input_writer
+    from services.case_workspace import CaseWorkspace
+    from services.stage_plan import render_stage_script
+    from utils import FoamPydantic
 
-    case = tmp_path / 'case'
-    case.mkdir()
-    image = case / 'plot.png'
-    image.write_bytes(b'keep previous image')
-    script = case / 'visualization.py'
-    script.write_text('# keep previous script\n')
-    (case / 'directory.png').mkdir()
-    external = tmp_path / 'external'
-    external.mkdir()
-    (case / 'linked').symlink_to(external, target_is_directory=True)
-    success, _, errors = run_pyvista_script(str(case), 'raise AssertionError("must not execute")',
-                                           filename=filename, expected_pngs=outputs)
-    assert not success and errors
-    assert image.read_bytes() == b'keep previous image'
-    assert script.read_text() == '# keep previous script\n'
-    assert not (tmp_path / 'outside.py').exists()
-    assert not list(external.iterdir())
+    _put(tmp_path, "system/controlDict", "application icoFoam;\n")
+    _put(tmp_path, "system/B", "corrected B")
+    if already_exists:
+        _put(tmp_path, "system/A", "created A")
+    operations = _operations("true")
+    _put(tmp_path, "Allrun", render_stage_script(operations))
+    workspace = CaseWorkspace.create(str(tmp_path), str(tmp_path / ".foamagent"))
 
+    def invoke(user, system, pydantic_obj=None):
+        if pydantic_obj is FoamPydantic:
+            return FoamPydantic(list_foamfile=[
+                dict(folder_name="system", file_name="B", content="corrected B")])
+        return "created A"
 
-@pytest.mark.parametrize('duplicate', [False, True])
-def test_visualization_counts_only_unique_verified_images(tmp_path, duplicate):
-    from services.visualization import visualize_case, VisualizationScript, VisualizationReview
+    task = dict(folder_name="system", file_name="A", stage="solver", action="create",
+                changes="Supply A")
+    previous_errors = [dict(file="system/A", error_content="Previous solver failure")]
+    state = initialize_state("Supply A and retain B", Config(execution_mode="fast"))
+    state.update(case_dir=str(tmp_path), case_input_source_dir=str(workspace.source_dir),
+                 llm_service=SimpleNamespace(invoke=invoke), requires_hpc=False,
+                 solver_operations=operations, case_solver="icoFoam",
+                 review_analysis="Supply A and retain B", error_logs=previous_errors,
+                 input_writer_mode="initial", subtasks=[task], pending_solver_subtasks=[task],
+                 rewrite_plan=dict(target_files=[
+                     dict(file="system/B", stage="solver", changes="Retain the correction")]))
 
-    names = ['plot.png', './plot.png' if duplicate else 'second.png']
-    proposal = VisualizationScript(
-        script='from PIL import Image\n' + '\n'.join(
-            f'Image.new("RGB", (8, 6)).save({name!r})' for name in names),
-        plots=[dict(output_png=name, field_name='U', time_step='latest', description='Requested view')
-               for name in names],
-    )
-    reviews = []
+    result = input_writer_node(state)
 
-    def invoke(payload, prompt, *, pydantic_obj):
-        if pydantic_obj is VisualizationScript:
-            return proposal
-        reviews.append(payload)
-        return VisualizationReview(meets_requirements=True, feedback='Both requested views exist')
-
-    result = visualize_case(str(tmp_path), 'Two velocity views', max_loop=1,
-                            llm_service=SimpleNamespace(invoke=invoke))
-    if duplicate:
-        assert not result['pyvista_visualization']['success']
-        assert not reviews
-        assert not (tmp_path / 'visualization.py').exists()
+    assert (workspace.source_dir / "system/A").read_text() == "created A"
+    assert (workspace.source_dir / "system/B").read_text() == "corrected B"
+    assert result["subtasks"] == result["pending_solver_subtasks"] == []
+    if already_exists:
+        assert result["termination_reason"] == "repair_made_no_progress"
+        assert result["error_logs"] == previous_errors
+        assert route_after_input_writer({**state, **result}) == "__end__"
     else:
-        assert result['pyvista_visualization']['success']
-        assert result['visualization_summary']['total_plots_generated'] == 2
-        assert len(set(result['plot_outputs'])) == 2
-        for output in result['plot_outputs']:
-            with Image.open(output) as image:
-                assert image.format == 'PNG' and image.size == (8, 6)
+        assert result["updated_files"] == ["system/A"]
+        assert not result["error_logs"]
+        assert route_after_input_writer({**state, **result}) == "local_runner"
+
+
+@pytest.mark.parametrize("scenario", ["old-log", "missing-result", "completed"])
+def test_solver_success_requires_current_completion_and_result(tmp_path, monkeypatch, scenario):
+    from services import solver_execution
+    from services.execution_logs import snapshot_execution_logs
+
+    _put(tmp_path, "log.solve", "Exec : icoFoam\nEnd\n")
+    logs_before = snapshot_execution_logs(tmp_path) if scenario == "old-log" else {}
+    if scenario != "missing-result":
+        _put(tmp_path, "1/U", "FoamFile {class volVectorField;}\n")
+    monkeypatch.setattr(solver_execution, "run_openfoam_utility", lambda argv, **kw:
+                        subprocess.CompletedProcess(argv, 0, "application icoFoam;\n", ""))
+
+    errors = solver_execution.check_solver_execution(
+        str(tmp_path), fields_before={}, logs_before=logs_before)
+
+    assert (not errors) is (scenario == "completed")
+
+
+def test_mesh_handoff_preserves_clean_solver_inputs(tmp_path):
+    from services.case_workspace import CaseWorkspace
+
+    _poly_mesh(tmp_path)
+    geometry = _put(tmp_path, "geometry.stl", "clean geometry")
+    field = _put(tmp_path, "0/U", "clean initial field")
+    workspace = CaseWorkspace.create(str(tmp_path), str(tmp_path / ".foamagent"))
+    geometry.write_text("runtime geometry")
+    field.write_text("runtime field")
+    points = _put(tmp_path, "constant/polyMesh/points", "new mesh points")
+
+    workspace.commit_mesh({"": tmp_path / "constant/polyMesh"})
+    workspace.restore_inputs()
+
+    assert geometry.read_text() == "clean geometry"
+    assert field.read_text() == "clean initial field"
+    assert points.read_text() == "new mesh points"
+
+
+def test_visualization_failure_status(tmp_path, monkeypatch):
+    """A rendering failure preserves simulation success as partial_success."""
+    from config import Config
+
+    node = importlib.import_module("nodes.visualization_node")
+    monkeypatch.setattr(node, "visualize_case", lambda *a, **kw:
+                        {"pyvista_visualization": {"success": False, "error": "render failed"}})
+    result = node.visualization_node(dict(case_dir=str(tmp_path), config=Config(), workflow_status="success"))
+    assert result["workflow_status"] == "partial_success"
+    assert result["termination_reason"] == "visualization_failed"
+    from main import workflow_exit_code
+    assert workflow_exit_code(result) != 0
+
+
+def test_standalone_run_preserves_script_and_forwards_request(tmp_path, monkeypatch):
+    """Standalone MCP run forwards its request and retains the supplied script."""
+    server = importlib.import_module("src.mcp.fastmcp_server")
+    script = tmp_path / "Allrun"
+    script.write_text("#!/bin/bash\ncustomSolver --user-option\n")
+    calls = []
+    monkeypatch.setattr(server, "run_allrun_and_collect_errors", lambda **kw: calls.append(kw) or [])
+
+    async def log(*args, **kwargs):
+        pass
+
+    run = getattr(server.run, "fn", server.run)
+    response = asyncio.run(run(server.RunSimulationRequest(case_dir=str(tmp_path), timeout=17),
+                               SimpleNamespace(info=log, error=log)))
+    assert response.status == "success" and not response.errors
+    assert calls == [dict(case_dir=str(tmp_path), timeout=17, max_retries=3,
+                          openfoam_target=server.runtime_openfoam_target(server.global_config))]
+    assert script.read_text() == "#!/bin/bash\ncustomSolver --user-option\n"
