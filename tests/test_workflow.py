@@ -7,6 +7,7 @@ from pathlib import Path
 import socket
 import subprocess
 import sys
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -305,6 +306,170 @@ def test_mesh_handoff_preserves_clean_solver_inputs(tmp_path):
     assert geometry.read_text() == "clean geometry"
     assert field.read_text() == "clean initial field"
     assert points.read_text() == "new mesh points"
+
+
+@pytest.mark.parametrize("failure", ["native", "handoff"])
+def test_failed_regional_reconstruction_restores_all_meshes_and_pending_physics(
+        tmp_path, monkeypatch, failure):
+    """A partial reconstruction cannot replace either canonical or working inputs."""
+    from services.case_workspace import CaseWorkspace
+
+    for root in (tmp_path, tmp_path / "processor0"):
+        for region in ("fluid", "solid"):
+            for name in ("points", "faces", "owner", "neighbour"):
+                _put(root, f"constant/{region}/polyMesh/{name}", f"original {region} {name}")
+            _put(root, f"constant/{region}/polyMesh/boundary",
+                 "1\n(wall {type wall; nFaces 1; startFace 0;})\n")
+    _put(tmp_path, "constant/regionProperties", "regions (fluid (fluid) solid (solid));\n")
+    initial = _put(tmp_path, "0/U", "original initial field")
+    workspace = CaseWorkspace.create(str(tmp_path), str(tmp_path / ".foamagent"))
+    before = {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob("*")
+              if p.is_file() and ".foamagent" not in p.parts and "polyMesh" in p.parts}
+
+    def native(argv, **kwargs):
+        if argv[0] == "foamDictionary":
+            return subprocess.CompletedProcess(argv, 0,
+                "" if "-includes" in argv else "regions (fluid (fluid) solid (solid));\n", "")
+        if argv[0] == "reconstructParMesh":
+            for region in ("fluid", "solid"):
+                for name in ("points", "faces", "owner", "neighbour", "boundary"):
+                    original = before[Path(f"constant/{region}/polyMesh/{name}")]
+                    _put(tmp_path, f"constant/{region}/polyMesh/{name}",
+                         original.decode() if name == "boundary" else "reconstructed mesh")
+                if failure == "native":
+                    return subprocess.CompletedProcess(argv, 1, "", "reconstruction failed")
+        return subprocess.CompletedProcess(argv, 0, "Mesh OK.\n", "")
+
+    monkeypatch.setattr(meshing, "run_openfoam_utility", native)
+    monkeypatch.setattr(meshing, "read_patch_bounds", lambda *a, **kw:
+                        {f"{region}/wall": [0, 1, 0, 1, 0, 1] for region in ("fluid", "solid")})
+    rename = Path.rename
+    failed = False
+
+    def fail_second_region(path, target):
+        nonlocal failed
+        if failure == "handoff" and not failed and Path(target) == workspace.source_dir / "constant/solid/polyMesh":
+            failed = True
+            raise OSError("second-region handoff failed")
+        return rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", fail_second_region)
+    pending = dict(file="0/U", stage="solver", changes="Retain the pending physical correction")
+    state = _state(tmp_path, case_input_source_dir=str(workspace.source_dir),
+                   rewrite_plan=dict(target_files=[pending]), final_reconstruction=dict(
+                       sources=[f"processor0/constant/{region}/polyMesh" for region in ("fluid", "solid")],
+                       argv=["reconstructParMesh", "-constant", "-allRegions"]))
+
+    result = meshing.execute_meshing(state, lambda _: {"error_logs": []})
+
+    assert result["error_logs"] and result["mesh_info"] is None
+    assert result["mesh_execution"]["final_reconstruction"]["status"] == "rolled_back"
+    assert {**state, **result}["rewrite_plan"]["target_files"] == [pending]
+    assert all((tmp_path / path).read_bytes() == content for path, content in before.items())
+    assert all((workspace.source_dir / path).read_bytes() == content
+               for path, content in before.items() if path.parts[0] == "constant")
+    assert (workspace.source_dir / ".foamagent/mesh-sources/processor0/constant/fluid/polyMesh/points").is_file()
+    assert initial.read_text() == (workspace.source_dir / "0/U").read_text() == "original initial field"
+    assert not (workspace.source_dir / ".foamagent/mesh-handoff").exists()
+
+
+@pytest.mark.parametrize("stop_confirmed", [True, False])
+def test_hpc_monitor_failure_cancels_and_confirms_before_returning(
+        tmp_path, monkeypatch, stop_confirmed):
+    """Lost monitoring never resubmits a known job or permits an unconfirmed stop."""
+    import re
+    import shlex
+    from services import run_hpc
+
+    cluster = dict(cluster_name="cluster", account_number="account", partition="test",
+                   nodes=1, ntasks_per_node=1, time_limit=1, memory=1)
+
+    def invoke(user, system):
+        if "Extract cluster information" in user:
+            return json.dumps(cluster)
+        wrapper = re.search(r"using the (.+?) script", user)[1]
+        return "#!/bin/bash\nbash " + shlex.quote(wrapper) + "\n"
+
+    state = dict(case_dir=str(tmp_path), config=Config(max_loop=3),
+                 user_requirement="Run on the supplied cluster", loop_count=0,
+                 llm_service=SimpleNamespace(invoke=invoke))
+    script = _put(tmp_path, "Allrun", "true\n")
+    real_run, calls = subprocess.run, []
+    monkeypatch.setenv("WM_PROJECT_VERSION", "10")
+    monkeypatch.setenv("FOAM_CONTROLDICT", "InfoSwitches {}")
+
+    def scheduler(argv, **kwargs):
+        calls.append(argv[0])
+        if argv[0] == "sbatch":
+            assert 0 < kwargs["timeout"] <= 7
+            real_run(["bash", argv[-1]], check=True, capture_output=True, text=True)
+            return subprocess.CompletedProcess(argv, 0, "Submitted batch job 123 on cluster clusterA\n", "")
+        assert argv[argv.index("--clusters") + 1] == "clusterA"
+        if argv[0] == "squeue":
+            assert argv[argv.index("-j") + 1] == "123"
+            if not stop_confirmed or "scancel" not in calls:
+                raise subprocess.CalledProcessError(1, argv, stderr="monitor unavailable")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        assert argv[0] == "scancel" and argv[-1] == "123"
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(run_hpc.subprocess, "run", scheduler)
+    if stop_confirmed:
+        result = run_hpc.run_stage_hpc(state, str(script), "solver", 7)
+        assert result["returncode"] == 1 and not result["executed"]
+        assert result["cancellation_status"] == "COMPLETED"
+    else:
+        with pytest.raises(run_hpc.HpcWorkflowStop) as stop:
+            run_hpc.run_stage_hpc(state, str(script), "solver", 7)
+        assert stop.value.reason == "hpc_job_state_unconfirmed"
+    assert calls.count("sbatch") == calls.count("scancel") == 1
+    assert calls.count("squeue") == 2
+
+
+def test_cancelled_mcp_run_keeps_case_locked_until_native_work_returns(tmp_path, monkeypatch):
+    """Cancelling a client wait must not allow a second tool to overwrite its case."""
+    server = importlib.import_module("src.mcp.fastmcp_server")
+    entered, release, second_entered = Event(), Event(), Event()
+    calls = []
+
+    def execute(**kwargs):
+        calls.append(kwargs["case_dir"])
+        if len(calls) == 1:
+            entered.set()
+            assert release.wait(timeout=3)
+        else:
+            second_entered.set()
+        return []
+
+    monkeypatch.setattr(server, "run_allrun_and_collect_errors", execute)
+    _put(tmp_path, "Allrun", "true\n")
+    run = getattr(server.run, "fn", server.run)
+
+    async def log(*args, **kwargs):
+        pass
+
+    async def scenario():
+        request = server.RunSimulationRequest(case_dir=str(tmp_path), timeout=2)
+        ctx = SimpleNamespace(info=log, error=log)
+        first = asyncio.create_task(run(request, ctx))
+        following = None
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            following = asyncio.create_task(run(request, ctx))
+            assert not await asyncio.to_thread(second_entered.wait, 0.1)
+        finally:
+            release.set()
+            if following is not None:
+                response = await asyncio.wait_for(following, 2)
+                assert response.status == "success"
+            elif not first.done():
+                await asyncio.wait_for(first, 2)
+        assert second_entered.is_set() and calls == [str(tmp_path), str(tmp_path)]
+
+    asyncio.run(scenario())
 
 
 def test_visualization_failure_status(tmp_path, monkeypatch):
