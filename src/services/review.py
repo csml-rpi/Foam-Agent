@@ -318,8 +318,12 @@ def _review_stage(state, stage, schema):
         }, "omitted_files": source_omitted}
     reference = state["mesh_reference"] if stage == "mesh" else {
         "content": state.get("tutorial_reference"), "script": state.get("allrun_reference")}
+    # Prior diagnoses are proposals, not observations. Keep them in state and the
+    # journal, but give the next review the native errors and execution outcomes.
+    observed_history = [{key: value for key, value in attempt.items() if key != "decision"}
+                        for attempt in history]
     stage_history = _review_context_excerpt(
-        str(history), "[Earlier stage history omitted; complete records remain in workflow state.]",
+        str(observed_history), "[Earlier stage history omitted; complete records remain in workflow state.]",
     )
     user = (
         f"<stage>{stage}</stage>\n<user_requirement>{state['user_requirement']}</user_requirement>\n"
