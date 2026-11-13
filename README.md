@@ -52,6 +52,9 @@ The diagnostic checks LLM access with a small request; the example uses the exis
 Use a fresh output directory for another run. See [authentication](docs/usage.md#authentication)
 for a Codex subscription or another provider.
 
+Open `.foamagent/workflow_report.html` in the generated case directory to explore
+the execution steps, decisions and repairs. See [workflow reports](docs/usage.md#workflow-report).
+
 Locally built images run their bundled code and assets without startup updates.
 See [Docker builds](docs/usage.md#docker-builds) for native targets and older image
 compatibility.

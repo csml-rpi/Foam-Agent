@@ -504,3 +504,262 @@ def test_standalone_run_preserves_script_and_forwards_request(tmp_path, monkeypa
     assert calls == [dict(case_dir=str(tmp_path), timeout=17, max_retries=3,
                           openfoam_target=server.runtime_openfoam_target(server.global_config))]
     assert script.read_text() == "#!/bin/bash\ncustomSolver --user-option\n"
+
+
+@pytest.fixture
+def reported_workflow(tmp_path, monkeypatch):
+    """Use the real graph and preparation with deterministic offline stage results."""
+    app = importlib.import_module("main")
+    preparation = importlib.import_module("services.preparation")
+    from services.review_history import ReviewHistory
+
+    monkeypatch.setattr(preparation, "load_agent_resources", lambda _: (
+        SimpleNamespace(print_statistics=lambda: None), {}))
+    monkeypatch.setattr(importlib.import_module("router_func"), "llm_requires_hpc", lambda _: False)
+    monkeypatch.setattr(app, "meshing_planner_node", lambda _: dict(
+        mesh_type="standard_mesh", mesh_operations=_operations("blockMesh", stage="mesh"),
+        mesh_boundary_plan=[dict(patch="inlet", role="inlet", location="x=0",
+                                 basis="user", evidence="Requested inlet at x=0")],
+        mesh_reference=dict(case="tutorial/cavity", reason="Compatible mesh topology")))
+    monkeypatch.setattr(app, "standard_meshing_node", lambda _: dict(
+        error_logs=[], mesh_info={"cell_count": 100}, mesh_execution={"executed": True}))
+    monkeypatch.setattr(app, "solver_planner_node", lambda _: dict(
+        case_solver="icoFoam", solver_operations=_operations("icoFoam"), solver_planned=True,
+        requires_input_writer=True, requires_hpc=False, requires_visualization=False))
+
+    def writer(state):
+        edits = dict(updated_files=["0/U"] if state["loop_count"] else [],
+                     file_diffs=[dict(file="0/U", diff="- dimensions invalid\n+ dimensions [0 1 -1 0 0 0 0]")]
+                     if state["loop_count"] else [])
+        if state["loop_count"]:
+            ReviewHistory(state["case_dir"], state.get("case_import_report_dir")).append(
+                "file_repair", stage="solver", **edits)
+        return dict(error_logs=[], rewrite_plan=None, **edits)
+
+    def runner(state):
+        errors = [] if state["loop_count"] else [{"file": "log.icoFoam", "error_content": "Invalid dimensions"}]
+        return dict(error_logs=errors, solver_execution={"executed": True, "error_logs": errors},
+                    workflow_status="running" if errors else "success")
+
+    monkeypatch.setattr(app, "input_writer_node", writer)
+    monkeypatch.setattr(app, "local_runner_node", runner)
+    monkeypatch.setattr(app, "solver_reviewer_node", lambda state: dict(
+        loop_count=state["loop_count"] + 1, repairing_mesh=False,
+        rewrite_plan={"target_files": [dict(file="0/U", stage="solver", changes="Correct dimensions")]},
+        review_analysis="Correct dimensions using the native field convention"))
+    yield app, Config(case_dir=str(tmp_path / "output"), execution_mode="fast")
+    # Imported original/ trees are deliberately read-only.
+    for path in tmp_path.rglob("*"):
+        if not path.is_symlink():
+            path.chmod(path.stat().st_mode | 0o700)
+
+
+@pytest.mark.parametrize("imported", [False, True], ids=["generated", "imported"])
+def test_workflow_report_preserves_decisions_retries_and_evidence(reported_workflow, tmp_path, imported):
+    """A browser-readable report follows the shared workflow, including a repaired failure."""
+    from html import unescape
+    import re
+    from urllib.parse import unquote
+
+    app, config = reported_workflow
+    source = tmp_path / "source"
+    if imported:
+        _put(source, "system/controlDict", "/* OpenFOAM: https://openfoam.org\nVersion: 10\n*/\napplication icoFoam;\n")
+    result = app.main("Inlet at x=0 <script>alert('input')</script>", config,
+                      case_path=str(source) if imported else None)
+    assert result["workflow_status"] == "success" and result["loop_count"] == 1
+    directory = Path(config.case_dir) / ("report" if imported else ".foamagent")
+    content = (directory / "workflow_report.html").read_text()
+    timeline = content.split('<ol class="timeline">', 1)[1].split('</ol>', 1)[0]
+    assert timeline.index("Plan mesh") < timeline.index("Plan physics and solver")
+    assert "Run solver locally · attempt 2" in timeline
+    assert "Invalid dimensions" in content and "Correct dimensions" in content
+    assert "- dimensions invalid" in content and "+ dimensions [0 1 -1 0 0 0 0]" in content
+    assert "Requested inlet at x=0" in content and "Compatible mesh topology" in content
+    assert "Not assessed by this report" in content
+    assert "&lt;script&gt;" in content and "<script>" not in content
+    for href in re.findall(r'href="([^"]+)"', content):
+        if not href.startswith("#"):
+            assert (directory / unquote(unescape(href))).is_file()
+    if imported:
+        assert not list((Path(config.case_dir) / "original").rglob("workflow_report.html"))
+        assert not list(source.rglob("workflow_report.html"))
+
+
+@pytest.mark.parametrize("failure", ["exception", "visualization"])
+def test_workflow_report_retains_failure_without_changing_its_result(reported_workflow, failure, monkeypatch):
+    app, config = reported_workflow
+    if failure == "exception":
+        def fail(_):
+            raise ValueError("Planning unavailable")
+        monkeypatch.setattr(app, "solver_planner_node", fail)
+        with pytest.raises(ValueError, match="Planning unavailable"):
+            app.main("Run this case", config)
+        expected = "Planning unavailable"
+    else:
+        planner = app.solver_planner_node
+        monkeypatch.setattr(app, "solver_planner_node", lambda state: {**planner(state), "requires_visualization": True})
+        node = importlib.import_module("nodes.visualization_node")
+        monkeypatch.setattr(node, "visualize_case", lambda *a, **kw: dict(
+            pyvista_visualization={"success": False, "error": "Rendering unavailable"}))
+        result = app.main("Run this case", config)
+        assert result["workflow_status"] == "partial_success" and app.workflow_exit_code(result) != 0
+        expected = "Rendering unavailable"
+    content = (Path(config.case_dir) / ".foamagent/workflow_report.html").read_text()
+    assert expected in content and "Not assessed by this report" in content
+    assert ("Not reached" if failure == "exception" else "Completed") in content
+
+
+def test_workflow_report_respects_output_ownership_and_write_failures(reported_workflow, tmp_path, monkeypatch, capsys):
+    app, config = reported_workflow
+    # Rejection of an existing output must leave it entirely untouched.
+    sentinel = _put(Path(config.case_dir), "keep.txt", "valuable input")
+    result = app.main("Run this case", config)
+    assert result["workflow_status"] == "failed"
+    assert list(Path(config.case_dir).iterdir()) == [sentinel]
+    sentinel.unlink()
+    # A report path pointing elsewhere must neither be followed nor fail the simulation.
+    outside = _put(tmp_path, "outside.txt", "preserve this file")
+    planner = app.solver_planner_node
+
+    def plan(state):
+        (Path(config.case_dir) / ".foamagent/workflow_report.html").symlink_to(outside)
+        return planner(state)
+
+    monkeypatch.setattr(app, "solver_planner_node", plan)
+    result = app.main("Run this case", config)
+    assert result["workflow_status"] == "success"
+    assert outside.read_text() == "preserve this file"
+    assert "workflow_report_warning" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("runner", ["local", "hpc"])
+def test_workflow_report_marks_skipped_solver_execution(reported_workflow, monkeypatch, runner):
+    """Returning to earlier failed inputs records a skip with no new execution evidence."""
+    app, config = reported_workflow
+    config.max_loop = 4
+    planner = app.solver_planner_node
+    monkeypatch.setattr(app, "solver_planner_node", lambda state: {
+        **planner(state), "requires_hpc": runner == "hpc"})
+
+    def writer(state):
+        source = Path(state["case_input_source_dir"])
+        _put(source, "system/controlDict", "application icoFoam;\n")
+        _put(source, "Allrun", "icoFoam\n")
+        # Two distinct failed inputs, then an actual edit back to the first.
+        _put(source, "0/U", f"internalField uniform ({state['loop_count'] % 2} 0 0);\n")
+        return dict(error_logs=[], rewrite_plan=None)
+
+    monkeypatch.setattr(app, "input_writer_node", writer)
+    node = importlib.import_module(f"nodes.{runner}_runner_node")
+    calls = []
+    errors = [{"file": "log.icoFoam", "error_content": "Previous native failure"}]
+    if runner == "local":
+        monkeypatch.setattr(node, "check_stage_inputs", lambda *a: [])
+        monkeypatch.setattr(node, "check_stage_script", lambda *a: [])
+        monkeypatch.setattr(node, "run_allrun_and_collect_errors", lambda *a, **kw: calls.append(1) or errors)
+    else:
+        def execute(state):
+            calls.append(1)
+            return dict(error_logs=errors, job_id="previous-job", solver_execution={
+                "executed": True, "job_id": "previous-job", "error_logs": errors})
+        monkeypatch.setattr(node, "_run_hpc", execute)
+    monkeypatch.setattr(app, f"{runner}_runner_node", getattr(node, f"{runner}_runner_node"))
+    result = app.main("Preserve the physics", config)
+    assert len(calls) == 2 and result["termination_reason"] == "repair_made_no_progress"
+    # Reporting must leave the workflow's original retained outcome intact.
+    assert result["solver_execution"]["executed"] is True
+    content = (Path(config.case_dir) / ".foamagent/workflow_report.html").read_text()
+    skipped = content.split('<ol class="timeline">', 1)[1].split('</ol>', 1)[0].rsplit('<li id="step-', 1)[1]
+    assert "Skip solver execution" in skipped and "Skipped" in skipped
+    assert "<pre>False</pre>" in skipped and "<pre>True</pre>" not in skipped
+    assert "Previous execution errors" in skipped and "Previous native failure" in skipped
+    assert "previous-job" not in skipped
+
+
+def test_workflow_report_keeps_each_planner_reference(reported_workflow, monkeypatch):
+    """A solver replan preserves both reference snapshots even though the source file changes."""
+    from services import plan
+
+    app, config = reported_workflow
+    metadata = dict(case_name="case", case_domain="fluid", case_category="incompressible", case_solver="icoFoam")
+    monkeypatch.setattr(plan, "parse_requirement_to_case_info", lambda *a, **kw: metadata)
+    references = iter(["FIRST_TUTORIAL", "SECOND_TUTORIAL"])
+
+    def retrieve(**kwargs):
+        reference = next(references)
+        return reference, "", "", reference + "_SCRIPT", plan.SimilarCaseAdviceModel(solver="icoFoam")
+
+    monkeypatch.setattr(plan, "retrieve_references", retrieve)
+    planner = app.solver_planner_node
+    visits = []
+
+    def replan(state):
+        visits.append(1)
+        return {**planner(state), **plan.prepare_solver_context(state),
+                "repairing_mesh": len(visits) == 1, "replan_solver": len(visits) == 1}
+
+    monkeypatch.setattr(app, "solver_planner_node", replan)
+    result = app.main("Preserve the physics", config)
+    assert result["workflow_status"] == "success" and len(visits) == 2
+    assert (Path(config.case_dir) / "similar_case.txt").read_text() == "SECOND_TUTORIAL\n\nSECOND_TUTORIAL_SCRIPT"
+    content = (Path(config.case_dir) / ".foamagent/workflow_report.html").read_text()
+    timeline = content.split('<ol class="timeline">', 1)[1].split('</ol>', 1)[0]
+    plans = [step for step in timeline.split('<li id="step-') if "Plan physics and solver" in step]
+    assert len(plans) == 2
+    assert "FIRST_TUTORIAL" in plans[0] and "FIRST_TUTORIAL_SCRIPT" in plans[0]
+    assert "SECOND_TUTORIAL" not in plans[0]
+    assert "SECOND_TUTORIAL" in plans[1] and "SECOND_TUTORIAL_SCRIPT" in plans[1]
+    assert "FIRST_TUTORIAL" not in plans[1]
+
+
+@pytest.mark.parametrize("scenario", ["write_warning", "status_notice", "original_error"])
+def test_report_diagnostics_preserve_workflow_outcome(reported_workflow, monkeypatch, scenario):
+    """Report I/O and its diagnostics may fail without changing a result or exception."""
+    import errno
+    from logger import FoamAgentLogger
+
+    app, config = reported_workflow
+    write_log = FoamAgentLogger.write
+
+    def full_report_log(self, text, **kwargs):
+        if text.startswith("<workflow_report"):
+            raise OSError(errno.ENOSPC, "No space left for report diagnostics")
+        return write_log(self, text, **kwargs)
+
+    monkeypatch.setattr(FoamAgentLogger, "write", full_report_log)
+    stream = sys.stderr
+    diagnostics = []
+
+    class FailingReportStream:
+        def write(self, text):
+            if text.startswith("<workflow_report"):
+                diagnostics.append(text)
+                raise OSError(errno.ENOSPC, "Diagnostic stream unavailable")
+            return stream.write(text)
+
+        def flush(self):
+            stream.flush()
+
+    monkeypatch.setattr(sys, "stderr", FailingReportStream())
+    write_file = Path.write_text
+
+    def write_report(path, *args, **kwargs):
+        if path.name == "workflow_report.html" and scenario != "status_notice":
+            raise OSError(errno.ENOSPC, "No space left for report")
+        return write_file(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", write_report)
+    if scenario == "original_error":
+        def fail(_):
+            raise ValueError("Original planning failure")
+        monkeypatch.setattr(app, "solver_planner_node", fail)
+        with pytest.raises(ValueError, match="Original planning failure"):
+            app.main("Preserve the physics", config)
+    else:
+        result = app.main("Preserve the physics", config)
+        assert result["workflow_status"] == "success" and app.workflow_exit_code(result) == 0
+    assert diagnostics
+    assert "<workflow_report" not in (Path(config.case_dir) / "workflow.log").read_text()
+    if scenario == "status_notice":
+        assert (Path(config.case_dir) / ".foamagent/workflow_report.html").is_file()

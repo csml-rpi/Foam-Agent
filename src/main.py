@@ -34,6 +34,7 @@ from router_func import (
 )
 from logger import close_logging, logging_context
 from services.plan import DEFAULT_IMPORTED_REQUIREMENT
+from services.workflow_report import WorkflowReport
 
 
 def workflow_exit_code(state: GraphState) -> int:
@@ -42,26 +43,23 @@ def workflow_exit_code(state: GraphState) -> int:
     return 2 if status in {"failed", "partial_success"} or state.get("termination_reason") else 0
 
 
-def create_foam_agent_graph() -> StateGraph:
+def create_foam_agent_graph(report: Optional[WorkflowReport] = None) -> StateGraph:
     """Create the OpenFOAM agent workflow graph."""
     
     # Create the graph
     workflow = StateGraph(GraphState)
     
     # Add nodes
-    workflow.add_node("meshing_planner", meshing_planner_node)
-    workflow.add_node("solver_planner", solver_planner_node)
-    workflow.add_node("standard_meshing", standard_meshing_node)
-    workflow.add_node("gmsh_meshing", gmsh_meshing_node)
-    workflow.add_node("custom_meshing", custom_meshing_node)
-    workflow.add_node("input_writer", input_writer_node)
-    workflow.add_node("local_runner", local_runner_node)
-    workflow.add_node("hpc_runner", hpc_runner_node)
-    workflow.add_node("mesh_reviewer", mesh_reviewer_node)
-    workflow.add_node("solver_reviewer", solver_reviewer_node)
-    workflow.add_node("static_review", static_review_node)
-    workflow.add_node("visualization", visualization_node)
-    workflow.add_node("preparation", preparation_node)
+    for name, node in {
+        "meshing_planner": meshing_planner_node, "solver_planner": solver_planner_node,
+        "standard_meshing": standard_meshing_node, "gmsh_meshing": gmsh_meshing_node,
+        "custom_meshing": custom_meshing_node, "input_writer": input_writer_node,
+        "local_runner": local_runner_node, "hpc_runner": hpc_runner_node,
+        "mesh_reviewer": mesh_reviewer_node, "solver_reviewer": solver_reviewer_node,
+        "static_review": static_review_node, "visualization": visualization_node,
+        "preparation": preparation_node,
+    }.items():
+        workflow.add_node(name, report.observe(name, node) if report else node)
     
     # Add edges
     workflow.add_edge(START, "preparation")
@@ -179,9 +177,12 @@ def main(
     """Run the shared workflow for a prompt or an existing case."""
     if case_path and not config.case_dir:
         raise ValueError("--output_dir is required when --case_path is used.")
+    report = WorkflowReport(user_requirement)
+    result = None
+    failure = None
     try:
         # Create and compile the graph
-        workflow = create_foam_agent_graph()
+        workflow = create_foam_agent_graph(report)
         app = workflow.compile()
 
         # Initialize the state
@@ -217,10 +218,12 @@ def main(
 
         return result
 
-    except Exception as e:
+    except BaseException as e:
+        failure = e
         print(f"<workflow_error>{e}</workflow_error>")
         raise
     finally:
+        report.finish(result, error=failure)
         close_logging()
 
 

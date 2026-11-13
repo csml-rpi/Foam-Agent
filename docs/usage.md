@@ -119,6 +119,21 @@ runtime feedback; `static_review_references.json` stores the references used.
 Standalone MCP tools require an explicit [`static_review`](mcp.md#workflows) call;
 `run_case` follows the complete workflow.
 
+### Workflow report
+
+Full CLI runs and MCP `run_case` also write `workflow_report.html` in the report
+directory above. Open it in a browser to follow the actual execution path,
+including retries, and expand decisions, evidence, checks and file changes.
+The report uses existing model outputs and review history, works offline, and
+adds no model calls. Evidence labels distinguish user requirements, supplied
+inputs, tutorial references and model assumptions where recorded. Each solver
+plan keeps its own reference evidence; skipped executions are explicitly marked.
+Explanations may be incomplete; execution success does not establish physical
+correctness.
+Failed runs retain a report once output preparation has established ownership.
+Report-writing errors are reported on stderr when possible, without changing the
+workflow result.
+
 ### Authentication
 
 Set credentials before model-backed operations; services initialize model clients only when needed.
