@@ -131,18 +131,24 @@ The repository also includes the `/foam` Claude Code skill. See the [MCP guide](
 
 ## Reported Benchmark Results
 
-These are the project's recorded [FoamBench](https://arxiv.org/abs/2509.20374) results, not guarantees for the current working tree, native ESI v2006, or arbitrary imported cases.
+Latest [FoamBench](https://arxiv.org/abs/2509.20374) evaluation on **2026-11-12**,
+using Foam-Agent commit [`8b34029`](https://github.com/csml-rpi/Foam-Agent/commit/8b340299810a7b1a1a1455e30ee0bd1ba4a5a85a)
+and CFDLLMBench dataset revision [`40807ed`](https://github.com/NREL-Theseus/cfdllmbench/tree/40807ed0c3539561f4f06e513329998b85b5bade/FoamBench/Dataset).
+The run used **`gpt-6-luna`** through a Codex subscription (`openai-codex`),
+Foundation OpenFOAM v10, a 15-loop runtime repair limit, and 5 parallel cases.
 
-| Framework | Model | Basic | Advanced |
-|---|---|---:|---:|
-| FoamAgent 2.0.0 (10 loops) | Opus 4.6 | 85.45% | 100% |
-| FoamAgent 2.0.0 (25 loops) | Opus 4.6 | 100% | 100% |
-| FoamAgent 2.0.0 (25 loops) | Sonnet 4.6 | 87.88% | 75.00% |
-| FoamAgent 2.0.0 (25 loops) | Haiku 4.6 | 54.55% | 37.50% |
-| FoamAgent 2.0.0 (25 loops) | gpt-5.4 | 45.45% | 75.00% |
-| FoamAgent 2.0.0 (25 loops) | gpt-5.3-codex | 54.55% | 62.50% |
+| Split | Cases | Execution success | NMSE score | Physical success |
+|---|---:|---:|---:|---:|
+| Basic | 110 | 93.64% | 78.64% | 72.73% |
+| Advanced | 16 | 75.00% | 68.75% | 68.75% |
 
-The highest reported scores in this table use **Anthropic Claude Opus 4.6**; model selection remains configurable.
+The NMSE score is the mean FoamBench grade: 1 for `NMSE < 0.1`,
+0.5 for `0.1 <= NMSE < 0.3`, and 0 otherwise. Physical success requires successful
+execution and `NMSE < 0.1`. All cases, including failures, remain in their split's
+denominator. Reference simulations completed successfully for 100% of cases.
+
+Separate strict checks of geometry, output time, and required fields yielded
+physical success rates of **69.09% for Basic** and **62.50% for Advanced**.
 
 ## Community
 
