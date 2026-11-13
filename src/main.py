@@ -332,6 +332,7 @@ if __name__ == "__main__":
         config.reuse_generated_dir = args.reuse_generated_dir
     
     config.overwrite_case_dir = args.overwrite_output
+    prompt_path = args.prompt_path
 
     if args.case_path:
         if args.reuse_generated_dir:
@@ -349,6 +350,10 @@ if __name__ == "__main__":
         prompt_path = args.prompt_path or f"{Path(__file__).parent.parent}/user_requirement.txt"
         with open(prompt_path, 'r', encoding="utf-8") as f:
             user_requirement = f.read()
+
+    if (prompt_path and config.case_dir
+            and Path(prompt_path).resolve().is_relative_to(Path(config.case_dir).expanduser().resolve())):
+        parser.error("Keep the prompt file outside the output directory.")
     
     final_state = main(
         user_requirement,
