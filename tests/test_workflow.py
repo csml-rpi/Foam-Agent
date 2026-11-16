@@ -763,3 +763,32 @@ def test_report_diagnostics_preserve_workflow_outcome(reported_workflow, monkeyp
     assert "<workflow_report" not in (Path(config.case_dir) / "workflow.log").read_text()
     if scenario == "status_notice":
         assert (Path(config.case_dir) / ".foamagent/workflow_report.html").is_file()
+
+
+def test_budget_env_overrides_apply_before_recursion_limit(monkeypatch):
+    monkeypatch.setenv("FOAMAGENT_MAX_LOOP", "4")
+    monkeypatch.setenv("FOAMAGENT_MAX_TIME_LIMIT", "900")
+    monkeypatch.setenv("FOAMAGENT_MAX_STATIC_REVIEW_RETRIES", "0")
+    cfg = Config()
+    assert (cfg.max_loop, cfg.max_time_limit, cfg.max_static_review_retries) == (4, 900, 0)
+    # recursion_limit is derived from max_loop, so it must see the override
+    assert cfg.recursion_limit == 6 * 4 + 8
+
+
+@pytest.mark.parametrize("key,value", [
+    ("FOAMAGENT_MAX_LOOP", "0"),
+    ("FOAMAGENT_MAX_LOOP", "ten"),
+    ("FOAMAGENT_MAX_TIME_LIMIT", "-5"),
+    ("FOAMAGENT_MAX_STATIC_REVIEW_RETRIES", "-1"),
+])
+def test_budget_env_overrides_reject_bad_values(monkeypatch, key, value):
+    monkeypatch.setenv(key, value)
+    with pytest.raises(ValueError, match=key):
+        Config()
+
+
+def test_budget_env_overrides_absent_keep_defaults(monkeypatch):
+    for key in ("FOAMAGENT_MAX_LOOP", "FOAMAGENT_MAX_TIME_LIMIT", "FOAMAGENT_MAX_STATIC_REVIEW_RETRIES"):
+        monkeypatch.delenv(key, raising=False)
+    cfg = Config()
+    assert (cfg.max_loop, cfg.max_time_limit, cfg.max_static_review_retries) == (25, 3600, 10)
