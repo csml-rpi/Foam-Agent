@@ -66,7 +66,14 @@ def get_embedding_model(config: Optional[Config] = None):
             )
         model_path = getattr(cfg, "embedding_model_path", "")
         kwargs = {"model_kwargs": {"local_files_only": True}} if model_path else {}
-        return HuggingFaceEmbeddings(model_name=model_path or model, **kwargs)
+        embeddings = HuggingFaceEmbeddings(model_name=model_path or model, **kwargs)
+        cap = getattr(cfg, "embedding_max_seq_length", None)
+        if cap:
+            # The first retrieval embeds the whole requirement. Uncapped, a
+            # ~2k-token requirement makes Qwen3-Embedding-0.6B peak ~1 GiB above
+            # its resident size, which is what kills memory-limited containers.
+            embeddings._client.max_seq_length = cap
+        return embeddings
     if provider == "ollama":
         from langchain_ollama import OllamaEmbeddings
         return OllamaEmbeddings(model=model)

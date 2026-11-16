@@ -55,6 +55,10 @@ class Config:
     embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"  # e.g. "text-embedding-3-small", "text-embedding-3-large", "Qwen/Qwen3-Embedding-0.6B", "Qwen/Qwen3-Embedding-8B"
     # Loading location is independent of the model identity used by FAISS.
     embedding_model_path: str = ""
+    # Token cap for *query* embeddings (huggingface provider). None keeps the
+    # model default, which for Qwen3-Embedding is 32768 tokens - long enough
+    # that embedding a long requirement can briefly need more than 1 GiB.
+    embedding_max_seq_length: int | None = None
 
     @property
     def generation_mode(self) -> str:
@@ -161,6 +165,18 @@ class Config:
         # Embedding provider/model overrides
         emb_provider_key = "FOAMAGENT_EMBEDDING_PROVIDER"
         emb_model_key = "FOAMAGENT_EMBEDDING_MODEL"
+
+        emb_cap_key = "FOAMAGENT_EMBEDDING_MAX_SEQ_LENGTH"
+        emb_cap_env = _env_nonempty(emb_cap_key)
+        if emb_cap_env is not None:
+            try:
+                cap = int(emb_cap_env)
+            except ValueError:
+                raise ValueError(f"{emb_cap_key} must be an integer, got {emb_cap_env!r}.") from None
+            if cap < 1:
+                raise ValueError(f"{emb_cap_key} must be >= 1, got {cap}.")
+            self.embedding_max_seq_length = cap
+            print(f"<config>embedding_max_seq_length={cap} (env:{emb_cap_key})</config>")
 
         emb_provider_env = _env_nonempty(emb_provider_key)
         if emb_provider_env is not None:

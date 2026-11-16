@@ -792,3 +792,37 @@ def test_budget_env_overrides_absent_keep_defaults(monkeypatch):
         monkeypatch.delenv(key, raising=False)
     cfg = Config()
     assert (cfg.max_loop, cfg.max_time_limit, cfg.max_static_review_retries) == (25, 3600, 10)
+
+
+def test_embedding_max_seq_length_env(monkeypatch):
+    monkeypatch.delenv("FOAMAGENT_EMBEDDING_MAX_SEQ_LENGTH", raising=False)
+    assert Config().embedding_max_seq_length is None          # default: model's own limit
+    monkeypatch.setenv("FOAMAGENT_EMBEDDING_MAX_SEQ_LENGTH", "1024")
+    assert Config().embedding_max_seq_length == 1024
+    for bad in ("0", "long"):
+        monkeypatch.setenv("FOAMAGENT_EMBEDDING_MAX_SEQ_LENGTH", bad)
+        with pytest.raises(ValueError, match="FOAMAGENT_EMBEDDING_MAX_SEQ_LENGTH"):
+            Config()
+
+
+@pytest.mark.parametrize("cap,expected", [(None, 32768), (512, 512)])
+def test_embedding_max_seq_length_reaches_the_model(monkeypatch, cap, expected):
+    # offline_models replaces utils.get_embedding_model wholesale; load an
+    # untouched copy of the module so the real factory is what gets tested,
+    # with only the model class stubbed (network stays blocked).
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "utils_under_test", Path(__file__).resolve().parents[1] / "src" / "utils.py")
+    utils = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(utils)
+
+    class _SentenceTransformer:
+        max_seq_length = 32768
+
+    class _Embeddings:
+        def __init__(self, model_name, **kwargs):
+            self._client = _SentenceTransformer()
+
+    monkeypatch.setattr(utils, "HuggingFaceEmbeddings", _Embeddings)
+    cfg = Config(embedding_provider="huggingface", embedding_max_seq_length=cap)
+    assert utils.get_embedding_model(cfg)._client.max_seq_length == expected
