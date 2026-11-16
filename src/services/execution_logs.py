@@ -18,6 +18,15 @@ from logger import active_log_paths
 _STREAMS = {"Allrun.out", "Allrun.err", "Allmesh.out", "Allmesh.err"}
 _ERROR = re.compile(r"FOAM FATAL(?: IO)? ERROR|\bERROR\s*:|Floating point exception\s*\(core dumped\)|Segmentation fault|already run.*(?:remove|re-run)|Failed\s+[1-9]\d*\s+mesh checks", re.I)
 _EXEC = re.compile(r"^Exec\s*:\s*(\S+)")
+# checkMesh prints one "***" line per failed check, then "Failed N mesh checks".
+_MESH_CHECK_FAILURE = re.compile(r"^\s*\*\*\*")
+_MESH_CHECK_SUMMARY = re.compile(r"Failed\s+[1-9]\d*\s+mesh checks", re.I)
+# Failed checks that do not make a mesh unusable. "Concave cells (using face
+# planes)" is an -allGeometry check that fires on every 2:1 refinement
+# boundary snappyHexMesh/hexRef8 creates: the coarse neighbour of a split face
+# becomes a 9-, 12- or 15-face polyhedron whose sub-faces are coplanar, and the
+# face-plane test reports it as concave although it is a valid hexahedron.
+_BENIGN_MESH_CHECK = re.compile(r"\*\*\*\s*Concave cells \(using face planes\)", re.I)
 
 
 def declared_startup_inputs(operations):
@@ -181,6 +190,7 @@ def scan_execution_log(path, *, solver=None, job_info_dir=None):
     solver_header, host = False, None
     pending = ""
     at_start = True
+    mesh_failures = []   # "***" lines of the checkMesh output being read
     with path.open(encoding="utf-8", errors="replace") as stream:
         for line in iter(lambda: stream.readline(8192), ""):
             tail.append(line)
@@ -189,6 +199,7 @@ def scan_execution_log(path, *, solver=None, job_info_dir=None):
                 tail_size -= len(tail.popleft())
             header = _EXEC.match(line) if at_start else None
             if header:
+                mesh_failures = []
                 depth += 1
                 solver_header, host = bool(solver and Path(header[1]).name == solver), None
                 if solver_depth is None and solver and Path(header[1]).name == solver:
@@ -214,7 +225,15 @@ def scan_execution_log(path, *, solver=None, job_info_dir=None):
                     runs[:] = [all(runs)]
                     solver_depth = None
                 depth -= 1
-            if _ERROR.search(line) and not pending and len(errors) < 8:
+            if at_start and _MESH_CHECK_FAILURE.match(line):
+                mesh_failures.append(line)
+            # A checkMesh run whose only failures are known false positives is
+            # not an execution error: reporting it sends the mesh to review,
+            # where the reviewer can only "stop" — ending the workflow on a
+            # usable mesh.
+            benign_summary = (_MESH_CHECK_SUMMARY.search(line) and mesh_failures
+                              and all(_BENIGN_MESH_CHECK.search(f) for f in mesh_failures))
+            if _ERROR.search(line) and not benign_summary and not pending and len(errors) < 8:
                 pending = line[:4096]
             elif pending:
                 pending += line[:4096 - len(pending)]

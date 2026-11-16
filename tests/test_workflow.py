@@ -826,3 +826,40 @@ def test_embedding_max_seq_length_reaches_the_model(monkeypatch, cap, expected):
     monkeypatch.setattr(utils, "HuggingFaceEmbeddings", _Embeddings)
     cfg = Config(embedding_provider="huggingface", embedding_max_seq_length=cap)
     assert utils.get_embedding_model(cfg)._client.max_seq_length == expected
+
+
+# Excerpt of a real checkMesh -allGeometry run on a snappyHexMesh level-3
+# refinement (462,856 cells; every solver-relevant check passed).
+_CHECKMESH_HEAD = (
+    "Exec   : checkMesh -allGeometry -allTopology\n"
+    "Checking geometry...\n"
+    "    Max non-orthogonality = 25.2 average: 4.1\n"
+    "    Cell determinant check OK.\n"
+)
+_CONCAVE = (" ***Concave cells (using face planes) found, number of cells: 7652\n"
+            "  <<Writing 7652 concave cells to set concaveCells\n")
+_PYRAMIDS = (" ***Error in face pyramids: 12 faces are incorrectly oriented.\n"
+             "  <<Writing 12 faces with incorrect orientation to set wrongOrientedFaces\n")
+
+
+def _scan(tmp_path, body, failed):
+    from services.execution_logs import scan_execution_log
+    log = tmp_path / "log.checkMesh"
+    log.write_text(_CHECKMESH_HEAD + body + f"\nFailed {failed} mesh checks.\n\nEnd\n\n")
+    return scan_execution_log(log)["errors"]
+
+
+def test_concave_face_plane_check_alone_is_not_an_error(tmp_path):
+    # A refined mesh that trips only this -allGeometry false positive used to
+    # be sent to mesh review, whose only option was to stop the workflow.
+    assert _scan(tmp_path, _CONCAVE, 1) == []
+
+
+def test_concave_check_does_not_mask_a_real_failure(tmp_path):
+    errors = _scan(tmp_path, _CONCAVE + _PYRAMIDS, 2)
+    assert errors and "Failed 2 mesh checks" in errors[0]
+
+
+def test_real_mesh_check_failure_is_still_an_error(tmp_path):
+    errors = _scan(tmp_path, _PYRAMIDS, 1)
+    assert errors and "Failed 1 mesh checks" in errors[0]
