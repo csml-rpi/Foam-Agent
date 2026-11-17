@@ -763,3 +763,103 @@ def test_report_diagnostics_preserve_workflow_outcome(reported_workflow, monkeyp
     assert "<workflow_report" not in (Path(config.case_dir) / "workflow.log").read_text()
     if scenario == "status_notice":
         assert (Path(config.case_dir) / ".foamagent/workflow_report.html").is_file()
+
+
+def test_budget_env_overrides_apply_before_recursion_limit(monkeypatch):
+    monkeypatch.setenv("FOAMAGENT_MAX_LOOP", "4")
+    monkeypatch.setenv("FOAMAGENT_MAX_TIME_LIMIT", "900")
+    monkeypatch.setenv("FOAMAGENT_MAX_STATIC_REVIEW_RETRIES", "0")
+    cfg = Config()
+    assert (cfg.max_loop, cfg.max_time_limit, cfg.max_static_review_retries) == (4, 900, 0)
+    # recursion_limit is derived from max_loop, so it must see the override
+    assert cfg.recursion_limit == 6 * 4 + 8
+
+
+@pytest.mark.parametrize("key,value", [
+    ("FOAMAGENT_MAX_LOOP", "0"),
+    ("FOAMAGENT_MAX_LOOP", "ten"),
+    ("FOAMAGENT_MAX_TIME_LIMIT", "-5"),
+    ("FOAMAGENT_MAX_STATIC_REVIEW_RETRIES", "-1"),
+])
+def test_budget_env_overrides_reject_bad_values(monkeypatch, key, value):
+    monkeypatch.setenv(key, value)
+    with pytest.raises(ValueError, match=key):
+        Config()
+
+
+def test_budget_env_overrides_absent_keep_defaults(monkeypatch):
+    for key in ("FOAMAGENT_MAX_LOOP", "FOAMAGENT_MAX_TIME_LIMIT", "FOAMAGENT_MAX_STATIC_REVIEW_RETRIES"):
+        monkeypatch.delenv(key, raising=False)
+    cfg = Config()
+    assert (cfg.max_loop, cfg.max_time_limit, cfg.max_static_review_retries) == (25, 3600, 10)
+
+
+def test_embedding_max_seq_length_env(monkeypatch):
+    monkeypatch.delenv("FOAMAGENT_EMBEDDING_MAX_SEQ_LENGTH", raising=False)
+    assert Config().embedding_max_seq_length is None          # default: model's own limit
+    monkeypatch.setenv("FOAMAGENT_EMBEDDING_MAX_SEQ_LENGTH", "1024")
+    assert Config().embedding_max_seq_length == 1024
+    for bad in ("0", "long"):
+        monkeypatch.setenv("FOAMAGENT_EMBEDDING_MAX_SEQ_LENGTH", bad)
+        with pytest.raises(ValueError, match="FOAMAGENT_EMBEDDING_MAX_SEQ_LENGTH"):
+            Config()
+
+
+@pytest.mark.parametrize("cap,expected", [(None, 32768), (512, 512)])
+def test_embedding_max_seq_length_reaches_the_model(monkeypatch, cap, expected):
+    # offline_models replaces utils.get_embedding_model wholesale; load an
+    # untouched copy of the module so the real factory is what gets tested,
+    # with only the model class stubbed (network stays blocked).
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "utils_under_test", Path(__file__).resolve().parents[1] / "src" / "utils.py")
+    utils = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(utils)
+
+    class _SentenceTransformer:
+        max_seq_length = 32768
+
+    class _Embeddings:
+        def __init__(self, model_name, **kwargs):
+            self._client = _SentenceTransformer()
+
+    monkeypatch.setattr(utils, "HuggingFaceEmbeddings", _Embeddings)
+    cfg = Config(embedding_provider="huggingface", embedding_max_seq_length=cap)
+    assert utils.get_embedding_model(cfg)._client.max_seq_length == expected
+
+
+# Excerpt of a real checkMesh -allGeometry run on a snappyHexMesh level-3
+# refinement (462,856 cells; every solver-relevant check passed).
+_CHECKMESH_HEAD = (
+    "Exec   : checkMesh -allGeometry -allTopology\n"
+    "Checking geometry...\n"
+    "    Max non-orthogonality = 25.2 average: 4.1\n"
+    "    Cell determinant check OK.\n"
+)
+_CONCAVE = (" ***Concave cells (using face planes) found, number of cells: 7652\n"
+            "  <<Writing 7652 concave cells to set concaveCells\n")
+_PYRAMIDS = (" ***Error in face pyramids: 12 faces are incorrectly oriented.\n"
+             "  <<Writing 12 faces with incorrect orientation to set wrongOrientedFaces\n")
+
+
+def _scan(tmp_path, body, failed):
+    from services.execution_logs import scan_execution_log
+    log = tmp_path / "log.checkMesh"
+    log.write_text(_CHECKMESH_HEAD + body + f"\nFailed {failed} mesh checks.\n\nEnd\n\n")
+    return scan_execution_log(log)["errors"]
+
+
+def test_concave_face_plane_check_alone_is_not_an_error(tmp_path):
+    # A refined mesh that trips only this -allGeometry false positive used to
+    # be sent to mesh review, whose only option was to stop the workflow.
+    assert _scan(tmp_path, _CONCAVE, 1) == []
+
+
+def test_concave_check_does_not_mask_a_real_failure(tmp_path):
+    errors = _scan(tmp_path, _CONCAVE + _PYRAMIDS, 2)
+    assert errors and "Failed 2 mesh checks" in errors[0]
+
+
+def test_real_mesh_check_failure_is_still_an_error(tmp_path):
+    errors = _scan(tmp_path, _PYRAMIDS, 1)
+    assert errors and "Failed 1 mesh checks" in errors[0]

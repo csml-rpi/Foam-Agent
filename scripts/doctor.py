@@ -77,6 +77,9 @@ def main(argv=None) -> int:
         print(f"{'OK' if ok else 'FAIL'}  {message}")
         failed |= not ok
 
+    def warn(message: str):
+        print(f"WARN  {message}")
+
     def check_package(package: str, extra: str = "mesh"):
         try:
             version = importlib.metadata.version(package)
@@ -112,6 +115,20 @@ def main(argv=None) -> int:
     for extra in sorted(extras):
         for package in provider_packages[extra]:
             check_package(package, extra)
+
+    # gmsh_meshing is always in the graph: the meshing planner routes there
+    # whenever it picks mesh_type "gmsh_mesh", typically because the
+    # requirement asks for Gmsh. gmsh itself is the optional `mesh` extra, so
+    # an install without it passes every check above and then fails those
+    # requests at run time. Not fatal — standard meshing still works — but
+    # worth stating.
+    try:
+        gmsh_version = importlib.metadata.version("gmsh")
+    except importlib.metadata.PackageNotFoundError:
+        warn("gmsh not installed: requirements routed to Gmsh meshing will fail; "
+             "install with python -m pip install -c constraints.txt -e '.[mesh]'")
+    else:
+        report(True, f"gmsh {gmsh_version}")
 
     runtime_target = runtime_openfoam_target(cfg)
     expected = {"foundation-v10": {"10"}, "esi-v2006": {"2006", "v2006"}}.get(runtime_target)
